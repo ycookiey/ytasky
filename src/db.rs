@@ -289,6 +289,7 @@ pub fn generate_recurring_tasks(conn: &Connection, date: &str) -> Result<()> {
 }
 
 /// 繰り返しルールを登録
+#[allow(clippy::too_many_arguments)]
 pub fn insert_recurrence(
     conn: &Connection,
     title: &str,
@@ -320,6 +321,7 @@ pub fn insert_recurrence(
 }
 
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn add_recurrence(
     conn: &Connection,
     title: &str,

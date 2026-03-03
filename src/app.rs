@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use crate::history::{
     Command, DeleteTaskCommand, ReorderTaskCommand, ToggleActualCommand, UndoManager,
 };
-use crate::model::{Category, CategoryReport, OverflowTask, Task, TitleReport};
+use crate::model::{Category, CategoryReport, Task, TitleReport};
 
 const DAY_MINUTES: i32 = 24 * 60;
 
@@ -75,14 +75,16 @@ enum FormAction {
 
 pub struct App {
     conn: Connection,
-    pub date: String,
-    pub tasks: Vec<Task>,
+    pub view_start_date: String,
+    pub day_tasks: Vec<(String, Vec<Task>)>,
     pub backlog_tasks: Vec<Task>,
-    pub overflow_tasks: Vec<OverflowTask>,
     pub categories: Vec<Category>,
     pub category_reports: Vec<CategoryReport>,
     pub title_reports: Vec<TitleReport>,
-    pub cursor: usize,
+    pub view_days: usize,
+    pub col_cursor: usize,
+    pub row_cursor: usize,
+    pub preferred_row: usize,
     pub backlog_cursor: usize,
     pub focus: PanelFocus,
     pub view_mode: ViewMode,
@@ -94,24 +96,40 @@ pub struct App {
 
 impl App {
     pub fn new(conn: Connection) -> anyhow::Result<Self> {
-        let date = Local::now().format("%Y-%m-%d").to_string();
-        let tasks = crate::db::load_tasks(&conn, &date)?;
+        let view_days = 3usize;
+        let col_cursor = view_days / 2;
+        let center_date = Local::now().date_naive();
+        let start = center_date - Duration::days(col_cursor as i64);
+        let view_start_date = start.format("%Y-%m-%d").to_string();
+        let mut day_tasks = Vec::with_capacity(view_days);
+        for i in 0..view_days {
+            let date = (start + Duration::days(i as i64))
+                .format("%Y-%m-%d")
+                .to_string();
+            let tasks = crate::db::load_tasks(&conn, &date)?;
+            day_tasks.push((date, tasks));
+        }
+        let cursor_date = day_tasks
+            .get(col_cursor)
+            .map(|(date, _)| date.clone())
+            .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
         let backlog_tasks = crate::db::load_backlog_tasks(&conn)?;
-        let overflow_tasks = Self::compute_overflow(&conn, &date)?;
         let categories = crate::db::load_categories(&conn)?;
-        let category_reports = crate::db::report_by_category(&conn, &date)?;
-        let title_reports = crate::db::report_by_title(&conn, &date)?;
+        let category_reports = crate::db::report_by_category(&conn, &cursor_date)?;
+        let title_reports = crate::db::report_by_title(&conn, &cursor_date)?;
 
         Ok(Self {
             conn,
-            date,
-            tasks,
+            view_start_date,
+            day_tasks,
             backlog_tasks,
-            overflow_tasks,
             categories,
             category_reports,
             title_reports,
-            cursor: 0,
+            view_days,
+            col_cursor,
+            row_cursor: 0,
+            preferred_row: 0,
             backlog_cursor: 0,
             focus: PanelFocus::Table,
             view_mode: ViewMode::TableView,
@@ -159,26 +177,8 @@ impl App {
                 }
                 return;
             }
-            KeyCode::Char('h') => {
-                if let Err(err) = self.shift_date(-1) {
-                    self.status_message = Some(err.to_string());
-                }
-                return;
-            }
-            KeyCode::Char('l') => {
-                if let Err(err) = self.shift_date(1) {
-                    self.status_message = Some(err.to_string());
-                }
-                return;
-            }
-            KeyCode::Char('H') => {
-                if let Err(err) = self.shift_date(-7) {
-                    self.status_message = Some(err.to_string());
-                }
-                return;
-            }
-            KeyCode::Char('L') => {
-                if let Err(err) = self.shift_date(7) {
+            KeyCode::Char(c @ '1'..='9') if key.modifiers.is_empty() => {
+                if let Err(err) = self.set_view_days((c as usize) - ('0' as usize)) {
                     self.status_message = Some(err.to_string());
                 }
                 return;
@@ -202,7 +202,7 @@ impl App {
                 PanelFocus::Table => self.handle_table_panel_key(key),
                 PanelFocus::Backlog => self.handle_backlog_panel_key(key),
             }
-        } else {
+        } else if self.view_mode == ViewMode::TimelineView {
             self.handle_timeline_key(key);
         }
     }
@@ -210,13 +210,26 @@ impl App {
     fn handle_table_panel_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if !self.tasks.is_empty() && self.cursor < self.tasks.len() - 1 {
-                    self.cursor += 1;
+                let max_row = self.cursor_tasks().len().saturating_sub(1);
+                if self.row_cursor < max_row {
+                    self.row_cursor += 1;
                 }
+                self.preferred_row = self.row_cursor;
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
+                if self.row_cursor > 0 {
+                    self.row_cursor -= 1;
+                }
+                self.preferred_row = self.row_cursor;
+            }
+            KeyCode::Char('h') => {
+                if let Err(err) = self.move_column_left() {
+                    self.status_message = Some(err.to_string());
+                }
+            }
+            KeyCode::Char('l') => {
+                if let Err(err) = self.move_column_right() {
+                    self.status_message = Some(err.to_string());
                 }
             }
             KeyCode::Char('a') => self.open_add_task_form(FormTarget::Schedule),
@@ -255,6 +268,53 @@ impl App {
         }
     }
 
+    fn handle_timeline_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                let max_row = self.cursor_tasks().len().saturating_sub(1);
+                if self.row_cursor < max_row {
+                    self.row_cursor += 1;
+                }
+                self.preferred_row = self.row_cursor;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.row_cursor > 0 {
+                    self.row_cursor -= 1;
+                }
+                self.preferred_row = self.row_cursor;
+            }
+            KeyCode::Char('h') => {
+                if let Err(err) = self.move_column_left() {
+                    self.status_message = Some(err.to_string());
+                }
+            }
+            KeyCode::Char('l') => {
+                if let Err(err) = self.move_column_right() {
+                    self.status_message = Some(err.to_string());
+                }
+            }
+            KeyCode::Char('a') => self.open_add_task_form(FormTarget::Schedule),
+            KeyCode::Char('e') => self.open_edit_task_form(FormTarget::Schedule),
+            KeyCode::Char('d') => self.open_delete_confirm(),
+            KeyCode::Char('J') => {
+                if let Err(err) = self.move_task_down() {
+                    self.status_message = Some(err.to_string());
+                }
+            }
+            KeyCode::Char('K') => {
+                if let Err(err) = self.move_task_up() {
+                    self.status_message = Some(err.to_string());
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Err(err) = self.toggle_actual_for_selected() {
+                    self.status_message = Some(err.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_backlog_panel_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -283,40 +343,6 @@ impl App {
             KeyCode::Char('a') => self.open_add_task_form(FormTarget::Backlog),
             KeyCode::Tab => {
                 self.focus = PanelFocus::Table;
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_timeline_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.tasks.is_empty() && self.cursor < self.tasks.len() - 1 {
-                    self.cursor += 1;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.cursor > 0 {
-                    self.cursor -= 1;
-                }
-            }
-            KeyCode::Char('a') => self.open_add_task_form(FormTarget::Schedule),
-            KeyCode::Char('e') => self.open_edit_task_form(FormTarget::Schedule),
-            KeyCode::Char('d') => self.open_delete_confirm(),
-            KeyCode::Char('J') => {
-                if let Err(err) = self.move_task_down() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char('K') => {
-                if let Err(err) = self.move_task_up() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char(' ') => {
-                if let Err(err) = self.toggle_actual_for_selected() {
-                    self.status_message = Some(err.to_string());
-                }
             }
             _ => {}
         }
@@ -362,9 +388,7 @@ impl App {
                     self.input_mode = InputMode::BacklogSelect { cursor };
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    if cursor > 0 {
-                        cursor -= 1;
-                    }
+                    cursor = cursor.saturating_sub(1);
                     self.backlog_cursor = cursor;
                     self.input_mode = InputMode::BacklogSelect { cursor };
                 }
@@ -613,7 +637,7 @@ impl App {
         match (form.target, form.mode) {
             (FormTarget::Schedule, FormMode::Add) => {
                 let command = AddScheduledTaskCommand::new(
-                    self.date.clone(),
+                    self.cursor_date().to_string(),
                     title.to_string(),
                     category.id.clone(),
                     duration_min,
@@ -621,8 +645,9 @@ impl App {
                     deadline.clone(),
                 );
                 self.run_command(Box::new(command))?;
-                if !self.tasks.is_empty() {
-                    self.cursor = self.tasks.len() - 1;
+                if !self.cursor_tasks().is_empty() {
+                    self.row_cursor = self.cursor_tasks().len() - 1;
+                    self.preferred_row = self.row_cursor;
                 }
             }
             (FormTarget::Schedule, FormMode::Edit) => {
@@ -636,8 +661,13 @@ impl App {
                     deadline.clone(),
                 );
                 self.run_command(Box::new(command))?;
-                if let Some(idx) = self.tasks.iter().position(|task| task.id == task_id) {
-                    self.cursor = idx;
+                if let Some(idx) = self
+                    .cursor_tasks()
+                    .iter()
+                    .position(|task| task.id == task_id)
+                {
+                    self.row_cursor = idx;
+                    self.preferred_row = self.row_cursor;
                 }
             }
             (FormTarget::Backlog, FormMode::Add) => {
@@ -690,12 +720,12 @@ impl App {
     }
 
     fn default_fixed_start(&self) -> i32 {
-        if self.tasks.is_empty() {
+        if self.cursor_tasks().is_empty() {
             return round_up_to_next_15_minutes(current_minutes());
         }
 
         let mut current_min = 0;
-        for task in &self.tasks {
+        for task in self.cursor_tasks() {
             let start = match task.fixed_start {
                 Some(fixed_start) => normalize_schedule_fixed_start(fixed_start, current_min),
                 None => current_min,
@@ -917,7 +947,7 @@ impl App {
         let Some(task) = self.selected_backlog_task().cloned() else {
             return Ok(());
         };
-        let command = InsertFromBacklogCommand::new(task.id, self.date.clone(), None);
+        let command = InsertFromBacklogCommand::new(task.id, self.cursor_date().to_string(), None);
         self.run_command(Box::new(command))
     }
 
@@ -928,8 +958,9 @@ impl App {
         let Some(task) = self.backlog_tasks.get(backlog_cursor).cloned() else {
             return Ok(());
         };
-        let insert_at = self.cursor.min(self.tasks.len());
-        let command = InsertFromBacklogCommand::new(task.id, self.date.clone(), Some(insert_at));
+        let insert_at = self.row_cursor.min(self.cursor_tasks().len());
+        let command =
+            InsertFromBacklogCommand::new(task.id, self.cursor_date().to_string(), Some(insert_at));
         self.run_command(Box::new(command))
     }
 
@@ -941,27 +972,29 @@ impl App {
     }
 
     fn move_task_down(&mut self) -> anyhow::Result<()> {
-        if self.tasks.is_empty() || self.cursor >= self.tasks.len() - 1 {
+        if self.cursor_tasks().is_empty() || self.row_cursor >= self.cursor_tasks().len() - 1 {
             return Ok(());
         }
 
-        let id1 = self.tasks[self.cursor].id;
-        let id2 = self.tasks[self.cursor + 1].id;
+        let id1 = self.cursor_tasks()[self.row_cursor].id;
+        let id2 = self.cursor_tasks()[self.row_cursor + 1].id;
         self.run_command(Box::new(ReorderTaskCommand::new(id1, id2)))?;
-        self.cursor = (self.cursor + 1).min(self.tasks.len().saturating_sub(1));
+        self.row_cursor = (self.row_cursor + 1).min(self.cursor_tasks().len().saturating_sub(1));
+        self.preferred_row = self.row_cursor;
 
         Ok(())
     }
 
     fn move_task_up(&mut self) -> anyhow::Result<()> {
-        if self.tasks.is_empty() || self.cursor == 0 {
+        if self.cursor_tasks().is_empty() || self.row_cursor == 0 {
             return Ok(());
         }
 
-        let id1 = self.tasks[self.cursor].id;
-        let id2 = self.tasks[self.cursor - 1].id;
+        let id1 = self.cursor_tasks()[self.row_cursor].id;
+        let id2 = self.cursor_tasks()[self.row_cursor - 1].id;
         self.run_command(Box::new(ReorderTaskCommand::new(id1, id2)))?;
-        self.cursor = self.cursor.saturating_sub(1);
+        self.row_cursor = self.row_cursor.saturating_sub(1);
+        self.preferred_row = self.row_cursor;
 
         Ok(())
     }
@@ -998,15 +1031,96 @@ impl App {
     }
 
     fn refresh_tasks(&mut self) -> anyhow::Result<()> {
-        self.tasks = crate::db::load_tasks(&self.conn, &self.date)?;
+        let start = NaiveDate::parse_from_str(&self.view_start_date, "%Y-%m-%d")
+            .with_context(|| format!("日付形式が不正です: {}", self.view_start_date))?;
+        self.day_tasks.clear();
+        for i in 0..self.view_days {
+            let date = (start + Duration::days(i as i64))
+                .format("%Y-%m-%d")
+                .to_string();
+            let tasks = crate::db::load_tasks(&self.conn, &date)?;
+            self.day_tasks.push((date, tasks));
+        }
         self.backlog_tasks = crate::db::load_backlog_tasks(&self.conn)?;
-        self.overflow_tasks = Self::compute_overflow(&self.conn, &self.date)?;
+        self.clamp_cursors();
         self.refresh_reports()?;
 
-        if self.tasks.is_empty() {
-            self.cursor = 0;
-        } else if self.cursor >= self.tasks.len() {
-            self.cursor = self.tasks.len() - 1;
+        Ok(())
+    }
+
+    fn refresh_reports(&mut self) -> anyhow::Result<()> {
+        if self.day_tasks.is_empty() {
+            self.category_reports.clear();
+            self.title_reports.clear();
+            return Ok(());
+        }
+        let date = self.cursor_date().to_string();
+        self.category_reports = crate::db::report_by_category(&self.conn, &date)?;
+        self.title_reports = crate::db::report_by_title(&self.conn, &date)?;
+        Ok(())
+    }
+
+    fn set_view_days(&mut self, n: usize) -> anyhow::Result<()> {
+        if !(1..=9).contains(&n) {
+            bail!("表示日数は1-9で指定してください");
+        }
+        let cursor_date = self.cursor_date().to_string();
+        self.view_days = n;
+        let cursor = NaiveDate::parse_from_str(&cursor_date, "%Y-%m-%d")
+            .with_context(|| format!("日付形式が不正です: {cursor_date}"))?;
+        let offset = (n / 2) as i64;
+        let start = cursor - Duration::days(offset);
+        self.view_start_date = start.format("%Y-%m-%d").to_string();
+        self.col_cursor = offset as usize;
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
+    fn selected_task(&self) -> Option<&Task> {
+        self.cursor_tasks().get(self.row_cursor)
+    }
+
+    fn move_column_left(&mut self) -> anyhow::Result<()> {
+        if self.col_cursor > 0 {
+            self.col_cursor -= 1;
+            self.restore_row_from_preferred();
+            self.refresh_reports()?;
+        } else {
+            let start = NaiveDate::parse_from_str(&self.view_start_date, "%Y-%m-%d")
+                .with_context(|| format!("日付形式が不正です: {}", self.view_start_date))?;
+            self.view_start_date = (start - Duration::days(1)).format("%Y-%m-%d").to_string();
+            self.refresh_tasks()?;
+            self.col_cursor = 0;
+        }
+        Ok(())
+    }
+
+    fn move_column_right(&mut self) -> anyhow::Result<()> {
+        let last_col = self.view_days.saturating_sub(1);
+        if self.col_cursor < last_col {
+            self.col_cursor += 1;
+            self.restore_row_from_preferred();
+            self.refresh_reports()?;
+        } else {
+            let start = NaiveDate::parse_from_str(&self.view_start_date, "%Y-%m-%d")
+                .with_context(|| format!("日付形式が不正です: {}", self.view_start_date))?;
+            self.view_start_date = (start + Duration::days(1)).format("%Y-%m-%d").to_string();
+            self.refresh_tasks()?;
+            self.col_cursor = last_col;
+        }
+        Ok(())
+    }
+
+    fn clamp_cursors(&mut self) {
+        if self.day_tasks.is_empty() {
+            self.col_cursor = 0;
+            self.row_cursor = 0;
+            self.preferred_row = 0;
+        } else {
+            if self.col_cursor >= self.day_tasks.len() {
+                self.col_cursor = self.day_tasks.len() - 1;
+            }
+            self.restore_row_from_preferred();
         }
 
         if self.backlog_tasks.is_empty() {
@@ -1014,83 +1128,46 @@ impl App {
         } else if self.backlog_cursor >= self.backlog_tasks.len() {
             self.backlog_cursor = self.backlog_tasks.len() - 1;
         }
-
-        Ok(())
     }
 
-    fn refresh_reports(&mut self) -> anyhow::Result<()> {
-        self.category_reports = crate::db::report_by_category(&self.conn, &self.date)?;
-        self.title_reports = crate::db::report_by_title(&self.conn, &self.date)?;
-        Ok(())
+    fn restore_row_from_preferred(&mut self) {
+        let task_len = self.cursor_tasks().len();
+        self.row_cursor = if task_len == 0 {
+            0
+        } else {
+            self.preferred_row.min(task_len - 1)
+        };
     }
 
-    fn shift_date(&mut self, days: i64) -> anyhow::Result<()> {
-        let current = NaiveDate::parse_from_str(&self.date, "%Y-%m-%d")
-            .with_context(|| format!("日付形式が不正です: {}", self.date))?;
-        let next = current + Duration::days(days);
-        self.date = next.format("%Y-%m-%d").to_string();
-        self.refresh_tasks()?;
-        self.cursor = 0;
-        Ok(())
+    /// 現在カーソルがある日付を返す
+    pub fn cursor_date(&self) -> &str {
+        self.day_tasks
+            .get(self.col_cursor)
+            .map(|(date, _)| date.as_str())
+            .unwrap_or(self.view_start_date.as_str())
     }
 
-    fn selected_task(&self) -> Option<&Task> {
-        self.tasks.get(self.cursor)
-    }
-
-    /// 前日のタスクが日を跨いでいる場合のはみ出し分を計算
-    fn compute_overflow(conn: &Connection, date: &str) -> anyhow::Result<Vec<OverflowTask>> {
-        let current = NaiveDate::parse_from_str(date, "%Y-%m-%d")
-            .with_context(|| format!("日付形式が不正です: {date}"))?;
-        let prev = current - Duration::days(1);
-        let prev_date = prev.format("%Y-%m-%d").to_string();
-
-        let prev_tasks = crate::db::load_tasks(conn, &prev_date)?;
-        if prev_tasks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut current_min = 0i32;
-        let mut overflow = Vec::new();
-
-        for task in &prev_tasks {
-            let start = match task.fixed_start {
-                Some(fs) => normalize_schedule_fixed_start(fs, current_min),
-                None => current_min,
-            };
-            let end = start + task.duration_min;
-
-            if end > DAY_MINUTES {
-                let overflow_start = if start >= DAY_MINUTES {
-                    start - DAY_MINUTES
-                } else {
-                    0
-                };
-                let overflow_end = end - DAY_MINUTES;
-
-                overflow.push(OverflowTask {
-                    title: task.title.clone(),
-                    category_id: task.category_id.clone(),
-                    start_min: overflow_start,
-                    end_min: overflow_end,
-                });
-            }
-
-            current_min = end;
-        }
-
-        Ok(overflow)
+    /// 現在カーソルがあるカラムのタスク一覧を返す
+    pub fn cursor_tasks(&self) -> &[Task] {
+        self.day_tasks
+            .get(self.col_cursor)
+            .map(|(_, tasks)| tasks.as_slice())
+            .unwrap_or(&[])
     }
 
     /// 残り時間（分）を計算
     pub fn remaining_minutes(&self) -> i32 {
-        let used_minutes: i64 = self.tasks.iter().map(|t| i64::from(t.duration_min)).sum();
+        let used_minutes: i64 = self
+            .cursor_tasks()
+            .iter()
+            .map(|t| i64::from(t.duration_min))
+            .sum();
         let remaining = i64::from(DAY_MINUTES) - used_minutes;
         remaining.clamp(i32::MIN as i64, i32::MAX as i64) as i32
     }
 
     pub fn is_today(&self) -> bool {
-        self.date == Local::now().format("%Y-%m-%d").to_string()
+        self.cursor_date() == Local::now().format("%Y-%m-%d").to_string()
     }
 
     pub fn undo_count(&self) -> usize {

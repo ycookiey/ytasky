@@ -60,6 +60,7 @@ impl UndoManager {
     }
 }
 
+#[allow(dead_code)]
 pub struct AddTaskCommand {
     date: String,
     title: String,
@@ -69,6 +70,7 @@ pub struct AddTaskCommand {
     inserted_task: Option<Task>,
 }
 
+#[allow(dead_code)]
 impl AddTaskCommand {
     pub fn new(
         date: String,
@@ -122,6 +124,7 @@ impl Command for AddTaskCommand {
     }
 }
 
+#[allow(dead_code)]
 pub struct EditTaskCommand {
     task_id: i64,
     title: String,
@@ -132,6 +135,7 @@ pub struct EditTaskCommand {
     after: Option<Task>,
 }
 
+#[allow(dead_code)]
 impl EditTaskCommand {
     pub fn new(
         task_id: i64,

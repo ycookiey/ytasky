@@ -111,6 +111,55 @@ struct ReportParams {
     date: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddBacklogParams {
+    /// Task title
+    title: String,
+    /// Category ID: work, study, sleep, meal, exercise, personal, break, commute, errand
+    category: String,
+    /// Duration in minutes (multiples of 15)
+    duration: i32,
+    /// Deadline in YYYY-MM-DD or "YYYY-MM-DD HH:MM" format (optional)
+    #[serde(default)]
+    deadline: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct EditBacklogParams {
+    /// Task ID to edit
+    id: i64,
+    /// New title (optional)
+    #[serde(default)]
+    title: Option<String>,
+    /// New category ID (optional)
+    #[serde(default)]
+    category: Option<String>,
+    /// New duration in minutes (optional)
+    #[serde(default)]
+    duration: Option<i32>,
+    /// New deadline in YYYY-MM-DD or "YYYY-MM-DD HH:MM" format, or "none" to remove (optional)
+    #[serde(default)]
+    deadline: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ScheduleBacklogParams {
+    /// Backlog task ID to insert into schedule
+    id: i64,
+    /// Target date in YYYY-MM-DD format. Defaults to today.
+    #[serde(default)]
+    date: Option<String>,
+    /// Position to insert at (0-based index). If omitted, appends to end.
+    #[serde(default)]
+    position: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ToBacklogParams {
+    /// Scheduled task ID to move to backlog
+    id: i64,
+}
+
 // --- MCP Server ---
 
 #[derive(Clone)]
@@ -290,6 +339,107 @@ impl YtaskyMcp {
         let cats = db::load_categories(&conn).map_err(db_err)?;
         ok_json(json!(cats))
     }
+
+    #[tool(
+        description = "List all backlog tasks (unscheduled). Sorted by deadline (soonest first, no deadline last)."
+    )]
+    fn list_backlog(&self) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().unwrap();
+        let tasks = db::load_backlog_tasks(&conn).map_err(db_err)?;
+        ok_json(json!({ "tasks": serialize_tasks(&tasks) }))
+    }
+
+    #[tool(
+        description = "Add a task to backlog (unscheduled pool). Backlog tasks have no date and can be inserted into any day's schedule later."
+    )]
+    fn add_backlog(
+        &self,
+        Parameters(params): Parameters<AddBacklogParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().unwrap();
+        let id = db::insert_backlog_task(
+            &conn,
+            &params.title,
+            &params.category,
+            params.duration,
+            params.deadline.as_deref(),
+        )
+        .map_err(db_err)?;
+        ok_json(json!({ "id": id }))
+    }
+
+    #[tool(
+        description = "Edit a backlog task. Only specified fields are updated. Use deadline=\"none\" to remove deadline."
+    )]
+    fn edit_backlog(
+        &self,
+        Parameters(params): Parameters<EditBacklogParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().unwrap();
+        let task = db::load_task_by_id(&conn, params.id)
+            .map_err(db_err)?
+            .ok_or_else(|| McpError::invalid_params("タスクが見つからない", None))?;
+
+        let new_title = params.title.as_deref().unwrap_or(&task.title);
+        let new_category = params.category.as_deref().unwrap_or(&task.category_id);
+        let new_duration = params.duration.unwrap_or(task.duration_min);
+        let new_deadline = match &params.deadline {
+            Some(s) if s == "none" => None,
+            Some(s) => Some(s.as_str()),
+            None => task.deadline.as_deref(),
+        };
+
+        db::update_task_with_deadline(
+            &conn,
+            params.id,
+            new_title,
+            new_category,
+            new_duration,
+            task.fixed_start,
+            new_deadline,
+        )
+        .map_err(db_err)?;
+        ok_json(json!({ "ok": true, "id": params.id }))
+    }
+
+    #[tool(description = "Delete a backlog task by ID.")]
+    fn delete_backlog(
+        &self,
+        Parameters(params): Parameters<TaskIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().unwrap();
+        db::delete_task(&conn, params.id).map_err(db_err)?;
+        ok_json(json!({ "ok": true, "id": params.id }))
+    }
+
+    #[tool(
+        description = "Move a backlog task into a day's schedule. Optionally specify position (0-based). Defaults to appending at end."
+    )]
+    fn schedule_backlog(
+        &self,
+        Parameters(params): Parameters<ScheduleBacklogParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let date = params.date.unwrap_or_else(today);
+        let conn = self.conn.lock().unwrap();
+        match params.position {
+            Some(pos) => db::insert_backlog_task_at(&conn, params.id, &date, pos),
+            None => db::append_backlog_task(&conn, params.id, &date),
+        }
+        .map_err(db_err)?;
+        ok_json(json!({ "ok": true, "id": params.id, "date": date }))
+    }
+
+    #[tool(
+        description = "Move a scheduled task to backlog. The task keeps its title, category, duration, and deadline but is removed from the day's schedule."
+    )]
+    fn to_backlog(
+        &self,
+        Parameters(params): Parameters<ToBacklogParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().unwrap();
+        db::set_backlog_flag(&conn, params.id, true).map_err(db_err)?;
+        ok_json(json!({ "ok": true, "id": params.id }))
+    }
 }
 
 #[tool_handler]
@@ -302,7 +452,9 @@ impl ServerHandler for YtaskyMcp {
             instructions: Some(
                 "ytasky is a time-blocking scheduler. Tasks have a date, title, category, \
                  duration (minutes), optional fixed start time, and actual start/end times. \
-                 Categories: work, study, sleep, meal, exercise, personal, break, commute, errand."
+                 Categories: work, study, sleep, meal, exercise, personal, break, commute, errand. \
+                 Backlog tasks are unscheduled tasks with optional deadlines that can be inserted \
+                 into any day's schedule."
                     .into(),
             ),
         }
@@ -323,6 +475,7 @@ fn serialize_tasks(tasks: &[model::Task]) -> Vec<serde_json::Value> {
                 "actual_start": t.actual_start.map(model::format_time),
                 "actual_end": t.actual_end.map(model::format_time),
                 "recurrence_id": t.recurrence_id,
+                "deadline": t.deadline,
             })
         })
         .collect()

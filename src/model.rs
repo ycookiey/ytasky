@@ -51,6 +51,7 @@ pub struct RecurrenceException {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct OverflowTask {
     pub title: String,
     pub category_id: String,

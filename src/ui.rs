@@ -42,16 +42,11 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     match app.view_mode {
         ViewMode::TableView => {
-            let main_chunks = Layout::horizontal([
-                Constraint::Length(24),
-                Constraint::Min(0),
-                Constraint::Length(30),
-            ])
-            .split(chunks[1]);
+            let main_chunks =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(30)]).split(chunks[1]);
 
-            draw_sidebar(f, main_chunks[0], app);
-            draw_task_table(f, main_chunks[1], app);
-            draw_backlog_panel(f, main_chunks[2], app);
+            draw_multi_day_columns(f, main_chunks[0], app);
+            draw_backlog_panel(f, main_chunks[1], app);
         }
         ViewMode::TimelineView => {
             draw_timeline_view(f, chunks[1], app);
@@ -68,16 +63,20 @@ fn draw_title_bar(f: &mut Frame, area: Rect, app: &App) {
     let remaining = app.remaining_minutes();
     let rem_str = format_duration(remaining);
     let now_str = Local::now().format("%H:%M").to_string();
+    let today_marker = if app.is_today() { " *" } else { "" };
+    let cursor_date = app.cursor_date().to_string();
     let date_label = match app.view_mode {
-        ViewMode::ReportView => format!("Report: {}", app.date),
-        _ => NaiveDate::parse_from_str(&app.date, "%Y-%m-%d")
-            .map(|date| format!("{} ({})", app.date, date.format("%a")))
-            .unwrap_or_else(|_| app.date.clone()),
+        ViewMode::ReportView => format!("Report: {cursor_date}"),
+        _ => NaiveDate::parse_from_str(&cursor_date, "%Y-%m-%d")
+            .map(|date| format!("{cursor_date} ({})", date.format("%a")))
+            .unwrap_or(cursor_date),
     };
     let mut title = format!(
-        "  {}  [{}]    余り {} / 24h    [u:{} r:{}]",
+        "  {}{}  [{}]  [{}d]    余り {} / 24h    [u:{} r:{}]",
         date_label,
+        today_marker,
         now_str,
+        app.view_days,
         rem_str,
         app.undo_count(),
         app.redo_count()
@@ -92,93 +91,39 @@ fn draw_title_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(bar, area);
 }
 
-fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
-    let mut lines: Vec<Line> = Vec::new();
-
-    // 前日からのはみ出し
-    for overflow in &app.overflow_tasks {
-        let time_str = format_time(overflow.start_min);
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {time_str} "),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                format!("░ {}", overflow.title),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
+fn draw_multi_day_columns(f: &mut Frame, area: Rect, app: &App) {
+    if app.view_days == 0 {
+        return;
     }
 
-    let schedule = build_schedule(app);
-    let buffers = build_buffers(app, &schedule);
-    let mut buffer_idx = 0usize;
+    let constraints: Vec<Constraint> = (0..app.view_days)
+        .map(|_| Constraint::Ratio(1, app.view_days as u32))
+        .collect();
+    let columns = Layout::horizontal(constraints).split(area);
 
-    // タイムライン: タスクを時刻順に表示
-    for (start, _, task) in &schedule {
-        if let Some((buffer_start, buffer_end)) = buffers.get(buffer_idx)
-            && *buffer_end == *start
-        {
-            let time_str = format_time(*buffer_start);
-            let buffer_minutes = buffer_end - buffer_start;
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {time_str} "),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("▒ buffer {buffer_minutes}m"),
-                    Style::default().fg(Color::Rgb(120, 120, 150)),
-                ),
-            ]));
-            buffer_idx += 1;
+    for (col_idx, (date, tasks)) in app.day_tasks.iter().enumerate() {
+        if col_idx >= columns.len() {
+            break;
         }
-
-        let time_str = format_time(*start);
-        let color = category_color(&task.category_id);
-
-        // 簡易ブロック表示
-        let block_char = if task.actual_end.is_some() {
-            "▓"
-        } else if task.actual_start.is_some() {
-            "▒"
+        let is_active = col_idx == app.col_cursor && app.focus == PanelFocus::Table;
+        let cursor_row = if is_active {
+            Some(app.row_cursor)
         } else {
-            "░"
+            None
         };
-        let title = if app.is_today() {
-            if let Some(actual_start) = task.actual_start {
-                if task.actual_end.is_none() {
-                    let elapsed = (current_minutes() - actual_start).max(0);
-                    format!("{} ({}m)", task.title, elapsed)
-                } else {
-                    task.title.clone()
-                }
-            } else {
-                task.title.clone()
-            }
-        } else {
-            task.title.clone()
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {time_str} "),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(format!("{block_char} {title}"), Style::default().fg(color)),
-        ]));
+        draw_day_column(f, columns[col_idx], app, date, tasks, is_active, cursor_row);
     }
-
-    if lines.is_empty() {
-        lines.push(Line::from("  タスクなし"));
-    }
-
-    let sidebar =
-        Paragraph::new(lines).block(Block::default().borders(Borders::RIGHT).title(" Timeline "));
-    f.render_widget(sidebar, area);
 }
 
-fn draw_task_table(f: &mut Frame, area: Rect, app: &App) {
+fn draw_day_column(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    date: &str,
+    tasks: &[Task],
+    is_active: bool,
+    cursor_row: Option<usize>,
+) {
     let header = Row::new(vec![
         Cell::from("#"),
         Cell::from("時刻"),
@@ -193,25 +138,13 @@ fn draw_task_table(f: &mut Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     );
 
-    let schedule = build_schedule(app);
-    let buffers = build_buffers(app, &schedule);
-
+    let schedule = build_schedule(tasks);
+    let buffers = build_buffers(&schedule);
     let mut rows: Vec<Row> = Vec::new();
 
-    // 前日からのはみ出しタスクを先頭に表示
-    for overflow in &app.overflow_tasks {
-        rows.push(
-            Row::new(vec![
-                Cell::from(""),
-                Cell::from(format_time(overflow.start_min)),
-                Cell::from(format_duration(overflow.end_min - overflow.start_min)),
-                Cell::from(overflow.title.clone()),
-                Cell::from(category_name(app, &overflow.category_id)),
-                Cell::from("(前日)"),
-            ])
-            .style(Style::default().fg(Color::DarkGray)),
-        );
-    }
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let is_today = date == today;
+    let compact = area.width < 42;
 
     let mut buffer_idx = 0usize;
     for (i, (start, _, task)) in schedule.iter().enumerate() {
@@ -236,7 +169,7 @@ fn draw_task_table(f: &mut Frame, area: Rect, app: &App) {
         let status = if task.actual_end.is_some() {
             "done".to_string()
         } else if let Some(actual_start) = task.actual_start {
-            if app.is_today() {
+            if is_today {
                 let elapsed = (current_minutes() - actual_start).max(0);
                 format!("▶{}", format_duration(elapsed))
             } else {
@@ -247,10 +180,15 @@ fn draw_task_table(f: &mut Frame, area: Rect, app: &App) {
         };
 
         let color = category_color(&task.category_id);
-        let style = if i == app.cursor {
+        let style = if Some(i) == cursor_row {
             Style::default().bg(Color::Rgb(50, 50, 80)).fg(Color::White)
         } else {
             Style::default().fg(color)
+        };
+        let category_text = if compact {
+            compact_category_name(app, &task.category_id)
+        } else {
+            category_name(app, &task.category_id)
         };
 
         rows.push(
@@ -259,23 +197,27 @@ fn draw_task_table(f: &mut Frame, area: Rect, app: &App) {
                 Cell::from(format_time(*start)),
                 Cell::from(format_duration(task.duration_min)),
                 Cell::from(task.title.clone()),
-                Cell::from(category_name(app, &task.category_id)),
+                Cell::from(category_text),
                 Cell::from(status),
             ])
             .style(style),
         );
     }
 
-    let widths = [
-        Constraint::Length(3),
-        Constraint::Length(6),
-        Constraint::Length(6),
-        Constraint::Min(10),
-        Constraint::Length(14),
-        Constraint::Length(7),
-    ];
+    if rows.is_empty() {
+        rows.push(
+            Row::new(vec![
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from("タスクなし"),
+                Cell::from(""),
+                Cell::from(""),
+            ])
+            .style(Style::default().fg(Color::DarkGray)),
+        );
+    }
 
-    // 最後のタスクの下に終了時刻を表示
     if let Some((_, end, _)) = schedule.last() {
         rows.push(
             Row::new(vec![
@@ -290,17 +232,59 @@ fn draw_task_table(f: &mut Frame, area: Rect, app: &App) {
         );
     }
 
-    let mut block = Block::default().borders(Borders::ALL).title(" Tasks ");
-    if app.view_mode == ViewMode::TableView
-        && app.focus == PanelFocus::Table
-        && app.backlog_select_cursor().is_none()
-    {
+    let widths = if compact {
+        [
+            Constraint::Length(2),
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Min(8),
+            Constraint::Length(4),
+            Constraint::Length(5),
+        ]
+    } else {
+        [
+            Constraint::Length(3),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Min(10),
+            Constraint::Length(14),
+            Constraint::Length(7),
+        ]
+    };
+
+    let title_style = if is_today {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(Span::styled(
+            format!(" {} ", format_column_date(date)),
+            title_style,
+        )));
+    if is_active && app.backlog_select_cursor().is_none() {
         block = block.border_style(Style::default().fg(Color::Yellow));
     }
 
     let table = Table::new(rows, widths).header(header).block(block);
-
     f.render_widget(table, area);
+}
+
+fn format_column_date(date: &str) -> String {
+    NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map(|d| format!("{:02}/{:02} ({})", d.month(), d.day(), d.format("%a")))
+        .unwrap_or_else(|_| date.to_string())
+}
+
+fn compact_category_name(app: &App, cat_id: &str) -> String {
+    app.categories
+        .iter()
+        .find(|cat| cat.id == cat_id)
+        .map(|cat| cat.icon.clone())
+        .unwrap_or_else(|| cat_id.chars().take(3).collect())
 }
 
 fn draw_backlog_panel(f: &mut Frame, area: Rect, app: &App) {
@@ -350,27 +334,64 @@ fn draw_backlog_panel(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_timeline_view(f: &mut Frame, area: Rect, app: &App) {
-    // レイアウト: タイムライン | サイドバー
-    let chunks = Layout::horizontal([Constraint::Min(0), Constraint::Length(24)]).split(area);
+    if app.view_days == 0 {
+        return;
+    }
 
-    draw_timeline_main(f, chunks[0], app);
-    draw_timeline_sidebar(f, chunks[1], app);
+    let constraints: Vec<Constraint> = (0..app.view_days)
+        .map(|_| Constraint::Ratio(1, app.view_days as u32))
+        .collect();
+    let columns = Layout::horizontal(constraints).split(area);
+
+    for (col_idx, (date, tasks)) in app.day_tasks.iter().enumerate() {
+        if col_idx >= columns.len() {
+            break;
+        }
+        let is_active = col_idx == app.col_cursor;
+        let cursor_row = if is_active { Some(app.row_cursor) } else { None };
+        draw_timeline_column(f, columns[col_idx], app, date, tasks, is_active, cursor_row);
+    }
 }
 
-fn draw_timeline_main(f: &mut Frame, area: Rect, app: &App) {
-    let schedule = build_schedule(app);
-    let buffers = build_buffers(app, &schedule);
+fn draw_timeline_column(
+    f: &mut Frame,
+    area: Rect,
+    _app: &App,
+    date: &str,
+    tasks: &[Task],
+    is_active: bool,
+    cursor_row: Option<usize>,
+) {
+    let schedule = build_schedule(tasks);
+    let buffers = build_buffers(&schedule);
 
-    let block_widget = Block::default()
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let is_today = date == today;
+    let title_style = if is_today {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let mut block_widget = Block::default()
         .borders(Borders::ALL)
-        .title(" Timeline View ");
+        .title(Line::from(Span::styled(
+            format!(" {} ", format_column_date(date)),
+            title_style,
+        )));
+    if is_active {
+        block_widget = block_widget.border_style(Style::default().fg(Color::Yellow));
+    }
+
     let inner = block_widget.inner(area);
-    let bar_width = inner.width.saturating_sub(7) as usize; // 7 = " HH:MM "
+    let compact = inner.width < 30;
+    let label_width = if compact { 6 } else { 7 };
+    let bar_width = inner.width.saturating_sub(label_width) as usize;
 
     let max_end = schedule
         .iter()
         .map(|(_, end, _)| *end)
-        .chain(app.overflow_tasks.iter().map(|o| o.end_min))
         .max()
         .unwrap_or(DAY_MINUTES)
         .max(DAY_MINUTES);
@@ -378,7 +399,7 @@ fn draw_timeline_main(f: &mut Frame, area: Rect, app: &App) {
 
     let mut lines: Vec<Line> = Vec::with_capacity(total_rows);
     let mut cursor_start_row: Option<usize> = None;
-    let now_min = app.is_today().then(current_minutes);
+    let now_min = is_today.then(current_minutes);
 
     for row_idx in 0..total_rows {
         let slot_start = (row_idx as i32) * 30;
@@ -391,7 +412,10 @@ fn draw_timeline_main(f: &mut Frame, area: Rect, app: &App) {
             let now_text = format!("─── {} ───", format_time(now_min));
             let padded = format!("{:^width$}", now_text, width = bar_width);
             lines.push(Line::from(vec![
-                Span::styled("       ", Style::default().fg(Color::Red)),
+                Span::styled(
+                    format!("{:width$}", "", width = label_width as usize),
+                    Style::default().fg(Color::Red),
+                ),
                 Span::styled(
                     padded,
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -399,37 +423,15 @@ fn draw_timeline_main(f: &mut Frame, area: Rect, app: &App) {
             ]));
         }
 
-        // 時刻ラベル (毎正時のみ)
         let label = if slot_start % 60 == 0 {
-            format!(" {:>5} ", format_time(slot_start))
-        } else {
-            "       ".to_string()
-        };
-
-        // オーバーフロータスク
-        if let Some(ov) = app
-            .overflow_tasks
-            .iter()
-            .find(|o| o.start_min < slot_end && o.end_min > slot_start)
-        {
-            let is_start = slot_start <= ov.start_min && ov.start_min < slot_end;
-            let color = muted_color(category_color(&ov.category_id));
-            let text = if is_start {
-                format!("  {} ", ov.title)
+            if compact {
+                format!(" {:>5}", format_time(slot_start))
             } else {
-                String::new()
-            };
-            let padded = format!("{:<width$}", text, width = bar_width);
-
-            lines.push(Line::from(vec![
-                Span::styled(label, Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    padded,
-                    Style::default().bg(color).fg(Color::Rgb(200, 200, 200)),
-                ),
-            ]));
-            continue;
-        }
+                format!(" {:>5} ", format_time(slot_start))
+            }
+        } else {
+            " ".repeat(label_width as usize)
+        };
 
         // バッファ区間
         if let Some((buffer_start, buffer_end)) = buffers
@@ -463,7 +465,7 @@ fn draw_timeline_main(f: &mut Frame, area: Rect, app: &App) {
             .find(|(_, (start, end, _))| *start < slot_end && *end > slot_start)
         {
             let is_start = slot_start <= *task_start && *task_start < slot_end;
-            let is_selected = idx == app.cursor;
+            let is_selected = cursor_row.is_some_and(|row| idx == row);
 
             if is_selected && cursor_start_row.is_none() {
                 cursor_start_row = Some(lines.len());
@@ -513,13 +515,16 @@ fn draw_timeline_main(f: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    // カーソル位置に基づいてスクロール
     let visible_rows = inner.height as usize;
-    let scroll_y = if let Some(cr) = cursor_start_row {
-        if cr < visible_rows / 3 {
-            0
+    let scroll_y = if cursor_row.is_some() {
+        if let Some(cr) = cursor_start_row {
+            if cr < visible_rows / 3 {
+                0
+            } else {
+                (cr - visible_rows / 3) as u16
+            }
         } else {
-            (cr - visible_rows / 3) as u16
+            0
         }
     } else {
         0
@@ -530,66 +535,6 @@ fn draw_timeline_main(f: &mut Frame, area: Rect, app: &App) {
         .scroll((scroll_y, 0));
 
     f.render_widget(timeline, area);
-}
-
-fn draw_timeline_sidebar(f: &mut Frame, area: Rect, app: &App) {
-    let mut lines: Vec<Line> = Vec::new();
-
-    lines.push(Line::from(Span::styled(
-        " カテゴリ集計",
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::styled(
-        " ────────────────────",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    for report in &app.category_reports {
-        let color = category_color(&report.category_id);
-        lines.push(Line::from(vec![
-            Span::styled(" █ ", Style::default().fg(color)),
-            Span::styled(
-                format!("{:<8}", report.category_name),
-                Style::default().fg(color),
-            ),
-            Span::styled(
-                format_duration(report.planned_min),
-                Style::default().fg(Color::White),
-            ),
-        ]));
-    }
-
-    if !app.category_reports.is_empty() {
-        lines.push(Line::from(""));
-        let total: i32 = app.category_reports.iter().map(|r| r.planned_min).sum();
-        lines.push(Line::from(vec![
-            Span::styled(" 合計 ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} / 24h", format_duration(total)),
-                Style::default().fg(Color::White),
-            ),
-        ]));
-
-        let remaining = app.remaining_minutes();
-        let rem_color = if remaining < 0 {
-            Color::Red
-        } else {
-            Color::Green
-        };
-        lines.push(Line::from(vec![
-            Span::styled(" 余り ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format_duration(remaining), Style::default().fg(rem_color)),
-        ]));
-    }
-
-    let sidebar = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::LEFT | Borders::TOP | Borders::BOTTOM)
-            .title(" Stats "),
-    );
-    f.render_widget(sidebar, area);
 }
 
 fn draw_report_view(f: &mut Frame, area: Rect, app: &App) {
@@ -710,11 +655,11 @@ fn draw_report_view(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(title_table, chunks[1]);
 }
 
-fn build_schedule(app: &App) -> Vec<(i32, i32, &Task)> {
-    let mut schedule: Vec<(i32, i32, &Task)> = Vec::with_capacity(app.tasks.len());
-    let mut current_min = app.overflow_tasks.last().map(|o| o.end_min).unwrap_or(0);
+fn build_schedule(tasks: &[Task]) -> Vec<(i32, i32, &Task)> {
+    let mut schedule: Vec<(i32, i32, &Task)> = Vec::with_capacity(tasks.len());
+    let mut current_min = 0;
 
-    for task in &app.tasks {
+    for task in tasks {
         let start = match task.fixed_start {
             Some(fixed_start) => normalize_fixed_start(fixed_start, current_min),
             None => current_min,
@@ -727,13 +672,9 @@ fn build_schedule(app: &App) -> Vec<(i32, i32, &Task)> {
     schedule
 }
 
-fn build_buffers(app: &App, schedule: &[(i32, i32, &Task)]) -> Vec<(i32, i32)> {
+fn build_buffers(schedule: &[(i32, i32, &Task)]) -> Vec<(i32, i32)> {
     let mut buffers = Vec::new();
-    let mut previous_end = app
-        .overflow_tasks
-        .last()
-        .map(|overflow| overflow.end_min)
-        .unwrap_or(0);
+    let mut previous_end = 0;
 
     for (start, end, _) in schedule {
         if previous_end < *start {
@@ -752,31 +693,6 @@ fn normalize_fixed_start(fixed_start: i32, current_min: i32) -> i32 {
 
     let shift_days = (current_min - fixed_start + DAY_MINUTES - 1) / DAY_MINUTES;
     fixed_start + shift_days * DAY_MINUTES
-}
-
-fn brighten_color(color: Color) -> Color {
-    match color {
-        Color::Rgb(r, g, b) => Color::Rgb(
-            (r as u16 + 50).min(255) as u8,
-            (g as u16 + 50).min(255) as u8,
-            (b as u16 + 50).min(255) as u8,
-        ),
-        _ => Color::White,
-    }
-}
-
-fn muted_color(color: Color) -> Color {
-    match color {
-        Color::Rgb(r, g, b) => {
-            let dark = (80u16, 80u16, 80u16);
-            Color::Rgb(
-                ((r as u16 + dark.0 * 2) / 3) as u8,
-                ((g as u16 + dark.1 * 2) / 3) as u8,
-                ((b as u16 + dark.2 * 2) / 3) as u8,
-            )
-        }
-        _ => Color::DarkGray,
-    }
 }
 
 fn format_signed_duration(minutes: i32) -> String {
@@ -1035,4 +951,29 @@ fn category_name(app: &App, cat_id: &str) -> String {
         .find(|cat| cat.id == cat_id)
         .map(|cat| format!("{} {}", cat.icon, cat.name))
         .unwrap_or_else(|| cat_id.to_string())
+}
+
+fn brighten_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            (r as u16 + 50).min(255) as u8,
+            (g as u16 + 50).min(255) as u8,
+            (b as u16 + 50).min(255) as u8,
+        ),
+        _ => Color::White,
+    }
+}
+
+fn muted_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => {
+            let dark = (80u16, 80u16, 80u16);
+            Color::Rgb(
+                ((r as u16 + dark.0 * 2) / 3) as u8,
+                ((g as u16 + dark.1 * 2) / 3) as u8,
+                ((b as u16 + dark.2 * 2) / 3) as u8,
+            )
+        }
+        _ => Color::DarkGray,
+    }
 }

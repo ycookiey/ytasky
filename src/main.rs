@@ -56,12 +56,11 @@ fn run_tui() -> Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        if event::poll(Duration::from_secs(10))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key);
-                }
-            }
+        if event::poll(Duration::from_secs(10))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            app.handle_key(key);
         }
 
         if app.should_quit {

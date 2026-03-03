@@ -82,6 +82,58 @@ pub enum Commands {
     },
     /// カテゴリ一覧
     Categories,
+    /// バックログ一覧
+    Backlog,
+    /// バックログにタスク追加
+    AddBacklog {
+        /// タスク名
+        #[arg(short, long)]
+        title: String,
+        /// カテゴリID
+        #[arg(short, long)]
+        category: String,
+        /// 所要時間(分)
+        #[arg(short = 'D', long)]
+        duration: i32,
+        /// 期限 (YYYY-MM-DD or "YYYY-MM-DD HH:MM")
+        #[arg(long)]
+        deadline: Option<String>,
+    },
+    /// バックログタスク編集
+    EditBacklog {
+        /// タスクID
+        id: i64,
+        #[arg(short, long)]
+        title: Option<String>,
+        #[arg(short, long)]
+        category: Option<String>,
+        #[arg(short = 'D', long)]
+        duration: Option<i32>,
+        /// 期限 ("none"で削除)
+        #[arg(long)]
+        deadline: Option<String>,
+    },
+    /// バックログタスク削除
+    DeleteBacklog {
+        /// タスクID
+        id: i64,
+    },
+    /// バックログからスケジュールに挿入
+    ScheduleBacklog {
+        /// バックログタスクID
+        id: i64,
+        /// 対象日 (YYYY-MM-DD)
+        #[arg(long)]
+        date: Option<String>,
+        /// 挿入位置 (0始まり、省略で末尾)
+        #[arg(long)]
+        position: Option<usize>,
+    },
+    /// スケジュールタスクをバックログに送る
+    ToBacklog {
+        /// タスクID
+        id: i64,
+    },
     /// MCP サーバー起動
     Mcp,
 }
@@ -212,6 +264,65 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
         Commands::Categories => {
             let cats = db::load_categories(conn)?;
             print_json(&cats);
+        }
+        Commands::Backlog => {
+            let tasks = db::load_backlog_tasks(conn)?;
+            print_json(&tasks);
+        }
+        Commands::AddBacklog {
+            title,
+            category,
+            duration,
+            deadline,
+        } => {
+            let id =
+                db::insert_backlog_task(conn, &title, &category, duration, deadline.as_deref())?;
+            print_json(&serde_json::json!({ "id": id }));
+        }
+        Commands::EditBacklog {
+            id,
+            title,
+            category,
+            duration,
+            deadline,
+        } => {
+            let task = db::load_task_by_id(conn, id)?.context("タスクが見つからない")?;
+
+            let new_title = title.as_deref().unwrap_or(&task.title);
+            let new_category = category.as_deref().unwrap_or(&task.category_id);
+            let new_duration = duration.unwrap_or(task.duration_min);
+            let new_deadline = match &deadline {
+                Some(s) if s == "none" => None,
+                Some(s) => Some(s.as_str()),
+                None => task.deadline.as_deref(),
+            };
+
+            db::update_task_with_deadline(
+                conn,
+                id,
+                new_title,
+                new_category,
+                new_duration,
+                task.fixed_start,
+                new_deadline,
+            )?;
+            print_json(&serde_json::json!({ "ok": true, "id": id }));
+        }
+        Commands::DeleteBacklog { id } => {
+            db::delete_task(conn, id)?;
+            print_json(&serde_json::json!({ "ok": true, "id": id }));
+        }
+        Commands::ScheduleBacklog { id, date, position } => {
+            let date = date.unwrap_or_else(today);
+            match position {
+                Some(pos) => db::insert_backlog_task_at(conn, id, &date, pos)?,
+                None => db::append_backlog_task(conn, id, &date)?,
+            }
+            print_json(&serde_json::json!({ "ok": true, "id": id, "date": date }));
+        }
+        Commands::ToBacklog { id } => {
+            db::set_backlog_flag(conn, id, true)?;
+            print_json(&serde_json::json!({ "ok": true, "id": id }));
         }
         Commands::Mcp => {
             // MCP は main.rs から直接呼ぶ
