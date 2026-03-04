@@ -35,6 +35,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // タイトルバー
         Constraint::Min(0),    // メインエリア
+        Constraint::Length(1), // キーバインドバー
     ])
     .split(f.area());
 
@@ -56,6 +57,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
     }
 
+    draw_keybindings_bar(f, chunks[2], app);
     draw_modal_if_needed(f, app);
 }
 
@@ -88,6 +90,84 @@ fn draw_title_bar(f: &mut Frame, area: Rect, app: &App) {
 
     let bar =
         Paragraph::new(title).style(Style::default().bg(Color::Rgb(40, 40, 80)).fg(Color::White));
+    f.render_widget(bar, area);
+}
+
+fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
+    let items: Vec<(&str, &str)> = match &app.input_mode {
+        InputMode::TaskForm(_) => {
+            vec![("Enter", "次/保存"), ("Tab", "移動"), ("Esc", "キャンセル")]
+        }
+        InputMode::ConfirmDelete { .. } | InputMode::ConfirmDeleteRecurrence { .. } => {
+            vec![("Enter", "削除"), ("Esc", "キャンセル")]
+        }
+        InputMode::RecurrenceForm(_) => {
+            vec![("j/k", "選択"), ("h/l", "曜日"), ("Space", "切替"), ("Tab", "終了日"), ("Enter", "保存"), ("Esc", "キャンセル")]
+        }
+        InputMode::BacklogSelect { .. } => {
+            vec![("j/k", "移動"), ("Enter", "挿入"), ("Esc", "キャンセル")]
+        }
+        InputMode::Normal => match app.view_mode {
+            ViewMode::ReportView => vec![("q/Esc", "閉じる")],
+            ViewMode::TimelineView => vec![
+                ("j/k", "移動"),
+                ("h/l", "日"),
+                ("a", "追加"),
+                ("e", "編集"),
+                ("d", "削除"),
+                ("J/K", "並替"),
+                ("Space", "実績"),
+                ("t", "Table"),
+                ("r", "Report"),
+                ("1-9", "日数"),
+                ("q", "終了"),
+            ],
+            ViewMode::TableView => match app.focus {
+                PanelFocus::Table => vec![
+                    ("j/k", "移動"),
+                    ("h/l", "日"),
+                    ("a", "追加"),
+                    ("e", "編集"),
+                    ("d", "削除"),
+                    ("J/K", "並替"),
+                    ("Space", "実績"),
+                    ("Tab", "BL"),
+                    ("B", "→BL"),
+                    ("p", "←BL"),
+                    ("t", "TL"),
+                    ("r", "Report"),
+                    ("1-9", "日数"),
+                    ("u/^r", "undo/redo"),
+                    ("q", "終了"),
+                ],
+                PanelFocus::Backlog => vec![
+                    ("j/k", "移動"),
+                    ("Enter", "挿入"),
+                    ("a", "追加"),
+                    ("e", "編集"),
+                    ("d", "削除"),
+                    ("Tab", "Table"),
+                    ("q", "終了"),
+                ],
+            },
+        },
+    };
+
+    let key_style = Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(Color::DarkGray);
+
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    for (idx, (key, desc)) in items.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(*key, key_style));
+        spans.push(Span::styled(format!(":{desc}"), desc_style));
+    }
+
+    let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(24, 24, 24)));
     f.render_widget(bar, area);
 }
 
