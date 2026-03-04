@@ -160,6 +160,65 @@ struct ToBacklogParams {
     id: i64,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddRecurrenceParams {
+    /// Task title
+    title: String,
+    /// Category ID
+    category: String,
+    /// Duration in minutes
+    duration: i32,
+    /// Fixed start time in HH:MM format (optional)
+    #[serde(default)]
+    fixed_start: Option<String>,
+    /// Pattern: daily, weekly, monthly
+    pattern: String,
+    /// Pattern data JSON (optional), e.g. {"days":[1,3,5]}
+    #[serde(default)]
+    pattern_data: Option<String>,
+    /// Start date in YYYY-MM-DD
+    start_date: String,
+    /// End date in YYYY-MM-DD (optional)
+    #[serde(default)]
+    end_date: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct EditRecurrenceParams {
+    /// Recurrence rule ID
+    id: i64,
+    /// New title (optional)
+    #[serde(default)]
+    title: Option<String>,
+    /// New category ID (optional)
+    #[serde(default)]
+    category: Option<String>,
+    /// New duration in minutes (optional)
+    #[serde(default)]
+    duration: Option<i32>,
+    /// New fixed start in HH:MM, or "none" (optional)
+    #[serde(default)]
+    fixed_start: Option<String>,
+    /// New pattern (optional)
+    #[serde(default)]
+    pattern: Option<String>,
+    /// New pattern data JSON, or "none" (optional)
+    #[serde(default)]
+    pattern_data: Option<String>,
+    /// New start date YYYY-MM-DD (optional)
+    #[serde(default)]
+    start_date: Option<String>,
+    /// New end date YYYY-MM-DD, or "none" (optional)
+    #[serde(default)]
+    end_date: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct RecurrenceIdParams {
+    /// Recurrence rule ID
+    id: i64,
+}
+
 // --- MCP Server ---
 
 #[derive(Clone)]
@@ -440,6 +499,98 @@ impl YtaskyMcp {
         db::set_backlog_flag(&conn, params.id, true).map_err(db_err)?;
         ok_json(json!({ "ok": true, "id": params.id }))
     }
+
+    #[tool(
+        description = "Add a recurrence rule. Pattern must be one of: daily, weekly, monthly. pattern_data may contain JSON like {\"days\":[1,3,5]}."
+    )]
+    fn add_recurrence(
+        &self,
+        Parameters(params): Parameters<AddRecurrenceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let fixed = params.fixed_start.map(|s| parse_time(&s)).transpose()?;
+        let conn = self.conn.lock().unwrap();
+        let id = db::insert_recurrence(
+            &conn,
+            &params.title,
+            &params.category,
+            params.duration,
+            fixed,
+            &params.pattern,
+            params.pattern_data.as_deref(),
+            &params.start_date,
+            params.end_date.as_deref(),
+        )
+        .map_err(db_err)?;
+        ok_json(json!({ "ok": true, "id": id }))
+    }
+
+    #[tool(
+        description = "Edit an existing recurrence rule. Omitted fields keep current values. Use fixed_start=\"none\" or end_date=\"none\" to clear values."
+    )]
+    fn edit_recurrence(
+        &self,
+        Parameters(params): Parameters<EditRecurrenceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().unwrap();
+        let current = db::load_recurrences(&conn)
+            .map_err(db_err)?
+            .into_iter()
+            .find(|item| item.id == params.id)
+            .ok_or_else(|| McpError::invalid_params("繰り返しルールが見つからない", None))?;
+
+        let new_title = params.title.unwrap_or(current.title);
+        let new_category = params.category.unwrap_or(current.category_id);
+        let new_duration = params.duration.unwrap_or(current.duration_min);
+        let new_fixed_start = match params.fixed_start.as_deref() {
+            Some("none") => None,
+            Some(s) => Some(parse_time(s)?),
+            None => current.fixed_start,
+        };
+        let new_pattern = params.pattern.unwrap_or(current.pattern);
+        let new_pattern_data = match params.pattern_data.as_deref() {
+            Some("none") => None,
+            Some(data) => Some(data),
+            None => current.pattern_data.as_deref(),
+        };
+        let new_start_date = params.start_date.unwrap_or(current.start_date);
+        let new_end_date = match params.end_date.as_deref() {
+            Some("none") => None,
+            Some(date) => Some(date),
+            None => current.end_date.as_deref(),
+        };
+
+        db::update_recurrence(
+            &conn,
+            params.id,
+            &new_title,
+            &new_category,
+            new_duration,
+            new_fixed_start,
+            &new_pattern,
+            new_pattern_data,
+            &new_start_date,
+            new_end_date,
+        )
+        .map_err(db_err)?;
+        ok_json(json!({ "ok": true, "id": params.id }))
+    }
+
+    #[tool(description = "Delete a recurrence rule by ID.")]
+    fn delete_recurrence(
+        &self,
+        Parameters(params): Parameters<RecurrenceIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().unwrap();
+        db::delete_recurrence(&conn, params.id).map_err(db_err)?;
+        ok_json(json!({ "ok": true, "id": params.id }))
+    }
+
+    #[tool(description = "List all recurrence rules.")]
+    fn list_recurrences(&self) -> Result<CallToolResult, McpError> {
+        let conn = self.conn.lock().unwrap();
+        let recurrences = db::load_recurrences(&conn).map_err(db_err)?;
+        ok_json(json!({ "recurrences": recurrences }))
+    }
 }
 
 #[tool_handler]
@@ -454,7 +605,8 @@ impl ServerHandler for YtaskyMcp {
                  duration (minutes), optional fixed start time, and actual start/end times. \
                  Categories: work, study, sleep, meal, exercise, personal, break, commute, errand. \
                  Backlog tasks are unscheduled tasks with optional deadlines that can be inserted \
-                 into any day's schedule."
+                 into any day's schedule. Recurrence rules can generate tasks automatically with \
+                 daily/weekly/monthly patterns."
                     .into(),
             ),
         }

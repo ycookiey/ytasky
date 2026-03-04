@@ -8,10 +8,10 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, FormField, FormMode, FormTarget, InputMode, PanelFocus, TaskFormState, ViewMode,
-    current_minutes,
+    App, BacklogTab, DeleteChoice, FormField, FormMode, FormTarget, InputMode, PanelFocus,
+    RecurrenceFormField, RecurrenceFormState, TaskFormState, ViewMode, current_minutes,
 };
-use crate::model::{Task, format_deadline, format_duration, format_time};
+use crate::model::{Recurrence, Task, format_deadline, format_duration, format_time};
 
 const DAY_MINUTES: i32 = 24 * 60;
 
@@ -190,13 +190,18 @@ fn draw_day_column(
         } else {
             category_name(app, &task.category_id)
         };
+        let title_text = if task.recurrence_id.is_some() {
+            format!("↻ {}", task.title)
+        } else {
+            task.title.clone()
+        };
 
         rows.push(
             Row::new(vec![
                 Cell::from(format!("{}", i + 1)),
                 Cell::from(format_time(*start)),
                 Cell::from(format_duration(task.duration_min)),
-                Cell::from(task.title.clone()),
+                Cell::from(title_text),
                 Cell::from(category_text),
                 Cell::from(status),
             ])
@@ -289,48 +294,93 @@ fn compact_category_name(app: &App, cat_id: &str) -> String {
 
 fn draw_backlog_panel(f: &mut Frame, area: Rect, app: &App) {
     let select_cursor = app.backlog_select_cursor();
-    let cursor = select_cursor.unwrap_or(app.backlog_cursor);
     let focused = app.focus == PanelFocus::Backlog || select_cursor.is_some();
-
-    let today = Local::now().format("%Y-%m-%d").to_string();
-    let mut rows: Vec<Row> = Vec::new();
-
-    if app.backlog_tasks.is_empty() {
-        rows.push(
-            Row::new(vec![
-                Cell::from("バックログなし"),
-                Cell::from("---").style(Style::default().fg(Color::DarkGray)),
-            ])
-            .style(Style::default().fg(Color::DarkGray)),
-        );
-    } else {
-        for (idx, task) in app.backlog_tasks.iter().enumerate() {
-            let (deadline_text, deadline_color) =
-                backlog_deadline_style(task.deadline.as_deref(), &today);
-            let row_style = if idx == cursor {
-                Style::default().bg(Color::Rgb(50, 50, 80)).fg(Color::White)
-            } else {
-                Style::default()
-            };
-            rows.push(
-                Row::new(vec![
-                    Cell::from(task.title.clone()),
-                    Cell::from(deadline_text).style(Style::default().fg(deadline_color)),
-                ])
-                .style(row_style),
-            );
-        }
-    }
 
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" Backlog ({}) ", app.backlog_tasks.len()));
+        .title(backlog_tab_title(app));
     if focused {
         block = block.border_style(Style::default().fg(Color::Yellow));
     }
 
-    let table = Table::new(rows, [Constraint::Min(1), Constraint::Length(8)]).block(block);
-    f.render_widget(table, area);
+    match app.backlog_tab {
+        BacklogTab::Backlog => {
+            let cursor = select_cursor.unwrap_or(app.backlog_cursor);
+            let today = Local::now().format("%Y-%m-%d").to_string();
+            let mut rows: Vec<Row> = Vec::new();
+
+            if app.backlog_tasks.is_empty() {
+                rows.push(
+                    Row::new(vec![
+                        Cell::from("バックログなし"),
+                        Cell::from("---").style(Style::default().fg(Color::DarkGray)),
+                    ])
+                    .style(Style::default().fg(Color::DarkGray)),
+                );
+            } else {
+                for (idx, task) in app.backlog_tasks.iter().enumerate() {
+                    let (deadline_text, deadline_color) =
+                        backlog_deadline_style(task.deadline.as_deref(), &today);
+                    let row_style = if idx == cursor {
+                        Style::default().bg(Color::Rgb(50, 50, 80)).fg(Color::White)
+                    } else {
+                        Style::default()
+                    };
+                    rows.push(
+                        Row::new(vec![
+                            Cell::from(task.title.clone()),
+                            Cell::from(deadline_text).style(Style::default().fg(deadline_color)),
+                        ])
+                        .style(row_style),
+                    );
+                }
+            }
+
+            let table = Table::new(rows, [Constraint::Min(1), Constraint::Length(8)]).block(block);
+            f.render_widget(table, area);
+        }
+        BacklogTab::Recurrences => {
+            let mut rows: Vec<Row> = Vec::new();
+
+            if app.recurrences.is_empty() {
+                rows.push(
+                    Row::new(vec![
+                        Cell::from("繰り返しなし"),
+                        Cell::from("---"),
+                        Cell::from("---"),
+                    ])
+                    .style(Style::default().fg(Color::DarkGray)),
+                );
+            } else {
+                for (idx, recurrence) in app.recurrences.iter().enumerate() {
+                    let row_style = if idx == app.recurrence_cursor {
+                        Style::default().bg(Color::Rgb(50, 50, 80)).fg(Color::White)
+                    } else {
+                        Style::default()
+                    };
+                    rows.push(
+                        Row::new(vec![
+                            Cell::from(recurrence.title.clone()),
+                            Cell::from(recurrence_pattern_label(recurrence)),
+                            Cell::from(recurrence_days_summary(recurrence)),
+                        ])
+                        .style(row_style),
+                    );
+                }
+            }
+
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Min(8),
+                    Constraint::Length(8),
+                    Constraint::Length(10),
+                ],
+            )
+            .block(block);
+            f.render_widget(table, area);
+        }
+    }
 }
 
 fn draw_timeline_view(f: &mut Frame, area: Rect, app: &App) {
@@ -348,7 +398,11 @@ fn draw_timeline_view(f: &mut Frame, area: Rect, app: &App) {
             break;
         }
         let is_active = col_idx == app.col_cursor;
-        let cursor_row = if is_active { Some(app.row_cursor) } else { None };
+        let cursor_row = if is_active {
+            Some(app.row_cursor)
+        } else {
+            None
+        };
         draw_timeline_column(f, columns[col_idx], app, date, tasks, is_active, cursor_row);
     }
 }
@@ -482,7 +536,12 @@ fn draw_timeline_column(
 
             let marker = if is_selected && is_start { "▸" } else { " " };
             let text = if is_start {
-                format!("{marker} {}", task.title)
+                let task_title = if task.recurrence_id.is_some() {
+                    format!("↻ {}", task.title)
+                } else {
+                    task.title.clone()
+                };
+                format!("{marker} {task_title}")
             } else {
                 String::new()
             };
@@ -734,12 +793,92 @@ fn backlog_deadline_style(deadline: Option<&str>, today: &str) -> (String, Color
     )
 }
 
+fn backlog_tab_title(app: &App) -> Line<'static> {
+    let backlog_style = if app.backlog_tab == BacklogTab::Backlog {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let recur_style = if app.backlog_tab == BacklogTab::Recurrences {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    Line::from(vec![
+        Span::styled(
+            format!("[Backlog ({})]", app.backlog_tasks.len()),
+            backlog_style,
+        ),
+        Span::raw(" "),
+        Span::styled(format!("[Recur ({})]", app.recurrences.len()), recur_style),
+    ])
+}
+
+fn recurrence_pattern_label(recurrence: &Recurrence) -> String {
+    match recurrence.pattern.as_str() {
+        "daily" => "daily".to_string(),
+        "weekly" => "weekly".to_string(),
+        "monthly" => "monthly".to_string(),
+        _ => recurrence.pattern.clone(),
+    }
+}
+
+fn recurrence_days_summary(recurrence: &Recurrence) -> String {
+    let days = recurrence
+        .pattern_data
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<crate::model::PatternData>(raw).ok())
+        .and_then(|parsed| parsed.days)
+        .unwrap_or_default();
+
+    match recurrence.pattern.as_str() {
+        "daily" => "毎日".to_string(),
+        "weekly" => {
+            let labels = ["月", "火", "水", "木", "金", "土", "日"];
+            let mut out = String::new();
+            for day in days {
+                if (1..=7).contains(&day) {
+                    out.push_str(labels[(day - 1) as usize]);
+                }
+            }
+            if out.is_empty() {
+                "---".to_string()
+            } else {
+                out
+            }
+        }
+        "monthly" => {
+            if days.is_empty() {
+                return "---".to_string();
+            }
+            let mut sorted = days;
+            sorted.sort_unstable();
+            sorted
+                .iter()
+                .map(|day| day.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+                + "日"
+        }
+        _ => "---".to_string(),
+    }
+}
+
 fn draw_modal_if_needed(f: &mut Frame, app: &App) {
     match &app.input_mode {
         InputMode::Normal => {}
         InputMode::TaskForm(form) => draw_task_form_modal(f, app, form),
         InputMode::ConfirmDelete { title, .. } => draw_delete_modal(f, app, title),
+        InputMode::ConfirmDeleteRecurrence { title, choice, .. } => {
+            draw_delete_recurrence_modal(f, app, title, choice)
+        }
         InputMode::BacklogSelect { .. } => {}
+        InputMode::RecurrenceForm(form) => draw_recurrence_form_modal(f, app, form),
     }
 }
 
@@ -929,6 +1068,195 @@ fn draw_delete_modal(f: &mut Frame, app: &App, title: &str) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
+fn draw_recurrence_form_modal(f: &mut Frame, app: &App, form: &RecurrenceFormState) {
+    let area = centered_rect(64, 54, f.area());
+    f.render_widget(Clear, area);
+
+    let task_title = find_task_title(app, form.task_id).unwrap_or("(unknown task)");
+    let title_suffix = if form.editing_recurrence_id.is_some() {
+        "編集"
+    } else {
+        "設定"
+    };
+    let block = Block::default()
+        .title(format!(" 繰り返し{title_suffix}: {task_title} "))
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+    f.render_widget(block, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let active = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(Color::White);
+    let muted = Style::default().fg(Color::DarkGray);
+    let selected_day = Style::default().fg(Color::Cyan);
+    let cursor_day = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::UNDERLINED);
+
+    let in_pattern = form.field == RecurrenceFormField::Pattern;
+    let pattern_labels = ["毎日", "毎週", "毎月"];
+    let day_labels = ["月", "火", "水", "木", "金", "土", "日"];
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (idx, label) in pattern_labels.iter().enumerate() {
+        let is_current = form.pattern_idx == idx;
+        let arrow = if is_current { "> " } else { "  " };
+        let label_style = if in_pattern && is_current {
+            active
+        } else if is_current {
+            selected_day
+        } else {
+            normal
+        };
+
+        let mut spans = vec![
+            Span::styled(arrow, if in_pattern && is_current { active } else { normal }),
+            Span::styled(*label, label_style),
+        ];
+
+        // weekly行: 曜日ボタン（weeklyパターン時のみ選択表示）
+        if idx == 1 {
+            spans.push(Span::raw("    "));
+            let show_selection = form.pattern == "weekly";
+            for (di, dl) in day_labels.iter().enumerate() {
+                let day_num = (di + 1) as u8;
+                let is_selected = show_selection && form.weekly_days.contains(&day_num);
+                let is_cursor = in_pattern && is_current && form.day_cursor == di;
+                let style = if is_cursor && is_selected {
+                    cursor_day
+                } else if is_cursor {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::UNDERLINED)
+                } else if is_selected {
+                    selected_day
+                } else {
+                    muted
+                };
+                spans.push(Span::styled(format!("[{dl}]"), style));
+            }
+        }
+
+        // monthly行: 日付入力（monthlyパターン時のみ値表示）
+        if idx == 2 {
+            spans.push(Span::raw("    "));
+            let day_text = if form.pattern != "monthly" || form.monthly_days.is_empty() {
+                "--".to_string()
+            } else {
+                format!("{:>2}", form.monthly_days[0])
+            };
+            let day_style = if in_pattern && is_current {
+                active
+            } else {
+                normal
+            };
+            spans.push(Span::styled(format!("[{day_text}]"), day_style));
+            spans.push(Span::styled(" 日", normal));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    // 終了日
+    lines.push(Line::from(""));
+    let end_display = if !form.end_date_input.is_empty() {
+        form.end_date_input.clone()
+    } else {
+        form.end_date.clone().unwrap_or_else(|| "なし".to_string())
+    };
+    let end_style = if form.field == RecurrenceFormField::EndDate {
+        active
+    } else {
+        normal
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  終了日  ", muted),
+        Span::styled(format!("[{end_display:<14}]"), end_style),
+    ]));
+
+    // ヘルプ
+    lines.push(Line::from(""));
+    let help = if form.field == RecurrenceFormField::Pattern {
+        match form.pattern.as_str() {
+            "weekly" => "j/k:選択 h/l:曜日移動 Space:切替 Tab:終了日 Enter:保存",
+            "monthly" => "j/k:選択 0-9:日入力 BS:削除 Tab:終了日 Enter:保存",
+            _ => "j/k:選択 Tab:終了日 Enter:保存",
+        }
+    } else {
+        "0-9/-:日付入力 j/k:±1日 h/l:±7日 n:なし Tab:戻る Enter:保存"
+    };
+    lines.push(Line::from(Span::styled(help, muted)));
+
+    if let Some(msg) = &app.status_message {
+        lines.push(Line::from(Span::styled(
+            msg.as_str(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_delete_recurrence_modal(f: &mut Frame, app: &App, title: &str, choice: &DeleteChoice) {
+    let area = centered_rect(58, 32, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(" 繰り返しタスク削除: \"{title}\" "))
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+    f.render_widget(block, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let this_day_style = if matches!(choice, DeleteChoice::ThisDayOnly) {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let delete_rule_style = if matches!(choice, DeleteChoice::DeleteRule) {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("[この日のみ]", this_day_style),
+            Span::raw("  "),
+            Span::styled("[ルールごと削除]", delete_rule_style),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "h/l: 選択  Enter: 確定  Esc: 取消",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    if let Some(msg) = &app.status_message {
+        lines.push(Line::from(Span::styled(
+            msg.as_str(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::vertical([
         Constraint::Percentage((100 - percent_y) / 2),
@@ -943,6 +1271,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         Constraint::Percentage((100 - percent_x) / 2),
     ])
     .split(vertical[1])[1]
+}
+
+fn find_task_title<'a>(app: &'a App, task_id: i64) -> Option<&'a str> {
+    for (_, tasks) in &app.day_tasks {
+        if let Some(task) = tasks.iter().find(|task| task.id == task_id) {
+            return Some(task.title.as_str());
+        }
+    }
+    app.backlog_tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .map(|task| task.title.as_str())
 }
 
 fn category_name(app: &App, cat_id: &str) -> String {

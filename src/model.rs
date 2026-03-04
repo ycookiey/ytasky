@@ -24,8 +24,7 @@ pub struct Task {
     pub deadline: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Recurrence {
     pub id: i64,
     pub title: String,
@@ -44,7 +43,6 @@ pub struct PatternData {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct RecurrenceException {
     pub recurrence_id: i64,
     pub date: String,

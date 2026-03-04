@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use crate::history::{
     Command, DeleteTaskCommand, ReorderTaskCommand, ToggleActualCommand, UndoManager,
 };
-use crate::model::{Category, CategoryReport, Task, TitleReport};
+use crate::model::{Category, CategoryReport, Recurrence, Task, TitleReport};
 
 const DAY_MINUTES: i32 = 24 * 60;
 
@@ -20,6 +20,12 @@ pub enum FormMode {
 pub enum PanelFocus {
     Table,
     Backlog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacklogTab {
+    Backlog,
+    Recurrences,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +50,35 @@ pub enum FormField {
     Title,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurrenceFormField {
+    Pattern,
+    EndDate,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecurrenceFormState {
+    pub task_id: i64,
+    pub task_date: String,
+    pub pattern: String,
+    pub pattern_idx: usize,
+    pub weekly_days: Vec<u8>,
+    pub monthly_days: Vec<u8>,
+    pub end_date: Option<String>,
+    pub end_date_input: String,
+    pub field: RecurrenceFormField,
+    pub editing_recurrence_id: Option<i64>,
+    pub day_cursor: usize,
+}
+
+
+
+#[derive(Debug, Clone)]
+pub enum DeleteChoice {
+    ThisDayOnly,
+    DeleteRule,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskFormState {
     pub target: FormTarget,
@@ -63,8 +98,21 @@ pub struct TaskFormState {
 pub enum InputMode {
     Normal,
     TaskForm(TaskFormState),
-    ConfirmDelete { task_id: i64, title: String },
-    BacklogSelect { cursor: usize },
+    ConfirmDelete {
+        task_id: i64,
+        title: String,
+    },
+    ConfirmDeleteRecurrence {
+        task_id: i64,
+        recurrence_id: i64,
+        title: String,
+        date: String,
+        choice: DeleteChoice,
+    },
+    BacklogSelect {
+        cursor: usize,
+    },
+    RecurrenceForm(RecurrenceFormState),
 }
 
 enum FormAction {
@@ -78,6 +126,7 @@ pub struct App {
     pub view_start_date: String,
     pub day_tasks: Vec<(String, Vec<Task>)>,
     pub backlog_tasks: Vec<Task>,
+    pub recurrences: Vec<Recurrence>,
     pub categories: Vec<Category>,
     pub category_reports: Vec<CategoryReport>,
     pub title_reports: Vec<TitleReport>,
@@ -86,7 +135,9 @@ pub struct App {
     pub row_cursor: usize,
     pub preferred_row: usize,
     pub backlog_cursor: usize,
+    pub recurrence_cursor: usize,
     pub focus: PanelFocus,
+    pub backlog_tab: BacklogTab,
     pub view_mode: ViewMode,
     pub should_quit: bool,
     pub input_mode: InputMode,
@@ -114,15 +165,17 @@ impl App {
             .map(|(date, _)| date.clone())
             .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
         let backlog_tasks = crate::db::load_backlog_tasks(&conn)?;
+        let recurrences = crate::db::load_recurrences(&conn)?;
         let categories = crate::db::load_categories(&conn)?;
         let category_reports = crate::db::report_by_category(&conn, &cursor_date)?;
         let title_reports = crate::db::report_by_title(&conn, &cursor_date)?;
 
-        Ok(Self {
+        let mut app = Self {
             conn,
             view_start_date,
             day_tasks,
             backlog_tasks,
+            recurrences,
             categories,
             category_reports,
             title_reports,
@@ -131,13 +184,17 @@ impl App {
             row_cursor: 0,
             preferred_row: 0,
             backlog_cursor: 0,
+            recurrence_cursor: 0,
             focus: PanelFocus::Table,
+            backlog_tab: BacklogTab::Backlog,
             view_mode: ViewMode::TableView,
             should_quit: false,
             input_mode: InputMode::Normal,
             status_message: None,
             undo_manager: UndoManager::new(),
-        })
+        };
+        app.refresh_recurrences()?;
+        Ok(app)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -235,6 +292,7 @@ impl App {
             KeyCode::Char('a') => self.open_add_task_form(FormTarget::Schedule),
             KeyCode::Char('e') => self.open_edit_task_form(FormTarget::Schedule),
             KeyCode::Char('d') => self.open_delete_confirm(),
+            KeyCode::Char('R') => self.open_recurrence_form(),
             KeyCode::Char('J') => {
                 if let Err(err) = self.move_task_down() {
                     self.status_message = Some(err.to_string());
@@ -316,6 +374,19 @@ impl App {
     }
 
     fn handle_backlog_panel_key(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Char('T') | KeyCode::BackTab) {
+            self.backlog_tab = match self.backlog_tab {
+                BacklogTab::Backlog => BacklogTab::Recurrences,
+                BacklogTab::Recurrences => BacklogTab::Backlog,
+            };
+            return;
+        }
+
+        if self.backlog_tab == BacklogTab::Recurrences {
+            self.handle_recurrence_tab_key(key);
+            return;
+        }
+
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 if !self.backlog_tasks.is_empty()
@@ -341,6 +412,42 @@ impl App {
             }
             KeyCode::Char('e') => self.open_edit_task_form(FormTarget::Backlog),
             KeyCode::Char('a') => self.open_add_task_form(FormTarget::Backlog),
+            KeyCode::Tab => {
+                self.focus = PanelFocus::Table;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_recurrence_tab_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.recurrences.is_empty()
+                    && self.recurrence_cursor < self.recurrences.len() - 1
+                {
+                    self.recurrence_cursor += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.recurrence_cursor = self.recurrence_cursor.saturating_sub(1);
+            }
+            KeyCode::Char('d') => {
+                let Some(recurrence) = self.recurrences.get(self.recurrence_cursor).cloned() else {
+                    return;
+                };
+                if let Err(err) = crate::db::delete_recurrence(&self.conn, recurrence.id)
+                    .and_then(|_| self.refresh_tasks())
+                    .and_then(|_| self.refresh_recurrences())
+                {
+                    self.status_message = Some(err.to_string());
+                } else {
+                    self.status_message =
+                        Some(format!("繰り返しルールを削除: {}", recurrence.title));
+                }
+            }
+            KeyCode::Char('e') => {
+                self.status_message = Some("繰り返しルール編集は未実装です".to_string());
+            }
             KeyCode::Tab => {
                 self.focus = PanelFocus::Table;
             }
@@ -376,6 +483,71 @@ impl App {
                 }
                 _ => self.input_mode = InputMode::ConfirmDelete { task_id, title },
             },
+            InputMode::ConfirmDeleteRecurrence {
+                task_id,
+                recurrence_id,
+                title,
+                date,
+                mut choice,
+            } => match key.code {
+                KeyCode::Esc => self.status_message = None,
+                KeyCode::Left | KeyCode::Char('h') => {
+                    choice = DeleteChoice::ThisDayOnly;
+                    self.input_mode = InputMode::ConfirmDeleteRecurrence {
+                        task_id,
+                        recurrence_id,
+                        title,
+                        date,
+                        choice,
+                    };
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    choice = DeleteChoice::DeleteRule;
+                    self.input_mode = InputMode::ConfirmDeleteRecurrence {
+                        task_id,
+                        recurrence_id,
+                        title,
+                        date,
+                        choice,
+                    };
+                }
+                KeyCode::Enter => {
+                    let result: anyhow::Result<()> = match choice {
+                        DeleteChoice::ThisDayOnly => {
+                            crate::db::add_recurrence_exception(&self.conn, recurrence_id, &date)
+                                .and_then(|_| crate::db::delete_task(&self.conn, task_id))
+                        }
+                        DeleteChoice::DeleteRule => {
+                            crate::db::delete_recurrence(&self.conn, recurrence_id)
+                                .and_then(|_| crate::db::delete_task(&self.conn, task_id))
+                        }
+                    }
+                    .and_then(|_| self.refresh_tasks())
+                    .and_then(|_| self.refresh_recurrences());
+
+                    if let Err(err) = result {
+                        self.status_message = Some(err.to_string());
+                        self.input_mode = InputMode::ConfirmDeleteRecurrence {
+                            task_id,
+                            recurrence_id,
+                            title,
+                            date,
+                            choice,
+                        };
+                    } else {
+                        self.status_message = None;
+                    }
+                }
+                _ => {
+                    self.input_mode = InputMode::ConfirmDeleteRecurrence {
+                        task_id,
+                        recurrence_id,
+                        title,
+                        date,
+                        choice,
+                    };
+                }
+            },
             InputMode::BacklogSelect { mut cursor } => match key.code {
                 KeyCode::Esc => {
                     self.status_message = None;
@@ -404,6 +576,25 @@ impl App {
                     self.input_mode = InputMode::BacklogSelect { cursor };
                 }
             },
+            InputMode::RecurrenceForm(mut form) => {
+                match self.handle_recurrence_form_key(key, &mut form) {
+                    FormAction::KeepOpen => self.input_mode = InputMode::RecurrenceForm(form),
+                    FormAction::Cancel => self.status_message = None,
+                    FormAction::Submit => {
+                        let is_edit = form.editing_recurrence_id.is_some();
+                        if let Err(err) = self.submit_recurrence_form(&form) {
+                            self.status_message = Some(err.to_string());
+                            self.input_mode = InputMode::RecurrenceForm(form);
+                        } else {
+                            self.status_message = Some(if is_edit {
+                                "繰り返しを更新しました".to_string()
+                            } else {
+                                "繰り返しを設定しました".to_string()
+                            });
+                        }
+                    }
+                }
+            }
             InputMode::Normal => {}
         }
     }
@@ -613,6 +804,241 @@ impl App {
         }
     }
 
+    fn handle_recurrence_form_key(
+        &mut self,
+        key: KeyEvent,
+        form: &mut RecurrenceFormState,
+    ) -> FormAction {
+        const PATTERNS: [&str; 3] = ["daily", "weekly", "monthly"];
+
+        match key.code {
+            KeyCode::Esc => {
+                if form.field == RecurrenceFormField::EndDate {
+                    form.field = RecurrenceFormField::Pattern;
+                    FormAction::KeepOpen
+                } else {
+                    FormAction::Cancel
+                }
+            }
+            KeyCode::Enter => match form.field {
+                RecurrenceFormField::Pattern => {
+                    form.field = RecurrenceFormField::EndDate;
+                    FormAction::KeepOpen
+                }
+                RecurrenceFormField::EndDate => FormAction::Submit,
+            },
+            KeyCode::Tab => {
+                form.field = match form.field {
+                    RecurrenceFormField::Pattern => RecurrenceFormField::EndDate,
+                    RecurrenceFormField::EndDate => RecurrenceFormField::Pattern,
+                };
+                FormAction::KeepOpen
+            }
+            KeyCode::Backspace => {
+                match form.field {
+                    RecurrenceFormField::Pattern if form.pattern == "monthly" => {
+                        if let Some(day) = form.monthly_days.first_mut() {
+                            *day /= 10;
+                            if *day == 0 {
+                                form.monthly_days.clear();
+                            }
+                        }
+                    }
+                    RecurrenceFormField::EndDate => {
+                        if !form.end_date_input.is_empty() {
+                            form.end_date_input.pop();
+                            self.try_resolve_recurrence_end_date_input(form);
+                        } else {
+                            form.end_date = None;
+                        }
+                    }
+                    RecurrenceFormField::Pattern => {}
+                }
+                FormAction::KeepOpen
+            }
+            // Pattern zone: j/k でパターン行移動
+            KeyCode::Up | KeyCode::Char('k') if form.field == RecurrenceFormField::Pattern => {
+                let idx = if form.pattern_idx == 0 {
+                    PATTERNS.len() - 1
+                } else {
+                    form.pattern_idx - 1
+                };
+                self.set_recurrence_pattern(form, idx);
+                FormAction::KeepOpen
+            }
+            KeyCode::Down | KeyCode::Char('j') if form.field == RecurrenceFormField::Pattern => {
+                let idx = (form.pattern_idx + 1) % PATTERNS.len();
+                self.set_recurrence_pattern(form, idx);
+                FormAction::KeepOpen
+            }
+            // Pattern zone (weekly): h/l で曜日カーソル移動
+            KeyCode::Left | KeyCode::Char('h')
+                if form.field == RecurrenceFormField::Pattern && form.pattern == "weekly" =>
+            {
+                if form.day_cursor > 0 {
+                    form.day_cursor -= 1;
+                }
+                FormAction::KeepOpen
+            }
+            KeyCode::Right | KeyCode::Char('l')
+                if form.field == RecurrenceFormField::Pattern && form.pattern == "weekly" =>
+            {
+                if form.day_cursor < 6 {
+                    form.day_cursor += 1;
+                }
+                FormAction::KeepOpen
+            }
+            // Pattern zone (weekly): space で曜日トグル
+            KeyCode::Char(' ')
+                if form.field == RecurrenceFormField::Pattern && form.pattern == "weekly" =>
+            {
+                let day = (form.day_cursor + 1) as u8;
+                if let Some(pos) = form.weekly_days.iter().position(|d| *d == day) {
+                    form.weekly_days.remove(pos);
+                } else {
+                    form.weekly_days.push(day);
+                    form.weekly_days.sort_unstable();
+                }
+                FormAction::KeepOpen
+            }
+            // EndDate zone
+            KeyCode::Char('n') if form.field == RecurrenceFormField::EndDate => {
+                form.end_date = None;
+                form.end_date_input.clear();
+                FormAction::KeepOpen
+            }
+            KeyCode::Up | KeyCode::Char('k') if form.field == RecurrenceFormField::EndDate => {
+                self.shift_recurrence_end_date(form, -1);
+                FormAction::KeepOpen
+            }
+            KeyCode::Down | KeyCode::Char('j') if form.field == RecurrenceFormField::EndDate => {
+                self.shift_recurrence_end_date(form, 1);
+                FormAction::KeepOpen
+            }
+            KeyCode::Left | KeyCode::Char('h') if form.field == RecurrenceFormField::EndDate => {
+                self.shift_recurrence_end_date(form, -7);
+                FormAction::KeepOpen
+            }
+            KeyCode::Right | KeyCode::Char('l') if form.field == RecurrenceFormField::EndDate => {
+                self.shift_recurrence_end_date(form, 7);
+                FormAction::KeepOpen
+            }
+            KeyCode::Char(c) => {
+                match form.field {
+                    RecurrenceFormField::Pattern if form.pattern == "weekly" => {
+                        // 1-7 で曜日直接トグル
+                        if ('1'..='7').contains(&c) {
+                            let day = (c as u8) - b'0';
+                            if let Some(pos) = form.weekly_days.iter().position(|d| *d == day) {
+                                form.weekly_days.remove(pos);
+                            } else {
+                                form.weekly_days.push(day);
+                                form.weekly_days.sort_unstable();
+                            }
+                        }
+                    }
+                    RecurrenceFormField::Pattern if form.pattern == "monthly" => {
+                        // 数字で日付入力
+                        if c.is_ascii_digit() {
+                            let digit = (c as u8 - b'0') as i32;
+                            let current = form.monthly_days.first().copied().unwrap_or(0) as i32;
+                            let mut next = current * 10 + digit;
+                            if next > 31 || next <= 0 {
+                                next = digit;
+                            }
+                            if (1..=31).contains(&next) {
+                                if form.monthly_days.is_empty() {
+                                    form.monthly_days.push(next as u8);
+                                } else {
+                                    form.monthly_days[0] = next as u8;
+                                }
+                            }
+                        }
+                    }
+                    RecurrenceFormField::EndDate => {
+                        if c.is_ascii_digit() || c == '-' {
+                            if form.end_date_input.len() < 10 {
+                                form.end_date_input.push(c);
+                            }
+                            self.try_resolve_recurrence_end_date_input(form);
+                        }
+                    }
+                    RecurrenceFormField::Pattern => {}
+                }
+                FormAction::KeepOpen
+            }
+            _ => FormAction::KeepOpen,
+        }
+    }
+
+    fn submit_recurrence_form(&mut self, form: &RecurrenceFormState) -> anyhow::Result<()> {
+        let pattern = form.pattern.as_str();
+
+        let pattern_data = match pattern {
+            "daily" => None,
+            "weekly" => {
+                if form.weekly_days.is_empty() {
+                    bail!("weekly は曜日を1つ以上選択してください (1=月..7=日)");
+                }
+                Some(serde_json::to_string(&crate::model::PatternData {
+                    days: Some(form.weekly_days.clone()),
+                })?)
+            }
+            "monthly" => {
+                if form.monthly_days.is_empty() {
+                    bail!("monthly は日付を入力してください (1-31)");
+                }
+                Some(serde_json::to_string(&crate::model::PatternData {
+                    days: Some(form.monthly_days.clone()),
+                })?)
+            }
+            _ => bail!("未対応の繰り返しパターンです"),
+        };
+
+        let end_date = self.resolve_recurrence_end_date_for_submit(form)?;
+
+        if let Some(recurrence_id) = form.editing_recurrence_id {
+            let rec = self
+                .recurrences
+                .iter()
+                .find(|r| r.id == recurrence_id)
+                .context("繰り返しルールが見つかりません")?;
+            crate::db::update_recurrence(
+                &self.conn,
+                recurrence_id,
+                &rec.title,
+                &rec.category_id,
+                rec.duration_min,
+                rec.fixed_start,
+                pattern,
+                pattern_data.as_deref(),
+                &rec.start_date,
+                end_date.as_deref(),
+            )?;
+        } else {
+            crate::db::create_recurrence_from_task(
+                &self.conn,
+                form.task_id,
+                pattern,
+                pattern_data.as_deref(),
+                end_date.as_deref(),
+            )?;
+        }
+        self.refresh_tasks()?;
+        self.refresh_recurrences()?;
+
+        if let Some(idx) = self
+            .cursor_tasks()
+            .iter()
+            .position(|task| task.id == form.task_id)
+        {
+            self.row_cursor = idx;
+            self.preferred_row = idx;
+        }
+
+        Ok(())
+    }
+
     fn submit_task_form(&mut self, form: &TaskFormState) -> anyhow::Result<()> {
         let title = form.title.trim();
         if title.is_empty() {
@@ -804,15 +1230,95 @@ impl App {
         });
     }
 
+    fn open_recurrence_form(&mut self) {
+        let Some(task) = self.selected_task() else {
+            return;
+        };
+
+        let task_id = task.id;
+        let task_date = task.date.clone();
+
+        if let Some(recurrence_id) = task.recurrence_id {
+            // 編集モード: 既存ルールをプリフィル
+            let Some(rec) = self.recurrences.iter().find(|r| r.id == recurrence_id).cloned()
+            else {
+                self.status_message = Some("繰り返しルールが見つかりません".to_string());
+                return;
+            };
+            let pattern_idx = match rec.pattern.as_str() {
+                "daily" => 0,
+                "weekly" => 1,
+                "monthly" => 2,
+                _ => 0,
+            };
+            let days = rec
+                .pattern_data
+                .as_deref()
+                .and_then(|d| serde_json::from_str::<crate::model::PatternData>(d).ok())
+                .and_then(|pd| pd.days)
+                .unwrap_or_default();
+            let (weekly_days, monthly_days) = match rec.pattern.as_str() {
+                "weekly" => (days, Vec::new()),
+                "monthly" => (Vec::new(), days),
+                _ => (Vec::new(), Vec::new()),
+            };
+            let day_cursor = weekly_days
+                .first()
+                .map(|d| (*d as usize).saturating_sub(1))
+                .unwrap_or(0);
+
+            self.input_mode = InputMode::RecurrenceForm(RecurrenceFormState {
+                task_id,
+                task_date,
+                pattern: rec.pattern.clone(),
+                pattern_idx,
+                weekly_days,
+                monthly_days,
+                end_date: rec.end_date.clone(),
+                end_date_input: String::new(),
+                field: RecurrenceFormField::Pattern,
+                editing_recurrence_id: Some(recurrence_id),
+                day_cursor,
+            });
+        } else {
+            // 新規作成モード（weekly/monthly切替時にスマートデフォルト発動）
+            self.input_mode = InputMode::RecurrenceForm(RecurrenceFormState {
+                task_id,
+                task_date,
+                pattern: "daily".to_string(),
+                pattern_idx: 0,
+                weekly_days: Vec::new(),
+                monthly_days: Vec::new(),
+                end_date: None,
+                end_date_input: String::new(),
+                field: RecurrenceFormField::Pattern,
+                editing_recurrence_id: None,
+                day_cursor: 0,
+            });
+        }
+    }
+
     fn open_delete_confirm(&mut self) {
         let Some(task) = self.selected_task() else {
             return;
         };
 
-        self.input_mode = InputMode::ConfirmDelete {
-            task_id: task.id,
-            title: task.title.clone(),
-        };
+        let task_id = task.id;
+        let title = task.title.clone();
+        let date = task.date.clone();
+        let recurrence_id = task.recurrence_id;
+
+        if let Some(recurrence_id) = recurrence_id {
+            self.input_mode = InputMode::ConfirmDeleteRecurrence {
+                task_id,
+                recurrence_id,
+                title,
+                date,
+                choice: DeleteChoice::ThisDayOnly,
+            };
+        } else {
+            self.input_mode = InputMode::ConfirmDelete { task_id, title };
+        }
     }
 
     fn select_next_category(&self, form: &mut TaskFormState) {
@@ -931,6 +1437,86 @@ impl App {
         self.status_message = None;
     }
 
+    fn set_recurrence_pattern(&self, form: &mut RecurrenceFormState, pattern_idx: usize) {
+        form.pattern_idx = pattern_idx.min(2);
+        form.pattern = match form.pattern_idx {
+            0 => "daily",
+            1 => "weekly",
+            2 => "monthly",
+            _ => "daily",
+        }
+        .to_string();
+
+        match form.pattern.as_str() {
+            "daily" => {}
+            "weekly" => {
+                if form.weekly_days.is_empty()
+                    && let Ok(date) = NaiveDate::parse_from_str(&form.task_date, "%Y-%m-%d")
+                {
+                    let weekday = date.weekday().number_from_monday() as u8;
+                    form.weekly_days = vec![weekday];
+                    form.day_cursor = (weekday - 1) as usize;
+                }
+            }
+            "monthly" => {
+                if form.monthly_days.is_empty()
+                    && let Ok(date) = NaiveDate::parse_from_str(&form.task_date, "%Y-%m-%d")
+                {
+                    form.monthly_days = vec![date.day() as u8];
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_recurrence_end_date_for_submit(
+        &self,
+        form: &RecurrenceFormState,
+    ) -> anyhow::Result<Option<String>> {
+        if form.end_date_input.is_empty() {
+            return Ok(form.end_date.clone());
+        }
+        Ok(Some(parse_recurrence_end_date(&form.end_date_input)?))
+    }
+
+    fn try_resolve_recurrence_end_date_input(&mut self, form: &mut RecurrenceFormState) {
+        if form.end_date_input.is_empty() {
+            self.status_message = None;
+            form.end_date = None;
+            return;
+        }
+
+        match parse_recurrence_end_date(&form.end_date_input) {
+            Ok(value) => {
+                form.end_date = Some(value);
+                self.status_message = None;
+            }
+            Err(err) => {
+                if form.end_date_input.len() == 8 || form.end_date_input.len() == 10 {
+                    self.status_message = Some(err.to_string());
+                } else {
+                    self.status_message = None;
+                }
+            }
+        }
+    }
+
+    fn shift_recurrence_end_date(&mut self, form: &mut RecurrenceFormState, delta_days: i64) {
+        if !form.end_date_input.is_empty() {
+            self.try_resolve_recurrence_end_date_input(form);
+            form.end_date_input.clear();
+        }
+
+        let base = form
+            .end_date
+            .as_deref()
+            .and_then(|raw| NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok())
+            .unwrap_or_else(|| Local::now().date_naive());
+        let shifted = base + Duration::days(delta_days);
+        form.end_date = Some(shifted.format("%Y-%m-%d").to_string());
+        self.status_message = None;
+    }
+
     fn selected_backlog_task(&self) -> Option<&Task> {
         self.backlog_tasks.get(self.backlog_cursor)
     }
@@ -1042,9 +1628,18 @@ impl App {
             self.day_tasks.push((date, tasks));
         }
         self.backlog_tasks = crate::db::load_backlog_tasks(&self.conn)?;
+        self.refresh_recurrences()?;
         self.clamp_cursors();
         self.refresh_reports()?;
 
+        Ok(())
+    }
+
+    fn refresh_recurrences(&mut self) -> anyhow::Result<()> {
+        self.recurrences = crate::db::load_recurrences(&self.conn)?;
+        self.recurrence_cursor = self
+            .recurrence_cursor
+            .min(self.recurrences.len().saturating_sub(1));
         Ok(())
     }
 
@@ -1127,6 +1722,12 @@ impl App {
             self.backlog_cursor = 0;
         } else if self.backlog_cursor >= self.backlog_tasks.len() {
             self.backlog_cursor = self.backlog_tasks.len() - 1;
+        }
+
+        if self.recurrences.is_empty() {
+            self.recurrence_cursor = 0;
+        } else if self.recurrence_cursor >= self.recurrences.len() {
+            self.recurrence_cursor = self.recurrences.len() - 1;
         }
     }
 
@@ -1650,6 +2251,29 @@ fn parse_absolute_deadline(raw: &str) -> anyhow::Result<String> {
         bail!("時刻は00-23で入力してください");
     }
     Ok(format!("{} {:02}:00", date.format("%Y-%m-%d"), hour))
+}
+
+fn parse_recurrence_end_date(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("終了日は YYYY-MM-DD で入力してください");
+    }
+
+    if trimmed.len() == 10 {
+        let date = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
+            .with_context(|| format!("終了日が不正です: {trimmed}"))?;
+        return Ok(date.format("%Y-%m-%d").to_string());
+    }
+
+    if trimmed.len() == 8 && trimmed.chars().all(|c| c.is_ascii_digit()) {
+        let year: i32 = trimmed[0..4].parse().context("年が不正です")?;
+        let month: u32 = trimmed[4..6].parse().context("月が不正です")?;
+        let day: u32 = trimmed[6..8].parse().context("日が不正です")?;
+        let date = NaiveDate::from_ymd_opt(year, month, day).context("日付が不正です")?;
+        return Ok(date.format("%Y-%m-%d").to_string());
+    }
+
+    bail!("終了日は YYYY-MM-DD または YYYYMMDD で入力してください")
 }
 
 fn parse_deadline_date_time(deadline: &str) -> Option<(NaiveDate, Option<String>)> {

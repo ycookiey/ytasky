@@ -320,7 +320,6 @@ pub fn insert_recurrence(
     Ok(conn.last_insert_rowid())
 }
 
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn add_recurrence(
     conn: &Connection,
@@ -344,6 +343,121 @@ pub fn add_recurrence(
         start_date,
         end_date,
     )
+}
+
+/// 全ての繰り返しルールを取得
+pub fn load_recurrences(conn: &Connection) -> Result<Vec<crate::model::Recurrence>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, category_id, duration_min, fixed_start,
+                pattern, pattern_data, start_date, end_date
+         FROM recurrences
+         ORDER BY id",
+    )?;
+
+    let recurrences = stmt
+        .query_map([], |row| {
+            Ok(crate::model::Recurrence {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                category_id: row.get(2)?,
+                duration_min: row.get(3)?,
+                fixed_start: row.get(4)?,
+                pattern: row.get(5)?,
+                pattern_data: row.get(6)?,
+                start_date: row.get(7)?,
+                end_date: row.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(recurrences)
+}
+
+/// 繰り返しルールを更新
+#[allow(clippy::too_many_arguments)]
+pub fn update_recurrence(
+    conn: &Connection,
+    id: i64,
+    title: &str,
+    category_id: &str,
+    duration_min: i32,
+    fixed_start: Option<i32>,
+    pattern: &str,
+    pattern_data: Option<&str>,
+    start_date: &str,
+    end_date: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE recurrences
+         SET title = ?2, category_id = ?3, duration_min = ?4,
+             fixed_start = ?5, pattern = ?6, pattern_data = ?7, start_date = ?8, end_date = ?9
+         WHERE id = ?1",
+        params![
+            id,
+            title,
+            category_id,
+            duration_min,
+            fixed_start,
+            pattern,
+            pattern_data,
+            start_date,
+            end_date
+        ],
+    )?;
+    Ok(())
+}
+
+/// 繰り返しルールを削除（例外も合わせて削除）
+pub fn delete_recurrence(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM recurrence_exceptions WHERE recurrence_id = ?1",
+        params![id],
+    )?;
+    conn.execute(
+        "UPDATE tasks SET recurrence_id = NULL WHERE recurrence_id = ?1",
+        params![id],
+    )?;
+    conn.execute("DELETE FROM recurrences WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// 特定日を繰り返し例外として登録（この日は生成しない）
+pub fn add_recurrence_exception(conn: &Connection, recurrence_id: i64, date: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO recurrence_exceptions (recurrence_id, date) VALUES (?1, ?2)",
+        params![recurrence_id, date],
+    )?;
+    Ok(())
+}
+
+/// 既存タスクを繰り返しルールに変換し、元タスクへ recurrence_id を紐づける
+pub fn create_recurrence_from_task(
+    conn: &Connection,
+    task_id: i64,
+    pattern: &str,
+    pattern_data: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<i64> {
+    let task = load_task_by_id(conn, task_id)?.context("タスクが見つからない")?;
+
+    let recurrence_id = insert_recurrence(
+        conn,
+        &task.title,
+        &task.category_id,
+        task.duration_min,
+        task.fixed_start,
+        pattern,
+        pattern_data,
+        &task.date,
+        end_date,
+    )?;
+
+    conn.execute(
+        "UPDATE tasks SET recurrence_id = ?1 WHERE id = ?2",
+        params![recurrence_id, task_id],
+    )?;
+
+    Ok(recurrence_id)
 }
 
 /// 全カテゴリ取得

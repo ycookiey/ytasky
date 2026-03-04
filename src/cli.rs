@@ -134,6 +134,61 @@ pub enum Commands {
         /// タスクID
         id: i64,
     },
+    /// 繰り返しルール一覧
+    ListRecurrences,
+    /// 繰り返しルール追加
+    AddRecurrence {
+        /// タスク名
+        #[arg(short, long)]
+        title: String,
+        /// カテゴリID
+        #[arg(short, long)]
+        category: String,
+        /// 所要時間(分)
+        #[arg(short = 'D', long)]
+        duration: i32,
+        /// 固定開始時刻 (HH:MM)
+        #[arg(short, long)]
+        fixed_start: Option<String>,
+        /// daily, weekly, monthly
+        #[arg(short, long)]
+        pattern: String,
+        /// JSON: {\"days\": [1,3,5]}
+        #[arg(long)]
+        pattern_data: Option<String>,
+        /// 開始日 (YYYY-MM-DD)
+        #[arg(long)]
+        start_date: String,
+        /// 終了日 (YYYY-MM-DD)
+        #[arg(long)]
+        end_date: Option<String>,
+    },
+    /// 繰り返しルール編集
+    EditRecurrence {
+        /// ルールID
+        id: i64,
+        #[arg(short, long)]
+        title: Option<String>,
+        #[arg(short, long)]
+        category: Option<String>,
+        #[arg(short = 'D', long)]
+        duration: Option<i32>,
+        #[arg(short, long)]
+        fixed_start: Option<String>,
+        #[arg(short, long)]
+        pattern: Option<String>,
+        #[arg(long)]
+        pattern_data: Option<String>,
+        #[arg(long)]
+        start_date: Option<String>,
+        #[arg(long)]
+        end_date: Option<String>,
+    },
+    /// 繰り返しルール削除
+    DeleteRecurrence {
+        /// ルールID
+        id: i64,
+    },
     /// MCP サーバー起動
     Mcp,
 }
@@ -322,6 +377,90 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
         }
         Commands::ToBacklog { id } => {
             db::set_backlog_flag(conn, id, true)?;
+            print_json(&serde_json::json!({ "ok": true, "id": id }));
+        }
+        Commands::ListRecurrences => {
+            let recurrences = db::load_recurrences(conn)?;
+            print_json(&recurrences);
+        }
+        Commands::AddRecurrence {
+            title,
+            category,
+            duration,
+            fixed_start,
+            pattern,
+            pattern_data,
+            start_date,
+            end_date,
+        } => {
+            let fixed = fixed_start.map(|s| parse_time(&s)).transpose()?;
+            let id = db::insert_recurrence(
+                conn,
+                &title,
+                &category,
+                duration,
+                fixed,
+                &pattern,
+                pattern_data.as_deref(),
+                &start_date,
+                end_date.as_deref(),
+            )?;
+            print_json(&serde_json::json!({ "ok": true, "id": id }));
+        }
+        Commands::EditRecurrence {
+            id,
+            title,
+            category,
+            duration,
+            fixed_start,
+            pattern,
+            pattern_data,
+            start_date,
+            end_date,
+        } => {
+            let recurrences = db::load_recurrences(conn)?;
+            let current = recurrences
+                .into_iter()
+                .find(|item| item.id == id)
+                .context("繰り返しルールが見つからない")?;
+
+            let new_title = title.unwrap_or(current.title);
+            let new_category = category.unwrap_or(current.category_id);
+            let new_duration = duration.unwrap_or(current.duration_min);
+            let new_fixed_start = match fixed_start.as_deref() {
+                Some("none") => None,
+                Some(s) => Some(parse_time(s)?),
+                None => current.fixed_start,
+            };
+            let new_pattern = pattern.unwrap_or(current.pattern);
+            let new_pattern_data = match pattern_data.as_deref() {
+                Some("none") => None,
+                Some(data) => Some(data),
+                None => current.pattern_data.as_deref(),
+            };
+            let new_start_date = start_date.unwrap_or(current.start_date);
+            let new_end_date = match end_date.as_deref() {
+                Some("none") => None,
+                Some(date) => Some(date),
+                None => current.end_date.as_deref(),
+            };
+
+            db::update_recurrence(
+                conn,
+                id,
+                &new_title,
+                &new_category,
+                new_duration,
+                new_fixed_start,
+                &new_pattern,
+                new_pattern_data,
+                &new_start_date,
+                new_end_date,
+            )?;
+            print_json(&serde_json::json!({ "ok": true, "id": id }));
+        }
+        Commands::DeleteRecurrence { id } => {
+            db::delete_recurrence(conn, id)?;
             print_json(&serde_json::json!({ "ok": true, "id": id }));
         }
         Commands::Mcp => {
