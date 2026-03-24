@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use crate::history::{
     Command, DeleteTaskCommand, ReorderTaskCommand, ToggleActualCommand, UndoManager,
 };
-use crate::model::{Category, CategoryReport, Recurrence, Task, TitleReport};
+use crate::model::{Category, CategoryReport, ExternalEvent, GCalCalendar, Recurrence, Task, TitleReport};
 
 const DAY_MINUTES: i32 = 24 * 60;
 
@@ -113,6 +113,28 @@ pub enum InputMode {
         cursor: usize,
     },
     RecurrenceForm(RecurrenceFormState),
+    GCalSetup(GCalSetupState),
+    GCalCalendarSelect {
+        calendars: Vec<GCalCalendar>,
+        cursor: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GCalSetupField {
+    ClientId,
+    ClientSecret,
+    SyncDays,
+    DefaultCategory,
+}
+
+#[derive(Debug, Clone)]
+pub struct GCalSetupState {
+    pub field: GCalSetupField,
+    pub client_id: String,
+    pub client_secret: String,
+    pub sync_days: String,
+    pub default_category_idx: usize,
 }
 
 enum FormAction {
@@ -125,6 +147,7 @@ pub struct App {
     conn: Connection,
     pub view_start_date: String,
     pub day_tasks: Vec<(String, Vec<Task>)>,
+    pub external_events: Vec<(String, Vec<ExternalEvent>)>,
     pub backlog_tasks: Vec<Task>,
     pub recurrences: Vec<Recurrence>,
     pub categories: Vec<Category>,
@@ -153,12 +176,15 @@ impl App {
         let start = center_date - Duration::days(col_cursor as i64);
         let view_start_date = start.format("%Y-%m-%d").to_string();
         let mut day_tasks = Vec::with_capacity(view_days);
+        let mut external_events = Vec::with_capacity(view_days);
         for i in 0..view_days {
             let date = (start + Duration::days(i as i64))
                 .format("%Y-%m-%d")
                 .to_string();
             let tasks = crate::db::load_tasks(&conn, &date)?;
-            day_tasks.push((date, tasks));
+            let events = crate::db::gcal_load_events(&conn, &date).unwrap_or_default();
+            day_tasks.push((date.clone(), tasks));
+            external_events.push((date, events));
         }
         let cursor_date = day_tasks
             .get(col_cursor)
@@ -174,6 +200,7 @@ impl App {
             conn,
             view_start_date,
             day_tasks,
+            external_events,
             backlog_tasks,
             recurrences,
             categories,
@@ -249,6 +276,10 @@ impl App {
                 if self.view_mode != ViewMode::TableView {
                     self.focus = PanelFocus::Table;
                 }
+                return;
+            }
+            KeyCode::Char('g') => {
+                self.open_gcal_setup();
                 return;
             }
             _ => {}
@@ -595,6 +626,123 @@ impl App {
                     }
                 }
             }
+            InputMode::GCalSetup(mut state) => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.status_message = None;
+                    }
+                    KeyCode::Tab | KeyCode::Enter => {
+                        match state.field {
+                            GCalSetupField::ClientId => state.field = GCalSetupField::ClientSecret,
+                            GCalSetupField::ClientSecret => state.field = GCalSetupField::SyncDays,
+                            GCalSetupField::SyncDays => {
+                                state.field = GCalSetupField::DefaultCategory
+                            }
+                            GCalSetupField::DefaultCategory => {
+                                // Submit: start auth or save settings
+                                if let Err(err) = self.submit_gcal_setup(&state) {
+                                    self.status_message = Some(err.to_string());
+                                    self.input_mode = InputMode::GCalSetup(state);
+                                } else {
+                                    self.status_message =
+                                        Some("GCal設定を保存。認証はCLIで実行: ytasky gcal auth".to_string());
+                                }
+                                return;
+                            }
+                        }
+                        self.input_mode = InputMode::GCalSetup(state);
+                    }
+                    KeyCode::BackTab => {
+                        state.field = match state.field {
+                            GCalSetupField::ClientId => GCalSetupField::ClientId,
+                            GCalSetupField::ClientSecret => GCalSetupField::ClientId,
+                            GCalSetupField::SyncDays => GCalSetupField::ClientSecret,
+                            GCalSetupField::DefaultCategory => GCalSetupField::SyncDays,
+                        };
+                        self.input_mode = InputMode::GCalSetup(state);
+                    }
+                    KeyCode::Char('j') | KeyCode::Down
+                        if state.field == GCalSetupField::DefaultCategory =>
+                    {
+                        if state.default_category_idx < self.categories.len().saturating_sub(1) {
+                            state.default_category_idx += 1;
+                        }
+                        self.input_mode = InputMode::GCalSetup(state);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up
+                        if state.field == GCalSetupField::DefaultCategory =>
+                    {
+                        state.default_category_idx =
+                            state.default_category_idx.saturating_sub(1);
+                        self.input_mode = InputMode::GCalSetup(state);
+                    }
+                    KeyCode::Char(c) => {
+                        match state.field {
+                            GCalSetupField::ClientId => state.client_id.push(c),
+                            GCalSetupField::ClientSecret => state.client_secret.push(c),
+                            GCalSetupField::SyncDays => {
+                                if c.is_ascii_digit() {
+                                    state.sync_days.push(c);
+                                }
+                            }
+                            GCalSetupField::DefaultCategory => {}
+                        }
+                        self.input_mode = InputMode::GCalSetup(state);
+                    }
+                    KeyCode::Backspace => {
+                        match state.field {
+                            GCalSetupField::ClientId => { state.client_id.pop(); }
+                            GCalSetupField::ClientSecret => { state.client_secret.pop(); }
+                            GCalSetupField::SyncDays => { state.sync_days.pop(); }
+                            GCalSetupField::DefaultCategory => {}
+                        }
+                        self.input_mode = InputMode::GCalSetup(state);
+                    }
+                    _ => {
+                        self.input_mode = InputMode::GCalSetup(state);
+                    }
+                }
+            }
+            InputMode::GCalCalendarSelect {
+                calendars,
+                mut cursor,
+            } => match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    // Save calendar enabled states
+                    for cal in &calendars {
+                        let _ = crate::db::gcal_set_calendar_enabled(
+                            &self.conn,
+                            &cal.calendar_id,
+                            cal.enabled,
+                        );
+                    }
+                    let _ = self.refresh_tasks();
+                    self.status_message = Some("カレンダー設定を保存した".to_string());
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if cursor < calendars.len().saturating_sub(1) {
+                        cursor += 1;
+                    }
+                    self.input_mode = InputMode::GCalCalendarSelect { calendars, cursor };
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    cursor = cursor.saturating_sub(1);
+                    self.input_mode = InputMode::GCalCalendarSelect { calendars, cursor };
+                }
+                KeyCode::Char(' ') => {
+                    let mut cals = calendars;
+                    if let Some(cal) = cals.get_mut(cursor) {
+                        cal.enabled = !cal.enabled;
+                    }
+                    self.input_mode = InputMode::GCalCalendarSelect {
+                        calendars: cals,
+                        cursor,
+                    };
+                }
+                _ => {
+                    self.input_mode = InputMode::GCalCalendarSelect { calendars, cursor };
+                }
+            },
             InputMode::Normal => {}
         }
     }
@@ -1620,12 +1768,15 @@ impl App {
         let start = NaiveDate::parse_from_str(&self.view_start_date, "%Y-%m-%d")
             .with_context(|| format!("日付形式が不正です: {}", self.view_start_date))?;
         self.day_tasks.clear();
+        self.external_events.clear();
         for i in 0..self.view_days {
             let date = (start + Duration::days(i as i64))
                 .format("%Y-%m-%d")
                 .to_string();
             let tasks = crate::db::load_tasks(&self.conn, &date)?;
-            self.day_tasks.push((date, tasks));
+            let events = crate::db::gcal_load_events(&self.conn, &date).unwrap_or_default();
+            self.day_tasks.push((date.clone(), tasks));
+            self.external_events.push((date, events));
         }
         self.backlog_tasks = crate::db::load_backlog_tasks(&self.conn)?;
         self.refresh_recurrences()?;
@@ -1784,6 +1935,80 @@ impl App {
             InputMode::BacklogSelect { cursor } => Some(*cursor),
             _ => None,
         }
+    }
+
+    fn open_gcal_setup(&mut self) {
+        let is_configured = crate::db::gcal_is_configured(&self.conn).unwrap_or(false);
+        if is_configured {
+            // Already configured: show calendar select
+            match crate::db::gcal_load_calendars(&self.conn) {
+                Ok(calendars) if !calendars.is_empty() => {
+                    self.input_mode = InputMode::GCalCalendarSelect {
+                        calendars,
+                        cursor: 0,
+                    };
+                }
+                _ => {
+                    self.status_message =
+                        Some("カレンダーがない。`ytasky gcal sync` を先に実行".to_string());
+                }
+            }
+            return;
+        }
+
+        // Not configured: show setup form
+        let client_id = crate::db::gcal_get_config(&self.conn, "client_id")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let client_secret = crate::db::gcal_get_config(&self.conn, "client_secret")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let sync_days = crate::db::gcal_get_config(&self.conn, "sync_days")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "30".to_string());
+        let default_cat = crate::db::gcal_get_config(&self.conn, "default_category")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "personal".to_string());
+        let default_category_idx = self
+            .categories
+            .iter()
+            .position(|c| c.id == default_cat)
+            .unwrap_or(5); // "personal" is usually at index 5
+
+        self.input_mode = InputMode::GCalSetup(GCalSetupState {
+            field: GCalSetupField::ClientId,
+            client_id,
+            client_secret,
+            sync_days,
+            default_category_idx,
+        });
+    }
+
+    fn submit_gcal_setup(&mut self, state: &GCalSetupState) -> anyhow::Result<()> {
+        if !state.sync_days.is_empty() {
+            crate::db::gcal_set_config(&self.conn, "sync_days", &state.sync_days)?;
+        }
+        if let Some(cat) = self.categories.get(state.default_category_idx) {
+            crate::db::gcal_set_config(&self.conn, "default_category", &cat.id)?;
+        }
+        if !state.client_id.is_empty() {
+            crate::db::gcal_set_config(&self.conn, "client_id", &state.client_id)?;
+        }
+        if !state.client_secret.is_empty() {
+            crate::db::gcal_set_config(&self.conn, "client_secret", &state.client_secret)?;
+        }
+        Ok(())
+    }
+
+    pub fn gcal_default_category(&self) -> String {
+        crate::db::gcal_get_config(&self.conn, "default_category")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "personal".to_string())
     }
 }
 

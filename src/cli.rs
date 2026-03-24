@@ -189,8 +189,37 @@ pub enum Commands {
         /// ルールID
         id: i64,
     },
+    /// Google Calendar 連携
+    Gcal {
+        #[command(subcommand)]
+        action: GcalAction,
+    },
     /// MCP サーバー起動
     Mcp,
+}
+
+#[derive(Subcommand)]
+pub enum GcalAction {
+    /// OAuth2認証
+    Auth {
+        #[arg(long)]
+        client_id: String,
+        #[arg(long)]
+        client_secret: String,
+    },
+    /// 同期実行
+    Sync,
+    /// カレンダー一覧
+    Calendars,
+    /// カレンダーの有効/無効切替
+    ToggleCalendar {
+        /// カレンダーID
+        calendar_id: String,
+    },
+    /// 設定状態を表示
+    Status,
+    /// 認証情報を削除
+    Logout,
 }
 
 fn today() -> String {
@@ -463,9 +492,99 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             db::delete_recurrence(conn, id)?;
             print_json(&serde_json::json!({ "ok": true, "id": id }));
         }
+        Commands::Gcal { .. } => {
+            // Gcal は main.rs から直接呼ぶ (async)
+            unreachable!();
+        }
         Commands::Mcp => {
             // MCP は main.rs から直接呼ぶ
             unreachable!();
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_gcal(action: GcalAction, conn: &Connection) -> Result<()> {
+    match action {
+        GcalAction::Auth {
+            client_id,
+            client_secret,
+        } => {
+            crate::gcal::run_auth_flow(conn, &client_id, &client_secret).await?;
+
+            // 認証後にカレンダー一覧を取得して保存
+            println!("カレンダー一覧を取得中...");
+            let cals = crate::gcal::fetch_and_store_calendars(conn).await?;
+            println!("{}個のカレンダーを取得", cals.len());
+            for cal in &cals {
+                let name = cal.summary.as_deref().unwrap_or(&cal.id);
+                println!("  [x] {name}");
+            }
+        }
+        GcalAction::Sync => {
+            if !db::gcal_is_configured(conn)? {
+                bail!(
+                    "GCalが未設定。先に `ytasky gcal auth --client-id=... --client-secret=...` を実行"
+                );
+            }
+            println!("同期中...");
+            let result = crate::gcal::sync_all(conn).await?;
+            println!(
+                "同期完了: {}件同期, {}件削除",
+                result.events_synced, result.events_deleted
+            );
+        }
+        GcalAction::Calendars => {
+            if !db::gcal_is_configured(conn)? {
+                bail!("GCalが未設定");
+            }
+            // refresh from API
+            let _ = crate::gcal::fetch_and_store_calendars(conn).await;
+            let calendars = db::gcal_load_calendars(conn)?;
+            if calendars.is_empty() {
+                println!("カレンダーなし");
+            } else {
+                for cal in &calendars {
+                    let mark = if cal.enabled { "x" } else { " " };
+                    println!("[{mark}] {} ({})", cal.name, cal.calendar_id);
+                }
+            }
+        }
+        GcalAction::ToggleCalendar { calendar_id } => {
+            let calendars = db::gcal_load_calendars(conn)?;
+            let cal = calendars
+                .iter()
+                .find(|c| c.calendar_id == calendar_id)
+                .context("カレンダーが見つからない")?;
+            let new_enabled = !cal.enabled;
+            db::gcal_set_calendar_enabled(conn, &calendar_id, new_enabled)?;
+            let status = if new_enabled { "有効" } else { "無効" };
+            println!("{}: {} → {status}", cal.name, calendar_id);
+        }
+        GcalAction::Status => {
+            let configured = db::gcal_is_configured(conn)?;
+            println!("認証: {}", if configured { "済み" } else { "未設定" });
+            if configured {
+                if let Some(last) = db::gcal_get_config(conn, "last_sync")? {
+                    println!("最終同期: {last}");
+                }
+                let sync_days = db::gcal_get_config(conn, "sync_days")?
+                    .unwrap_or_else(|| "30".to_string());
+                println!("同期日数: {sync_days}");
+                let default_cat = db::gcal_get_config(conn, "default_category")?
+                    .unwrap_or_else(|| "personal".to_string());
+                println!("カテゴリ: {default_cat}");
+                let calendars = db::gcal_load_calendars(conn)?;
+                let enabled_count = calendars.iter().filter(|c| c.enabled).count();
+                println!(
+                    "カレンダー: {enabled_count}/{} 有効",
+                    calendars.len()
+                );
+            }
+        }
+        GcalAction::Logout => {
+            db::gcal_clear_all(conn)?;
+            println!("GCal認証情報を削除した");
         }
     }
     Ok(())

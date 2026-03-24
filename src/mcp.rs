@@ -7,7 +7,7 @@ use rmcp::{
 use rusqlite::Connection;
 use serde_json::json;
 
-use crate::{db, model};
+use crate::{db, gcal, model};
 
 /// HH:MM → 分に変換
 fn parse_time(s: &str) -> Result<i32, McpError> {
@@ -217,6 +217,13 @@ struct EditRecurrenceParams {
 struct RecurrenceIdParams {
     /// Recurrence rule ID
     id: i64,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ListExternalEventsParams {
+    /// Target date in YYYY-MM-DD format. Defaults to today.
+    #[serde(default)]
+    date: Option<String>,
 }
 
 // --- MCP Server ---
@@ -590,6 +597,49 @@ impl YtaskyMcp {
         let conn = self.conn.lock().unwrap();
         let recurrences = db::load_recurrences(&conn).map_err(db_err)?;
         ok_json(json!({ "recurrences": recurrences }))
+    }
+
+    #[tool(
+        description = "Trigger Google Calendar sync. Fetches events from enabled calendars and stores them locally. Requires prior auth via CLI."
+    )]
+    async fn gcal_sync(&self) -> Result<CallToolResult, McpError> {
+        let config = {
+            let conn = self.conn.lock().unwrap();
+            if !db::gcal_is_configured(&conn).map_err(db_err)? {
+                return ok_json(json!({
+                    "error": "GCal未設定。`ytasky gcal auth` を先に実行"
+                }));
+            }
+            gcal::sync_prepare(&conn).map_err(db_err)?
+        };
+
+        let results = gcal::sync_fetch(&config)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let sync_result = {
+            let conn = self.conn.lock().unwrap();
+            gcal::sync_write(&conn, &results).map_err(db_err)?
+        };
+
+        ok_json(json!({
+            "ok": true,
+            "events_synced": sync_result.events_synced,
+            "events_deleted": sync_result.events_deleted,
+        }))
+    }
+
+    #[tool(
+        description = "List external (Google Calendar) events for a given date. Shows events imported from Google Calendar."
+    )]
+    fn list_external_events(
+        &self,
+        Parameters(params): Parameters<ListExternalEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let date = params.date.unwrap_or_else(today);
+        let conn = self.conn.lock().unwrap();
+        let events = db::gcal_load_events(&conn, &date).map_err(db_err)?;
+        ok_json(json!({ "date": date, "events": events }))
     }
 }
 

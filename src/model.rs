@@ -73,6 +73,25 @@ pub struct TitleReport {
     pub actual_min: i32,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalEvent {
+    pub id: i64,
+    pub gcal_event_id: String,
+    pub calendar_id: String,
+    pub date: String,
+    pub title: String,
+    pub start_min: Option<i32>,
+    pub duration_min: i32,
+    pub is_all_day: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GCalCalendar {
+    pub calendar_id: String,
+    pub name: String,
+    pub enabled: bool,
+}
+
 /// 分を "HH:MM" に変換（24:00以降も対応）
 pub fn format_time(minutes: i32) -> String {
     let wrapped = minutes.rem_euclid(24 * 60);

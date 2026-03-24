@@ -75,6 +75,32 @@ fn create_tables(conn: &Connection) -> Result<()> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_tasks_date ON tasks(date);
+
+        CREATE TABLE IF NOT EXISTS gcal_config (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS gcal_calendars (
+            calendar_id TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS external_events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            gcal_event_id  TEXT NOT NULL,
+            calendar_id    TEXT NOT NULL,
+            date           TEXT NOT NULL,
+            title          TEXT NOT NULL,
+            start_min      INTEGER,
+            duration_min   INTEGER NOT NULL,
+            is_all_day     INTEGER NOT NULL DEFAULT 0,
+            last_synced    TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(gcal_event_id, date)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_external_events_date ON external_events(date);
         ",
     )?;
 
@@ -1062,4 +1088,178 @@ fn parse_pattern_days(pattern_data: Option<&str>) -> Result<Vec<u8>> {
     let parsed = serde_json::from_str::<crate::model::PatternData>(raw)
         .with_context(|| format!("pattern_dataのJSONが不正です: {raw}"))?;
     Ok(parsed.days.unwrap_or_default())
+}
+
+// --- Google Calendar ---
+
+pub fn gcal_get_config(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM gcal_config WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn gcal_set_config(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO gcal_config (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+pub fn gcal_is_configured(conn: &Connection) -> Result<bool> {
+    Ok(gcal_get_config(conn, "refresh_token")?.is_some())
+}
+
+pub fn gcal_upsert_calendar(
+    conn: &Connection,
+    calendar_id: &str,
+    name: &str,
+    enabled: bool,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO gcal_calendars (calendar_id, name, enabled) VALUES (?1, ?2, ?3)
+         ON CONFLICT(calendar_id) DO UPDATE SET name = excluded.name",
+        params![calendar_id, name, enabled as i32],
+    )?;
+    Ok(())
+}
+
+pub fn gcal_load_calendars(conn: &Connection) -> Result<Vec<crate::model::GCalCalendar>> {
+    let mut stmt =
+        conn.prepare("SELECT calendar_id, name, enabled FROM gcal_calendars ORDER BY name")?;
+    let calendars = stmt
+        .query_map([], |row| {
+            Ok(crate::model::GCalCalendar {
+                calendar_id: row.get(0)?,
+                name: row.get(1)?,
+                enabled: row.get::<_, i32>(2)? != 0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(calendars)
+}
+
+pub fn gcal_set_calendar_enabled(
+    conn: &Connection,
+    calendar_id: &str,
+    enabled: bool,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE gcal_calendars SET enabled = ?2 WHERE calendar_id = ?1",
+        params![calendar_id, enabled as i32],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gcal_upsert_event(
+    conn: &Connection,
+    gcal_event_id: &str,
+    calendar_id: &str,
+    date: &str,
+    title: &str,
+    start_min: Option<i32>,
+    duration_min: i32,
+    is_all_day: bool,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO external_events
+            (gcal_event_id, calendar_id, date, title, start_min, duration_min, is_all_day, last_synced)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+         ON CONFLICT(gcal_event_id, date) DO UPDATE SET
+            calendar_id = excluded.calendar_id,
+            title       = excluded.title,
+            start_min   = excluded.start_min,
+            duration_min = excluded.duration_min,
+            is_all_day  = excluded.is_all_day,
+            last_synced = excluded.last_synced",
+        params![
+            gcal_event_id,
+            calendar_id,
+            date,
+            title,
+            start_min,
+            duration_min,
+            is_all_day as i32
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn gcal_load_events(
+    conn: &Connection,
+    date: &str,
+) -> Result<Vec<crate::model::ExternalEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.gcal_event_id, e.calendar_id, e.date, e.title,
+                e.start_min, e.duration_min, e.is_all_day
+         FROM external_events e
+         JOIN gcal_calendars c ON e.calendar_id = c.calendar_id AND c.enabled = 1
+         WHERE e.date = ?1
+         ORDER BY e.is_all_day DESC, e.start_min ASC, e.title ASC",
+    )?;
+    let events = stmt
+        .query_map(params![date], |row| {
+            Ok(crate::model::ExternalEvent {
+                id: row.get(0)?,
+                gcal_event_id: row.get(1)?,
+                calendar_id: row.get(2)?,
+                date: row.get(3)?,
+                title: row.get(4)?,
+                start_min: row.get(5)?,
+                duration_min: row.get(6)?,
+                is_all_day: row.get::<_, i32>(7)? != 0,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(events)
+}
+
+pub fn gcal_delete_stale_events(
+    conn: &Connection,
+    calendar_id: &str,
+    date: &str,
+    current_event_ids: &[String],
+) -> Result<usize> {
+    if current_event_ids.is_empty() {
+        let deleted = conn.execute(
+            "DELETE FROM external_events WHERE calendar_id = ?1 AND date = ?2",
+            params![calendar_id, date],
+        )?;
+        return Ok(deleted);
+    }
+    let placeholders: Vec<String> = (0..current_event_ids.len())
+        .map(|i| format!("?{}", i + 3))
+        .collect();
+    let sql = format!(
+        "DELETE FROM external_events
+         WHERE calendar_id = ?1 AND date = ?2
+           AND gcal_event_id NOT IN ({})",
+        placeholders.join(",")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    param_values.push(Box::new(calendar_id.to_string()));
+    param_values.push(Box::new(date.to_string()));
+    for id in current_event_ids {
+        param_values.push(Box::new(id.clone()));
+    }
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+    let deleted = stmt.execute(params_ref.as_slice())?;
+    Ok(deleted)
+}
+
+pub fn gcal_clear_all(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DELETE FROM external_events;
+         DELETE FROM gcal_calendars;
+         DELETE FROM gcal_config;",
+    )?;
+    Ok(())
 }

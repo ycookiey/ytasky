@@ -16,3 +16,6 @@ tokio = { version = "1", features = ["full"] }
 schemars = "0.8"
 anyhow = "1"
 dirs = "6"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+oauth2 = "5"
+open = "5"

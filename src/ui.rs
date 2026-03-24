@@ -8,10 +8,13 @@ use ratatui::{
 };
 
 use crate::app::{
-    App, BacklogTab, DeleteChoice, FormField, FormMode, FormTarget, InputMode, PanelFocus,
-    RecurrenceFormField, RecurrenceFormState, TaskFormState, ViewMode, current_minutes,
+    App, BacklogTab, DeleteChoice, FormField, FormMode, FormTarget, GCalSetupField,
+    GCalSetupState, InputMode, PanelFocus, RecurrenceFormField, RecurrenceFormState,
+    TaskFormState, ViewMode, current_minutes,
 };
-use crate::model::{Recurrence, Task, format_deadline, format_duration, format_time};
+use crate::model::{
+    ExternalEvent, GCalCalendar, Recurrence, Task, format_deadline, format_duration, format_time,
+};
 
 const DAY_MINUTES: i32 = 24 * 60;
 
@@ -107,6 +110,21 @@ fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
         InputMode::BacklogSelect { .. } => {
             vec![("j/k", "移動"), ("Enter", "挿入"), ("Esc", "キャンセル")]
         }
+        InputMode::GCalSetup(_) => {
+            vec![
+                ("Tab/Enter", "次"),
+                ("BackTab", "前"),
+                ("Esc", "キャンセル"),
+            ]
+        }
+        InputMode::GCalCalendarSelect { .. } => {
+            vec![
+                ("j/k", "移動"),
+                ("Space", "切替"),
+                ("Enter", "確定"),
+                ("Esc", "閉じる"),
+            ]
+        }
         InputMode::Normal => match app.view_mode {
             ViewMode::ReportView => vec![("q/Esc", "閉じる")],
             ViewMode::TimelineView => vec![
@@ -117,6 +135,7 @@ fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
                 ("d", "削除"),
                 ("J/K", "並替"),
                 ("Space", "実績"),
+                ("g", "GCal"),
                 ("t", "Table"),
                 ("r", "Report"),
                 ("1-9", "日数"),
@@ -134,6 +153,7 @@ fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
                     ("Tab", "BL"),
                     ("B", "→BL"),
                     ("p", "←BL"),
+                    ("g", "GCal"),
                     ("t", "TL"),
                     ("r", "Report"),
                     ("1-9", "日数"),
@@ -191,7 +211,21 @@ fn draw_multi_day_columns(f: &mut Frame, area: Rect, app: &App) {
         } else {
             None
         };
-        draw_day_column(f, columns[col_idx], app, date, tasks, is_active, cursor_row);
+        let ext_events = app
+            .external_events
+            .get(col_idx)
+            .map(|(_, events)| events.as_slice())
+            .unwrap_or(&[]);
+        draw_day_column(
+            f,
+            columns[col_idx],
+            app,
+            date,
+            tasks,
+            ext_events,
+            is_active,
+            cursor_row,
+        );
     }
 }
 
@@ -201,6 +235,7 @@ fn draw_day_column(
     app: &App,
     date: &str,
     tasks: &[Task],
+    ext_events: &[ExternalEvent],
     is_active: bool,
     cursor_row: Option<usize>,
 ) {
@@ -219,74 +254,124 @@ fn draw_day_column(
     );
 
     let schedule = build_schedule(tasks);
-    let buffers = build_buffers(&schedule);
+    let ext_color_id = app.gcal_default_category();
+    // Build combined schedule with external events
+    let (combined, all_day_events) =
+        build_combined_schedule(&schedule, ext_events, &ext_color_id);
+    let buffers = build_combined_buffers(&combined);
     let mut rows: Vec<Row> = Vec::new();
 
     let today = Local::now().format("%Y-%m-%d").to_string();
     let is_today = date == today;
     let compact = area.width < 42;
 
-    let mut buffer_idx = 0usize;
-    for (i, (start, _, task)) in schedule.iter().enumerate() {
-        if let Some((buffer_start, buffer_end)) = buffers.get(buffer_idx)
-            && *buffer_end == *start
-        {
-            let buffer_minutes = buffer_end - buffer_start;
-            rows.push(
-                Row::new(vec![
-                    Cell::from(""),
-                    Cell::from(format_time(*buffer_start)),
-                    Cell::from(format_duration(buffer_minutes)),
-                    Cell::from(format!("-- buffer {buffer_minutes}m --")),
-                    Cell::from(""),
-                    Cell::from(""),
-                ])
-                .style(Style::default().fg(Color::Rgb(120, 120, 150))),
-            );
-            buffer_idx += 1;
-        }
-
-        let status = if task.actual_end.is_some() {
-            "done".to_string()
-        } else if let Some(actual_start) = task.actual_start {
-            if is_today {
-                let elapsed = (current_minutes() - actual_start).max(0);
-                format!("▶{}", format_duration(elapsed))
-            } else {
-                "▶now".to_string()
-            }
-        } else {
-            "--".to_string()
-        };
-
-        let color = category_color(&task.category_id);
-        let style = if Some(i) == cursor_row {
-            Style::default().bg(Color::Rgb(50, 50, 80)).fg(Color::White)
-        } else {
-            Style::default().fg(color)
-        };
-        let category_text = if compact {
-            compact_category_name(app, &task.category_id)
-        } else {
-            category_name(app, &task.category_id)
-        };
-        let title_text = if task.recurrence_id.is_some() {
-            format!("↻ {}", task.title)
-        } else {
-            task.title.clone()
-        };
-
+    // All-day events at top
+    for event in &all_day_events {
+        let color = category_color(&ext_color_id);
         rows.push(
             Row::new(vec![
-                Cell::from(format!("{}", i + 1)),
-                Cell::from(format_time(*start)),
-                Cell::from(format_duration(task.duration_min)),
-                Cell::from(title_text),
-                Cell::from(category_text),
-                Cell::from(status),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from("終日"),
+                Cell::from(format!("📅 {} (終日)", event.title)),
+                Cell::from(""),
+                Cell::from(""),
             ])
-            .style(style),
+            .style(Style::default().fg(color)),
         );
+    }
+
+    let mut task_visual_idx = 0usize; // tracks actual task index for cursor
+    let mut buffer_idx = 0usize;
+    for entry in &combined {
+        let start_min = match entry {
+            ScheduleEntry::Task(s, _, _) | ScheduleEntry::External(s, _, _) => *s,
+            ScheduleEntry::Buffer(s, _) => *s,
+        };
+
+        // Insert buffer before this entry if needed
+        if let Some((buffer_start, buffer_end)) = buffers.get(buffer_idx) {
+            if *buffer_end == start_min {
+                let buffer_minutes = buffer_end - buffer_start;
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(""),
+                        Cell::from(format_time(*buffer_start)),
+                        Cell::from(format_duration(buffer_minutes)),
+                        Cell::from(format!("-- buffer {buffer_minutes}m --")),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ])
+                    .style(Style::default().fg(Color::Rgb(120, 120, 150))),
+                );
+                buffer_idx += 1;
+            }
+        }
+
+        match entry {
+            ScheduleEntry::Task(start, _end, task) => {
+                let status = if task.actual_end.is_some() {
+                    "done".to_string()
+                } else if let Some(actual_start) = task.actual_start {
+                    if is_today {
+                        let elapsed = (current_minutes() - actual_start).max(0);
+                        format!("▶{}", format_duration(elapsed))
+                    } else {
+                        "▶now".to_string()
+                    }
+                } else {
+                    "--".to_string()
+                };
+
+                let color = category_color(&task.category_id);
+                let style = if Some(task_visual_idx) == cursor_row {
+                    Style::default().bg(Color::Rgb(50, 50, 80)).fg(Color::White)
+                } else {
+                    Style::default().fg(color)
+                };
+                let category_text = if compact {
+                    compact_category_name(app, &task.category_id)
+                } else {
+                    category_name(app, &task.category_id)
+                };
+                let title_text = if task.recurrence_id.is_some() {
+                    format!("↻ {}", task.title)
+                } else {
+                    task.title.clone()
+                };
+
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(format!("{}", task_visual_idx + 1)),
+                        Cell::from(format_time(*start)),
+                        Cell::from(format_duration(task.duration_min)),
+                        Cell::from(title_text),
+                        Cell::from(category_text),
+                        Cell::from(status),
+                    ])
+                    .style(style),
+                );
+                task_visual_idx += 1;
+            }
+            ScheduleEntry::External(start, _end, event) => {
+                let rounded_duration = (event.duration_min + 14) / 15 * 15;
+                let color = category_color(&ext_color_id);
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(""),
+                        Cell::from(format_time(*start)),
+                        Cell::from(format_duration(rounded_duration)),
+                        Cell::from(format!("📅 {}", event.title)),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ])
+                    .style(Style::default().fg(color)),
+                );
+            }
+            ScheduleEntry::Buffer(_, _) => {
+                // buffers handled above
+            }
+        }
     }
 
     if rows.is_empty() {
@@ -303,11 +388,16 @@ fn draw_day_column(
         );
     }
 
-    if let Some((_, end, _)) = schedule.last() {
+    // End time marker
+    let last_end = combined.iter().rev().find_map(|e| match e {
+        ScheduleEntry::Task(_, end, _) | ScheduleEntry::External(_, end, _) => Some(*end),
+        _ => None,
+    });
+    if let Some(end) = last_end {
         rows.push(
             Row::new(vec![
                 Cell::from(""),
-                Cell::from(format_time(*end)),
+                Cell::from(format_time(end)),
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
@@ -483,21 +573,38 @@ fn draw_timeline_view(f: &mut Frame, area: Rect, app: &App) {
         } else {
             None
         };
-        draw_timeline_column(f, columns[col_idx], app, date, tasks, is_active, cursor_row);
+        let ext_events = app
+            .external_events
+            .get(col_idx)
+            .map(|(_, events)| events.as_slice())
+            .unwrap_or(&[]);
+        draw_timeline_column(
+            f,
+            columns[col_idx],
+            app,
+            date,
+            tasks,
+            ext_events,
+            is_active,
+            cursor_row,
+        );
     }
 }
 
 fn draw_timeline_column(
     f: &mut Frame,
     area: Rect,
-    _app: &App,
+    app: &App,
     date: &str,
     tasks: &[Task],
+    ext_events: &[ExternalEvent],
     is_active: bool,
     cursor_row: Option<usize>,
 ) {
     let schedule = build_schedule(tasks);
-    let buffers = build_buffers(&schedule);
+    let ext_color_id = app.gcal_default_category();
+    let (combined, _all_day) = build_combined_schedule(&schedule, ext_events, &ext_color_id);
+    let buffers = build_combined_buffers(&combined);
 
     let today = Local::now().format("%Y-%m-%d").to_string();
     let is_today = date == today;
@@ -523,9 +630,12 @@ fn draw_timeline_column(
     let label_width = if compact { 6 } else { 7 };
     let bar_width = inner.width.saturating_sub(label_width) as usize;
 
-    let max_end = schedule
+    let max_end = combined
         .iter()
-        .map(|(_, end, _)| *end)
+        .filter_map(|e| match e {
+            ScheduleEntry::Task(_, end, _) | ScheduleEntry::External(_, end, _) => Some(*end),
+            _ => None,
+        })
         .max()
         .unwrap_or(DAY_MINUTES)
         .max(DAY_MINUTES);
@@ -593,55 +703,78 @@ fn draw_timeline_column(
         }
 
         // 通常スケジュール
-        if let Some((idx, (task_start, _, task))) = schedule
-            .iter()
-            .enumerate()
-            .find(|(_, (start, end, _))| *start < slot_end && *end > slot_start)
-        {
-            let is_start = slot_start <= *task_start && *task_start < slot_end;
-            let is_selected = cursor_row.is_some_and(|row| idx == row);
+        if let Some(entry) = combined.iter().find(|e| {
+            let (s, end) = match e {
+                ScheduleEntry::Task(s, end, _) | ScheduleEntry::External(s, end, _) => (*s, *end),
+                ScheduleEntry::Buffer(_, _) => return false,
+            };
+            s < slot_end && end > slot_start
+        }) {
+            match entry {
+                ScheduleEntry::Task(task_start, _, task) => {
+                    // Find task index for cursor
+                    let task_idx = schedule.iter().position(|(_, _, t)| t.id == task.id);
+                    let is_start = slot_start <= *task_start && *task_start < slot_end;
+                    let is_selected = cursor_row.is_some_and(|row| task_idx == Some(row));
 
-            if is_selected && cursor_start_row.is_none() {
-                cursor_start_row = Some(lines.len());
+                    if is_selected && cursor_start_row.is_none() {
+                        cursor_start_row = Some(lines.len());
+                    }
+
+                    let base_color = category_color(&task.category_id);
+                    let (bg, fg) = if task.actual_end.is_some() {
+                        (muted_color(base_color), Color::Rgb(180, 180, 180))
+                    } else {
+                        (base_color, Color::White)
+                    };
+                    let bg = if is_selected { brighten_color(bg) } else { bg };
+
+                    let marker = if is_selected && is_start { "▸" } else { " " };
+                    let text = if is_start {
+                        let task_title = if task.recurrence_id.is_some() {
+                            format!("↻ {}", task.title)
+                        } else {
+                            task.title.clone()
+                        };
+                        format!("{marker} {task_title}")
+                    } else {
+                        String::new()
+                    };
+                    let padded = format!("{:<width$}", text, width = bar_width);
+
+                    let mut style = Style::default().bg(bg).fg(fg);
+                    if task.actual_start.is_some() && task.actual_end.is_none() {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+
+                    let label_style = if is_selected && is_start {
+                        Style::default().fg(Color::White)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::styled(label, label_style),
+                        Span::styled(padded, style),
+                    ]));
+                }
+                ScheduleEntry::External(ext_start, _, event) => {
+                    let is_start = slot_start <= *ext_start && *ext_start < slot_end;
+                    let base_color = category_color(&ext_color_id);
+                    let text = if is_start {
+                        format!("  {}", event.title)
+                    } else {
+                        String::new()
+                    };
+                    let padded = format!("{:<width$}", text, width = bar_width);
+
+                    lines.push(Line::from(vec![
+                        Span::styled(label, Style::default().fg(Color::DarkGray)),
+                        Span::styled(padded, Style::default().bg(base_color).fg(Color::White)),
+                    ]));
+                }
+                _ => {}
             }
-
-            let base_color = category_color(&task.category_id);
-            let (bg, fg) = if task.actual_end.is_some() {
-                (muted_color(base_color), Color::Rgb(180, 180, 180))
-            } else {
-                (base_color, Color::White)
-            };
-
-            let bg = if is_selected { brighten_color(bg) } else { bg };
-
-            let marker = if is_selected && is_start { "▸" } else { " " };
-            let text = if is_start {
-                let task_title = if task.recurrence_id.is_some() {
-                    format!("↻ {}", task.title)
-                } else {
-                    task.title.clone()
-                };
-                format!("{marker} {task_title}")
-            } else {
-                String::new()
-            };
-            let padded = format!("{:<width$}", text, width = bar_width);
-
-            let mut style = Style::default().bg(bg).fg(fg);
-            if task.actual_start.is_some() && task.actual_end.is_none() {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-
-            let label_style = if is_selected && is_start {
-                Style::default().fg(Color::White)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(label, label_style),
-                Span::styled(padded, style),
-            ]));
         } else {
             // 空きスロット
             lines.push(Line::from(vec![
@@ -811,20 +944,6 @@ fn build_schedule(tasks: &[Task]) -> Vec<(i32, i32, &Task)> {
     schedule
 }
 
-fn build_buffers(schedule: &[(i32, i32, &Task)]) -> Vec<(i32, i32)> {
-    let mut buffers = Vec::new();
-    let mut previous_end = 0;
-
-    for (start, end, _) in schedule {
-        if previous_end < *start {
-            buffers.push((previous_end, *start));
-        }
-        previous_end = *end;
-    }
-
-    buffers
-}
-
 fn normalize_fixed_start(fixed_start: i32, current_min: i32) -> i32 {
     if fixed_start >= current_min {
         return fixed_start;
@@ -959,6 +1078,10 @@ fn draw_modal_if_needed(f: &mut Frame, app: &App) {
         }
         InputMode::BacklogSelect { .. } => {}
         InputMode::RecurrenceForm(form) => draw_recurrence_form_modal(f, app, form),
+        InputMode::GCalSetup(state) => draw_gcal_setup_modal(f, app, state),
+        InputMode::GCalCalendarSelect {
+            calendars, cursor, ..
+        } => draw_gcal_calendar_select_modal(f, calendars, *cursor),
     }
 }
 
@@ -1396,4 +1519,252 @@ fn muted_color(color: Color) -> Color {
         }
         _ => Color::DarkGray,
     }
+}
+
+// --- External events integration ---
+
+enum ScheduleEntry<'a> {
+    Task(i32, i32, &'a Task),
+    External(i32, i32, &'a ExternalEvent),
+    #[allow(dead_code)]
+    Buffer(i32, i32),
+}
+
+/// Build combined schedule merging tasks and external events by start time.
+/// Returns (combined entries, all-day events).
+fn build_combined_schedule<'a>(
+    task_schedule: &[(i32, i32, &'a Task)],
+    ext_events: &'a [ExternalEvent],
+    _ext_color_id: &str,
+) -> (Vec<ScheduleEntry<'a>>, Vec<&'a ExternalEvent>) {
+    let mut all_day = Vec::new();
+    let mut timed_ext: Vec<&ExternalEvent> = Vec::new();
+
+    for event in ext_events {
+        if event.is_all_day {
+            all_day.push(event);
+        } else if event.start_min.is_some() {
+            timed_ext.push(event);
+        }
+    }
+    timed_ext.sort_by_key(|e| e.start_min.unwrap_or(0));
+
+    // Merge task_schedule and timed_ext by start time
+    let mut combined = Vec::new();
+    let mut ti = 0usize;
+    let mut ei = 0usize;
+
+    while ti < task_schedule.len() || ei < timed_ext.len() {
+        let task_start = task_schedule.get(ti).map(|(s, _, _)| *s);
+        let ext_start = timed_ext.get(ei).and_then(|e| e.start_min);
+
+        match (task_start, ext_start) {
+            (Some(ts), Some(es)) if ts <= es => {
+                let (s, e, t) = task_schedule[ti];
+                combined.push(ScheduleEntry::Task(s, e, t));
+                ti += 1;
+            }
+            (Some(_), Some(_)) => {
+                let event = timed_ext[ei];
+                let start = event.start_min.unwrap();
+                let end = start + event.duration_min;
+                combined.push(ScheduleEntry::External(start, end, event));
+                ei += 1;
+            }
+            (Some(_), None) => {
+                let (s, e, t) = task_schedule[ti];
+                combined.push(ScheduleEntry::Task(s, e, t));
+                ti += 1;
+            }
+            (None, Some(_)) => {
+                let event = timed_ext[ei];
+                let start = event.start_min.unwrap();
+                let end = start + event.duration_min;
+                combined.push(ScheduleEntry::External(start, end, event));
+                ei += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    (combined, all_day)
+}
+
+fn build_combined_buffers(combined: &[ScheduleEntry]) -> Vec<(i32, i32)> {
+    let mut buffers = Vec::new();
+    let mut previous_end = 0i32;
+
+    for entry in combined {
+        let (start, end) = match entry {
+            ScheduleEntry::Task(s, e, _) | ScheduleEntry::External(s, e, _) => (*s, *e),
+            ScheduleEntry::Buffer(s, e) => (*s, *e),
+        };
+        if previous_end < start {
+            buffers.push((previous_end, start));
+        }
+        previous_end = end;
+    }
+
+    buffers
+}
+
+fn draw_gcal_setup_modal(f: &mut Frame, app: &App, state: &GCalSetupState) {
+    let area = centered_rect(64, 50, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Google Calendar 設定 ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+    f.render_widget(block, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let active = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(Color::White);
+    let muted = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Client ID
+    let id_style = if state.field == GCalSetupField::ClientId {
+        active
+    } else {
+        normal
+    };
+    lines.push(Line::from(vec![
+        Span::styled("Client ID:     ", muted),
+        Span::styled(
+            if state.client_id.is_empty() {
+                "(入力)"
+            } else {
+                &state.client_id
+            },
+            id_style,
+        ),
+    ]));
+
+    // Client Secret
+    let secret_style = if state.field == GCalSetupField::ClientSecret {
+        active
+    } else {
+        normal
+    };
+    let secret_display = if state.client_secret.is_empty() {
+        "(入力)".to_string()
+    } else {
+        "*".repeat(state.client_secret.len().min(20))
+    };
+    lines.push(Line::from(vec![
+        Span::styled("Client Secret: ", muted),
+        Span::styled(secret_display, secret_style),
+    ]));
+
+    // Sync days
+    let days_style = if state.field == GCalSetupField::SyncDays {
+        active
+    } else {
+        normal
+    };
+    lines.push(Line::from(vec![
+        Span::styled("同期日数:       ", muted),
+        Span::styled(&state.sync_days, days_style),
+    ]));
+
+    // Default category
+    let cat_style = if state.field == GCalSetupField::DefaultCategory {
+        active
+    } else {
+        normal
+    };
+    let cat_name = app
+        .categories
+        .get(state.default_category_idx)
+        .map(|c| format!("{} {}", c.icon, c.name))
+        .unwrap_or_else(|| "personal".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("カテゴリ:       ", muted),
+        Span::styled(cat_name, cat_style),
+    ]));
+    if state.field == GCalSetupField::DefaultCategory {
+        lines.push(Line::from(Span::styled("  (j/k で選択)", muted)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "認証はCLIで実行: ytasky gcal auth --client-id=... --client-secret=...",
+        muted,
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Tab/Enter: 次へ  BackTab: 戻る  最終項目でEnter: 保存  Esc: 取消",
+        muted,
+    )));
+
+    if let Some(msg) = &app.status_message {
+        lines.push(Line::from(Span::styled(
+            msg.as_str(),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_gcal_calendar_select_modal(
+    f: &mut Frame,
+    calendars: &[GCalCalendar],
+    cursor: usize,
+) {
+    let area = centered_rect(58, 50, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" カレンダー選択 ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+    f.render_widget(block, area);
+
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+
+    let mut lines: Vec<Line> = Vec::new();
+    let muted = Style::default().fg(Color::DarkGray);
+
+    for (idx, cal) in calendars.iter().enumerate() {
+        let mark = if cal.enabled { "x" } else { " " };
+        let style = if idx == cursor {
+            Style::default()
+                .bg(Color::Rgb(50, 50, 80))
+                .fg(Color::White)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(
+            format!(" [{mark}] {}", cal.name),
+            style,
+        )));
+    }
+
+    if calendars.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "カレンダーがない。`ytasky gcal sync` を先に実行",
+            muted,
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Space: 切替  Enter: 確定  Esc: 閉じる",
+        muted,
+    )));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
