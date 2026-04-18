@@ -117,6 +117,7 @@ fn test_init_insert_and_view() {
         ("duration_min".to_string(), "30".to_string()),
         ("status".to_string(), "todo".to_string()),
         ("sort_order".to_string(), "0".to_string()),
+        ("is_backlog".to_string(), "0".to_string()),
     ]);
     let id = db.insert("tasks", record).unwrap();
     assert_eq!(id, 1, "first task id should be 1");

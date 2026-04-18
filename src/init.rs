@@ -132,6 +132,8 @@ pub fn apply_schema(db: &mut ybasey::Database) -> Result<()> {
         true,
     )?;
     db.add_field("tasks", "note", "str", true)?;
+    db.add_field("tasks", "is_backlog", "int", false)?;
+    db.add_field("tasks", "deadline", "str", true)?;
 
     // ---- views ----
     apply_views(db)?;
