@@ -21,6 +21,7 @@ pub struct Task {
     pub actual_start: Option<i32>,
     pub actual_end: Option<i32>,
     pub recurrence_id: Option<i64>,
+    pub is_backlog: bool,
     pub deadline: Option<String>,
 }
 

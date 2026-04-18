@@ -1,12 +1,16 @@
+//! history.rs — undo/redo Command pattern
+//!
+//! Sub-task 11: rusqlite::Connection → ybasey::Database に全面置換済み。
+
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use ybasey::Database;
 
 use crate::model::Task;
 
 pub trait Command {
-    fn execute(&mut self, conn: &Connection) -> Result<()>;
-    fn undo(&mut self, conn: &Connection) -> Result<()>;
-    fn redo(&mut self, conn: &Connection) -> Result<()>;
+    fn execute(&mut self, db: &mut Database) -> Result<()>;
+    fn undo(&mut self, db: &mut Database) -> Result<()>;
+    fn redo(&mut self, db: &mut Database) -> Result<()>;
 }
 
 #[derive(Default)]
@@ -20,33 +24,27 @@ impl UndoManager {
         Self::default()
     }
 
-    pub fn execute_command(
-        &mut self,
-        conn: &Connection,
-        mut command: Box<dyn Command>,
-    ) -> Result<()> {
-        command.execute(conn)?;
+    pub fn execute_command(&mut self, db: &mut Database, mut command: Box<dyn Command>) -> Result<()> {
+        command.execute(db)?;
         self.undo_stack.push(command);
         self.redo_stack.clear();
         Ok(())
     }
 
-    pub fn undo(&mut self, conn: &Connection) -> Result<bool> {
+    pub fn undo(&mut self, db: &mut Database) -> Result<bool> {
         let Some(mut command) = self.undo_stack.pop() else {
             return Ok(false);
         };
-
-        command.undo(conn)?;
+        command.undo(db)?;
         self.redo_stack.push(command);
         Ok(true)
     }
 
-    pub fn redo(&mut self, conn: &Connection) -> Result<bool> {
+    pub fn redo(&mut self, db: &mut Database) -> Result<bool> {
         let Some(mut command) = self.redo_stack.pop() else {
             return Ok(false);
         };
-
-        command.redo(conn)?;
+        command.redo(db)?;
         self.undo_stack.push(command);
         Ok(true)
     }
@@ -91,35 +89,34 @@ impl AddTaskCommand {
 }
 
 impl Command for AddTaskCommand {
-    fn execute(&mut self, conn: &Connection) -> Result<()> {
+    fn execute(&mut self, db: &mut Database) -> Result<()> {
         let id = crate::db::insert_task(
-            conn,
+            db,
             &self.date,
             &self.title,
             &self.category_id,
             self.duration_min,
             self.fixed_start,
         )?;
-
         let task =
-            load_task_by_id(conn, id)?.context("追加後のタスク状態を取得できませんでした")?;
+            crate::db::load_task_by_id(db, id)?.context("追加後のタスク状態を取得できませんでした")?;
         self.inserted_task = Some(task);
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> Result<()> {
+    fn undo(&mut self, db: &mut Database) -> Result<()> {
         if let Some(task) = &self.inserted_task {
-            crate::db::delete_task(conn, task.id)?;
+            crate::db::delete_task(db, task.id)?;
         }
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> Result<()> {
+    fn redo(&mut self, db: &mut Database) -> Result<()> {
         let task = self
             .inserted_task
             .as_ref()
             .context("Redo対象の追加タスク情報がありません")?;
-        restore_task(conn, task)?;
+        restore_task(db, task)?;
         Ok(())
     }
 }
@@ -157,34 +154,31 @@ impl EditTaskCommand {
 }
 
 impl Command for EditTaskCommand {
-    fn execute(&mut self, conn: &Connection) -> Result<()> {
+    fn execute(&mut self, db: &mut Database) -> Result<()> {
         let before =
-            load_task_by_id(conn, self.task_id)?.context("編集対象タスクが見つかりません")?;
-
+            crate::db::load_task_by_id(db, self.task_id)?.context("編集対象タスクが見つかりません")?;
         crate::db::update_task(
-            conn,
+            db,
             self.task_id,
             &self.title,
             &self.category_id,
             self.duration_min,
             self.fixed_start,
         )?;
-
-        let after = load_task_by_id(conn, self.task_id)?
+        let after = crate::db::load_task_by_id(db, self.task_id)?
             .context("編集後のタスク状態を取得できませんでした")?;
         self.before = Some(before);
         self.after = Some(after);
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> Result<()> {
+    fn undo(&mut self, db: &mut Database) -> Result<()> {
         let before = self
             .before
             .as_ref()
             .context("Undo対象の編集前状態がありません")?;
-
         crate::db::update_task(
-            conn,
+            db,
             before.id,
             &before.title,
             &before.category_id,
@@ -194,14 +188,13 @@ impl Command for EditTaskCommand {
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> Result<()> {
+    fn redo(&mut self, db: &mut Database) -> Result<()> {
         let after = self
             .after
             .as_ref()
             .context("Redo対象の編集後状態がありません")?;
-
         crate::db::update_task(
-            conn,
+            db,
             after.id,
             &after.title,
             &after.category_id,
@@ -227,25 +220,25 @@ impl DeleteTaskCommand {
 }
 
 impl Command for DeleteTaskCommand {
-    fn execute(&mut self, conn: &Connection) -> Result<()> {
+    fn execute(&mut self, db: &mut Database) -> Result<()> {
         let task =
-            load_task_by_id(conn, self.task_id)?.context("削除対象タスクが見つかりません")?;
-        crate::db::delete_task(conn, self.task_id)?;
+            crate::db::load_task_by_id(db, self.task_id)?.context("削除対象タスクが見つかりません")?;
+        crate::db::delete_task(db, self.task_id)?;
         self.deleted_task = Some(task);
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> Result<()> {
+    fn undo(&mut self, db: &mut Database) -> Result<()> {
         let task = self
             .deleted_task
             .as_ref()
             .context("Undo対象の削除タスク情報がありません")?;
-        restore_task(conn, task)?;
+        restore_task(db, task)?;
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> Result<()> {
-        crate::db::delete_task(conn, self.task_id)?;
+    fn redo(&mut self, db: &mut Database) -> Result<()> {
+        crate::db::delete_task(db, self.task_id)?;
         Ok(())
     }
 }
@@ -262,18 +255,18 @@ impl ReorderTaskCommand {
 }
 
 impl Command for ReorderTaskCommand {
-    fn execute(&mut self, conn: &Connection) -> Result<()> {
-        crate::db::swap_sort_order(conn, self.id1, self.id2)?;
+    fn execute(&mut self, db: &mut Database) -> Result<()> {
+        crate::db::swap_sort_order(db, self.id1, self.id2)?;
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> Result<()> {
-        crate::db::swap_sort_order(conn, self.id1, self.id2)?;
+    fn undo(&mut self, db: &mut Database) -> Result<()> {
+        crate::db::swap_sort_order(db, self.id1, self.id2)?;
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> Result<()> {
-        crate::db::swap_sort_order(conn, self.id1, self.id2)?;
+    fn redo(&mut self, db: &mut Database) -> Result<()> {
+        crate::db::swap_sort_order(db, self.id1, self.id2)?;
         Ok(())
     }
 }
@@ -293,7 +286,6 @@ impl ToggleActualCommand {
             (Some(start), None) => (Some(start), Some(now_min.max(start))),
             (Some(_), Some(_)) | (None, Some(_)) => (None, None),
         };
-
         Self {
             task_id: task.id,
             before_start: task.actual_start,
@@ -305,107 +297,143 @@ impl ToggleActualCommand {
 }
 
 impl Command for ToggleActualCommand {
-    fn execute(&mut self, conn: &Connection) -> Result<()> {
-        crate::db::update_actual(conn, self.task_id, self.after_start, self.after_end)?;
+    fn execute(&mut self, db: &mut Database) -> Result<()> {
+        crate::db::update_actual(db, self.task_id, self.after_start, self.after_end)?;
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> Result<()> {
-        crate::db::update_actual(conn, self.task_id, self.before_start, self.before_end)?;
+    fn undo(&mut self, db: &mut Database) -> Result<()> {
+        crate::db::update_actual(db, self.task_id, self.before_start, self.before_end)?;
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> Result<()> {
-        crate::db::update_actual(conn, self.task_id, self.after_start, self.after_end)?;
+    fn redo(&mut self, db: &mut Database) -> Result<()> {
+        crate::db::update_actual(db, self.task_id, self.after_start, self.after_end)?;
         Ok(())
     }
 }
 
-fn load_task_by_id(conn: &Connection, id: i64) -> Result<Option<Task>> {
-    conn.query_row(
-        "SELECT id, date, sort_order, title, category_id, duration_min,
-                fixed_start, actual_start, actual_end, recurrence_id, deadline
-         FROM tasks WHERE id = ?1",
-        params![id],
-        |row| {
-            Ok(Task {
-                id: row.get(0)?,
-                date: row.get(1)?,
-                sort_order: row.get(2)?,
-                title: row.get(3)?,
-                category_id: row.get(4)?,
-                duration_min: row.get(5)?,
-                fixed_start: row.get(6)?,
-                actual_start: row.get(7)?,
-                actual_end: row.get(8)?,
-                recurrence_id: row.get(9)?,
-                deadline: row.get(10)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(Into::into)
-}
+// ---- history.rs 内部 helper (restore_task) ------------------------------------
 
-fn restore_task(conn: &Connection, task: &Task) -> Result<()> {
-    let existing = load_task_by_id(conn, task.id)?;
-    if existing.is_some() {
+/// 削除済みタスクを復元する (Undo 用)
+fn restore_task(db: &mut Database, task: &Task) -> Result<()> {
+    // 既存なら何もしない
+    if crate::db::load_task_by_id(db, task.id)?.is_some() {
         return Ok(());
     }
 
-    conn.execute(
-        "UPDATE tasks
-         SET sort_order = sort_order + 1
-         WHERE date = ?1 AND sort_order >= ?2",
-        params![task.date.as_str(), task.sort_order],
-    )?;
-
-    conn.execute(
-        "INSERT INTO tasks (
-            id, date, sort_order, title, category_id, duration_min,
-            fixed_start, actual_start, actual_end, recurrence_id, deadline
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            task.id,
-            task.date.as_str(),
-            task.sort_order,
-            task.title.as_str(),
-            task.category_id.as_str(),
-            task.duration_min,
-            task.fixed_start,
-            task.actual_start,
-            task.actual_end,
-            task.recurrence_id,
-            task.deadline.as_deref(),
-        ],
-    )?;
-
-    normalize_sort_order(conn, &task.date)?;
-    Ok(())
-}
-
-fn normalize_sort_order(conn: &Connection, date: &str) -> Result<()> {
-    let mut stmt =
-        conn.prepare("SELECT id FROM tasks WHERE date = ?1 ORDER BY sort_order, id ASC")?;
-    let ids = stmt
-        .query_map(params![date], |row| row.get::<_, i64>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    if ids.is_empty() {
-        return Ok(());
+    // sort_order 以降を shift
+    if task.is_backlog {
+        let to_shift: Vec<(u64, i32)> = {
+            let table = db.table("tasks")?;
+            table
+                .list()
+                .iter()
+                .map(|r| {
+                    let id = r.id;
+                    let sort = match r.get("sort_order") {
+                        Some(ybasey::schema::Value::Int(v)) => *v as i32,
+                        _ => 0,
+                    };
+                    let is_bl = match r.get("is_backlog") {
+                        Some(ybasey::schema::Value::Int(v)) => *v != 0,
+                        _ => false,
+                    };
+                    (id, sort, is_bl)
+                })
+                .filter(|(_, sort, is_bl)| *is_bl && *sort >= task.sort_order)
+                .map(|(id, sort, _)| (id, sort))
+                .collect()
+        };
+        if !to_shift.is_empty() {
+            let ops: Vec<ybasey::Op> = to_shift
+                .iter()
+                .map(|&(id, sort)| ybasey::Op::Update {
+                    id,
+                    fields: vec![("sort_order".into(), (sort + 1).to_string())],
+                })
+                .collect();
+            db.batch("tasks", ops)?;
+        }
+    } else {
+        let to_shift: Vec<(u64, i32)> = {
+            let table = db.table("tasks")?;
+            table
+                .list()
+                .iter()
+                .map(|r| {
+                    let id = r.id;
+                    let sort = match r.get("sort_order") {
+                        Some(ybasey::schema::Value::Int(v)) => *v as i32,
+                        _ => 0,
+                    };
+                    let date = match r.get("date") {
+                        Some(ybasey::schema::Value::Str(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    let is_bl = match r.get("is_backlog") {
+                        Some(ybasey::schema::Value::Int(v)) => *v != 0,
+                        _ => false,
+                    };
+                    (id, sort, date, is_bl)
+                })
+                .filter(|(_, sort, date, is_bl)| {
+                    !is_bl && date == &task.date && *sort >= task.sort_order
+                })
+                .map(|(id, sort, _, _)| (id, sort))
+                .collect()
+        };
+        if !to_shift.is_empty() {
+            let ops: Vec<ybasey::Op> = to_shift
+                .iter()
+                .map(|&(id, sort)| ybasey::Op::Update {
+                    id,
+                    fields: vec![("sort_order".into(), (sort + 1).to_string())],
+                })
+                .collect();
+            db.batch("tasks", ops)?;
+        }
     }
 
-    conn.execute(
-        "UPDATE tasks SET sort_order = sort_order + 1000000 WHERE date = ?1",
-        params![date],
-    )?;
-
-    for (idx, id) in ids.iter().enumerate() {
-        conn.execute(
-            "UPDATE tasks SET sort_order = ?1 WHERE id = ?2",
-            params![idx as i32, id],
-        )?;
+    // InsertWithId で元の id で復元
+    let mut fields = vec![
+        ("date".into(), task.date.clone()),
+        ("title".into(), task.title.clone()),
+        ("category_id".into(), task.category_id.clone()),
+        ("duration_min".into(), task.duration_min.to_string()),
+        ("status".into(), "todo".into()),
+        ("sort_order".into(), task.sort_order.to_string()),
+        ("is_backlog".into(), if task.is_backlog { "1" } else { "0" }.into()),
+    ];
+    if let Some(fs) = task.fixed_start {
+        fields.push(("fixed_start".into(), fs.to_string()));
+    }
+    if let Some(s) = task.actual_start {
+        fields.push(("actual_start".into(), s.to_string()));
+    }
+    if let Some(e) = task.actual_end {
+        fields.push(("actual_end".into(), e.to_string()));
+    }
+    if let Some(rid) = task.recurrence_id {
+        fields.push(("recurrence_id".into(), rid.to_string()));
+    }
+    if let Some(dl) = &task.deadline {
+        fields.push(("deadline".into(), dl.clone()));
     }
 
+    db.batch(
+        "tasks",
+        vec![ybasey::Op::InsertWithId {
+            id: task.id as u64,
+            record: ybasey::NewRecord::from(fields),
+        }],
+    )?;
+
+    // normalize
+    if task.is_backlog {
+        crate::db::normalize_backlog_sort_order_pub(db)?;
+    } else {
+        crate::db::normalize_sort_order_pub(db, &task.date)?;
+    }
     Ok(())
 }

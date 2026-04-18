@@ -1,7 +1,7 @@
 use anyhow::{Context, bail};
 use chrono::{Datelike, Duration, Local, Months, NaiveDate, Timelike};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use rusqlite::Connection;
+use ybasey::Database;
 
 use crate::history::{
     Command, DeleteTaskCommand, ReorderTaskCommand, ToggleActualCommand, UndoManager,
@@ -123,7 +123,7 @@ enum FormAction {
 }
 
 pub struct App {
-    conn: Connection,
+    db: Database,
     pub view_start_date: String,
     pub day_tasks: Vec<(String, Vec<Task>)>,
     pub backlog_tasks: Vec<Task>,
@@ -147,7 +147,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(conn: Connection) -> anyhow::Result<Self> {
+    pub fn new(mut db: Database) -> anyhow::Result<Self> {
         let view_days = 3usize;
         let col_cursor = view_days / 2;
         let center_date = Local::now().date_naive();
@@ -158,21 +158,21 @@ impl App {
             let date = (start + Duration::days(i as i64))
                 .format("%Y-%m-%d")
                 .to_string();
-            let tasks = crate::db::load_tasks(&conn, &date)?;
+            let tasks = crate::db::load_tasks(&mut db, &date)?;
             day_tasks.push((date, tasks));
         }
         let cursor_date = day_tasks
             .get(col_cursor)
             .map(|(date, _)| date.clone())
             .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
-        let backlog_tasks = crate::db::load_backlog_tasks(&conn)?;
-        let recurrences = crate::db::load_recurrences(&conn)?;
-        let categories = crate::db::load_categories(&conn)?;
-        let category_reports = crate::db::report_by_category(&conn, &cursor_date)?;
-        let title_reports = crate::db::report_by_title(&conn, &cursor_date)?;
+        let backlog_tasks = crate::db::load_backlog_tasks(&db)?;
+        let recurrences = crate::db::load_recurrences(&db)?;
+        let categories = crate::db::load_categories(&db)?;
+        let category_reports = crate::db::report_by_category(&db, &cursor_date)?;
+        let title_reports = crate::db::report_by_title(&db, &cursor_date)?;
 
         let mut app = Self {
-            conn,
+            db,
             view_start_date,
             day_tasks,
             backlog_tasks,
@@ -436,7 +436,7 @@ impl App {
                 let Some(recurrence) = self.recurrences.get(self.recurrence_cursor).cloned() else {
                     return;
                 };
-                if let Err(err) = crate::db::delete_recurrence(&self.conn, recurrence.id)
+                if let Err(err) = crate::db::delete_recurrence(&mut self.db, recurrence.id)
                     .and_then(|_| self.refresh_tasks())
                     .and_then(|_| self.refresh_recurrences())
                 {
@@ -515,12 +515,12 @@ impl App {
                 KeyCode::Enter => {
                     let result: anyhow::Result<()> = match choice {
                         DeleteChoice::ThisDayOnly => {
-                            crate::db::add_recurrence_exception(&self.conn, recurrence_id, &date)
-                                .and_then(|_| crate::db::delete_task(&self.conn, task_id))
+                            crate::db::add_recurrence_exception(&mut self.db, recurrence_id, &date)
+                                .and_then(|_| crate::db::delete_task(&mut self.db, task_id))
                         }
                         DeleteChoice::DeleteRule => {
-                            crate::db::delete_recurrence(&self.conn, recurrence_id)
-                                .and_then(|_| crate::db::delete_task(&self.conn, task_id))
+                            crate::db::delete_recurrence(&mut self.db, recurrence_id)
+                                .and_then(|_| crate::db::delete_task(&mut self.db, task_id))
                         }
                     }
                     .and_then(|_| self.refresh_tasks())
@@ -1005,7 +1005,7 @@ impl App {
                 .find(|r| r.id == recurrence_id)
                 .context("繰り返しルールが見つかりません")?;
             crate::db::update_recurrence(
-                &self.conn,
+                &mut self.db,
                 recurrence_id,
                 &rec.title,
                 &rec.category_id,
@@ -1018,7 +1018,7 @@ impl App {
             )?;
         } else {
             crate::db::create_recurrence_from_task(
-                &self.conn,
+                &mut self.db,
                 form.task_id,
                 pattern,
                 pattern_data.as_deref(),
@@ -1598,20 +1598,20 @@ impl App {
     }
 
     fn run_command(&mut self, command: Box<dyn Command>) -> anyhow::Result<()> {
-        self.undo_manager.execute_command(&self.conn, command)?;
+        self.undo_manager.execute_command(&mut self.db, command)?;
         self.refresh_tasks()?;
         Ok(())
     }
 
     fn undo(&mut self) -> anyhow::Result<()> {
-        if self.undo_manager.undo(&self.conn)? {
+        if self.undo_manager.undo(&mut self.db)? {
             self.refresh_tasks()?;
         }
         Ok(())
     }
 
     fn redo(&mut self) -> anyhow::Result<()> {
-        if self.undo_manager.redo(&self.conn)? {
+        if self.undo_manager.redo(&mut self.db)? {
             self.refresh_tasks()?;
         }
         Ok(())
@@ -1625,10 +1625,10 @@ impl App {
             let date = (start + Duration::days(i as i64))
                 .format("%Y-%m-%d")
                 .to_string();
-            let tasks = crate::db::load_tasks(&self.conn, &date)?;
+            let tasks = crate::db::load_tasks(&mut self.db, &date)?;
             self.day_tasks.push((date, tasks));
         }
-        self.backlog_tasks = crate::db::load_backlog_tasks(&self.conn)?;
+        self.backlog_tasks = crate::db::load_backlog_tasks(&self.db)?;
         self.refresh_recurrences()?;
         self.clamp_cursors();
         self.refresh_reports()?;
@@ -1637,7 +1637,7 @@ impl App {
     }
 
     fn refresh_recurrences(&mut self) -> anyhow::Result<()> {
-        self.recurrences = crate::db::load_recurrences(&self.conn)?;
+        self.recurrences = crate::db::load_recurrences(&self.db)?;
         self.recurrence_cursor = self
             .recurrence_cursor
             .min(self.recurrences.len().saturating_sub(1));
@@ -1651,8 +1651,8 @@ impl App {
             return Ok(());
         }
         let date = self.cursor_date().to_string();
-        self.category_reports = crate::db::report_by_category(&self.conn, &date)?;
-        self.title_reports = crate::db::report_by_title(&self.conn, &date)?;
+        self.category_reports = crate::db::report_by_category(&self.db, &date)?;
+        self.title_reports = crate::db::report_by_title(&self.db, &date)?;
         Ok(())
     }
 
@@ -1820,9 +1820,9 @@ impl AddScheduledTaskCommand {
 }
 
 impl Command for AddScheduledTaskCommand {
-    fn execute(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn execute(&mut self, db: &mut Database) -> anyhow::Result<()> {
         let id = crate::db::insert_task_with_deadline(
-            conn,
+            db,
             &self.date,
             &self.title,
             &self.category_id,
@@ -1834,15 +1834,15 @@ impl Command for AddScheduledTaskCommand {
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn undo(&mut self, db: &mut Database) -> anyhow::Result<()> {
         if let Some(id) = self.inserted_id {
-            crate::db::delete_task(conn, id)?;
+            crate::db::delete_task(db, id)?;
         }
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> anyhow::Result<()> {
-        self.execute(conn)
+    fn redo(&mut self, db: &mut Database) -> anyhow::Result<()> {
+        self.execute(db)
     }
 }
 
@@ -1880,11 +1880,11 @@ impl EditScheduledTaskCommand {
 }
 
 impl Command for EditScheduledTaskCommand {
-    fn execute(&mut self, conn: &Connection) -> anyhow::Result<()> {
-        let before = crate::db::load_task_by_id(conn, self.task_id)?
+    fn execute(&mut self, db: &mut Database) -> anyhow::Result<()> {
+        let before = crate::db::load_task_by_id(db, self.task_id)?
             .context("編集対象タスクが見つかりません")?;
         crate::db::update_task_with_deadline(
-            conn,
+            db,
             self.task_id,
             &self.title,
             &self.category_id,
@@ -1892,17 +1892,17 @@ impl Command for EditScheduledTaskCommand {
             self.fixed_start,
             self.deadline.as_deref(),
         )?;
-        let after = crate::db::load_task_by_id(conn, self.task_id)?
+        let after = crate::db::load_task_by_id(db, self.task_id)?
             .context("編集後のタスク状態を取得できませんでした")?;
         self.before = Some(before);
         self.after = Some(after);
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn undo(&mut self, db: &mut Database) -> anyhow::Result<()> {
         let before = self.before.as_ref().context("Undo対象がありません")?;
         crate::db::update_task_with_deadline(
-            conn,
+            db,
             before.id,
             &before.title,
             &before.category_id,
@@ -1913,10 +1913,10 @@ impl Command for EditScheduledTaskCommand {
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn redo(&mut self, db: &mut Database) -> anyhow::Result<()> {
         let after = self.after.as_ref().context("Redo対象がありません")?;
         crate::db::update_task_with_deadline(
-            conn,
+            db,
             after.id,
             &after.title,
             &after.category_id,
@@ -1945,10 +1945,10 @@ impl MoveToBacklogCommand {
 }
 
 impl Command for MoveToBacklogCommand {
-    fn execute(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn execute(&mut self, db: &mut Database) -> anyhow::Result<()> {
         if self.from_date.is_none() || self.from_sort.is_none() {
             let Some((date, sort_order, is_backlog)) =
-                crate::db::load_task_position(conn, self.task_id)?
+                crate::db::load_task_position(db, self.task_id)?
             else {
                 return Ok(());
             };
@@ -1959,19 +1959,19 @@ impl Command for MoveToBacklogCommand {
             self.from_sort = Some(sort_order);
         }
 
-        crate::db::set_backlog_flag(conn, self.task_id, true)?;
+        crate::db::set_backlog_flag(db, self.task_id, true)?;
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn undo(&mut self, db: &mut Database) -> anyhow::Result<()> {
         let date = self.from_date.as_deref().context("元の日付がありません")?;
         let sort = self.from_sort.context("元の順序がありません")?;
-        crate::db::restore_task_to_schedule(conn, self.task_id, date, sort)?;
+        crate::db::restore_task_to_schedule(db, self.task_id, date, sort)?;
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> anyhow::Result<()> {
-        crate::db::set_backlog_flag(conn, self.task_id, true)?;
+    fn redo(&mut self, db: &mut Database) -> anyhow::Result<()> {
+        crate::db::set_backlog_flag(db, self.task_id, true)?;
         Ok(())
     }
 }
@@ -1997,10 +1997,10 @@ impl InsertFromBacklogCommand {
 }
 
 impl Command for InsertFromBacklogCommand {
-    fn execute(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn execute(&mut self, db: &mut Database) -> anyhow::Result<()> {
         if self.source_backlog_sort.is_none() {
             let Some((_, sort_order, is_backlog)) =
-                crate::db::load_task_position(conn, self.task_id)?
+                crate::db::load_task_position(db, self.task_id)?
             else {
                 return Ok(());
             };
@@ -2011,37 +2011,37 @@ impl Command for InsertFromBacklogCommand {
         }
 
         if let Some(index) = self.target_index {
-            crate::db::insert_backlog_task_at(conn, self.task_id, &self.target_date, index)?;
+            crate::db::insert_backlog_task_at(db, self.task_id, &self.target_date, index)?;
         } else {
-            crate::db::append_backlog_task(conn, self.task_id, &self.target_date)?;
+            crate::db::append_backlog_task(db, self.task_id, &self.target_date)?;
         }
 
-        if let Some((_, sort_order, _)) = crate::db::load_task_position(conn, self.task_id)? {
+        if let Some((_, sort_order, _)) = crate::db::load_task_position(db, self.task_id)? {
             self.inserted_sort = Some(sort_order);
         }
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn undo(&mut self, db: &mut Database) -> anyhow::Result<()> {
         let sort = self
             .source_backlog_sort
             .context("元のバックログ順序がありません")?;
-        crate::db::restore_task_to_backlog(conn, self.task_id, sort)?;
+        crate::db::restore_task_to_backlog(db, self.task_id, sort)?;
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn redo(&mut self, db: &mut Database) -> anyhow::Result<()> {
         if let Some(sort) = self.inserted_sort {
             crate::db::insert_backlog_task_at(
-                conn,
+                db,
                 self.task_id,
                 &self.target_date,
                 sort as usize,
             )?;
         } else if let Some(index) = self.target_index {
-            crate::db::insert_backlog_task_at(conn, self.task_id, &self.target_date, index)?;
+            crate::db::insert_backlog_task_at(db, self.task_id, &self.target_date, index)?;
         } else {
-            crate::db::append_backlog_task(conn, self.task_id, &self.target_date)?;
+            crate::db::append_backlog_task(db, self.task_id, &self.target_date)?;
         }
         Ok(())
     }
@@ -2073,9 +2073,9 @@ impl AddBacklogCommand {
 }
 
 impl Command for AddBacklogCommand {
-    fn execute(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn execute(&mut self, db: &mut Database) -> anyhow::Result<()> {
         let id = crate::db::insert_backlog_task(
-            conn,
+            db,
             &self.title,
             &self.category_id,
             self.duration_min,
@@ -2085,15 +2085,15 @@ impl Command for AddBacklogCommand {
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn undo(&mut self, db: &mut Database) -> anyhow::Result<()> {
         if let Some(id) = self.inserted_id {
-            crate::db::delete_task(conn, id)?;
+            crate::db::delete_task(db, id)?;
         }
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> anyhow::Result<()> {
-        self.execute(conn)
+    fn redo(&mut self, db: &mut Database) -> anyhow::Result<()> {
+        self.execute(db)
     }
 }
 
@@ -2128,11 +2128,11 @@ impl UpdateBacklogCommand {
 }
 
 impl Command for UpdateBacklogCommand {
-    fn execute(&mut self, conn: &Connection) -> anyhow::Result<()> {
-        let before = crate::db::load_task_by_id(conn, self.task_id)?
+    fn execute(&mut self, db: &mut Database) -> anyhow::Result<()> {
+        let before = crate::db::load_task_by_id(db, self.task_id)?
             .context("編集対象バックログが見つかりません")?;
         crate::db::update_task_with_deadline(
-            conn,
+            db,
             self.task_id,
             &self.title,
             &self.category_id,
@@ -2140,17 +2140,17 @@ impl Command for UpdateBacklogCommand {
             None,
             self.deadline.as_deref(),
         )?;
-        let after = crate::db::load_task_by_id(conn, self.task_id)?
+        let after = crate::db::load_task_by_id(db, self.task_id)?
             .context("編集後のバックログ状態を取得できませんでした")?;
         self.before = Some(before);
         self.after = Some(after);
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn undo(&mut self, db: &mut Database) -> anyhow::Result<()> {
         let before = self.before.as_ref().context("Undo対象がありません")?;
         crate::db::update_task_with_deadline(
-            conn,
+            db,
             before.id,
             &before.title,
             &before.category_id,
@@ -2161,10 +2161,10 @@ impl Command for UpdateBacklogCommand {
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn redo(&mut self, db: &mut Database) -> anyhow::Result<()> {
         let after = self.after.as_ref().context("Redo対象がありません")?;
         crate::db::update_task_with_deadline(
-            conn,
+            db,
             after.id,
             &after.title,
             &after.category_id,
@@ -2193,9 +2193,9 @@ impl DeleteBacklogCommand {
 }
 
 impl Command for DeleteBacklogCommand {
-    fn execute(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn execute(&mut self, db: &mut Database) -> anyhow::Result<()> {
         let current_id = self.restored_id.unwrap_or(self.task_id);
-        let Some(task) = crate::db::load_task_by_id(conn, current_id)? else {
+        let Some(task) = crate::db::load_task_by_id(db, current_id)? else {
             return Ok(());
         };
         if self.backup.is_none() {
@@ -2206,16 +2206,16 @@ impl Command for DeleteBacklogCommand {
                 task.deadline.clone(),
             ));
         }
-        crate::db::delete_task(conn, current_id)?;
+        crate::db::delete_task(db, current_id)?;
         self.restored_id = None;
         Ok(())
     }
 
-    fn undo(&mut self, conn: &Connection) -> anyhow::Result<()> {
+    fn undo(&mut self, db: &mut Database) -> anyhow::Result<()> {
         let (title, category_id, duration_min, deadline) =
             self.backup.as_ref().context("Undo対象がありません")?;
         let id = crate::db::insert_backlog_task(
-            conn,
+            db,
             title,
             category_id,
             *duration_min,
@@ -2225,8 +2225,8 @@ impl Command for DeleteBacklogCommand {
         Ok(())
     }
 
-    fn redo(&mut self, conn: &Connection) -> anyhow::Result<()> {
-        self.execute(conn)
+    fn redo(&mut self, db: &mut Database) -> anyhow::Result<()> {
+        self.execute(db)
     }
 }
 

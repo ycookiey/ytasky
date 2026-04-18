@@ -1,8 +1,6 @@
 use anyhow::{Context, Result, bail};
 use chrono::Local;
 use clap::{Parser, Subcommand};
-use rusqlite::{Connection, OptionalExtension};
-
 use crate::{db, model};
 
 #[derive(Parser)]
@@ -227,11 +225,11 @@ fn print_json(value: &impl serde::Serialize) {
     println!("{}", serde_json::to_string_pretty(value).unwrap());
 }
 
-pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
+pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
     match cmd {
         Commands::List { date } => {
             let date = date.unwrap_or_else(today);
-            let tasks = db::load_tasks(conn, &date)?;
+            let tasks = db::load_tasks(db, &date)?;
             print_json(&tasks);
         }
         Commands::Add {
@@ -243,7 +241,7 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
         } => {
             let date = date.unwrap_or_else(today);
             let fixed = fixed_start.map(|s| parse_time(&s)).transpose()?;
-            let id = db::insert_task(conn, &date, &title, &category, duration, fixed)?;
+            let id = db::insert_task(db, &date, &title, &category, duration, fixed)?;
             print_json(&serde_json::json!({ "id": id, "date": date }));
         }
         Commands::Edit {
@@ -254,17 +252,7 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             fixed_start,
         } => {
             // 現在の値を取得して、指定されたフィールドだけ更新
-            let tasks = db::load_tasks(
-                conn,
-                &conn
-                    .query_row("SELECT date FROM tasks WHERE id = ?1", [id], |r| {
-                        r.get::<_, String>(0)
-                    })
-                    .context("タスクが見つからない")?,
-            )?;
-            let task = tasks
-                .iter()
-                .find(|t| t.id == id)
+            let task = db::load_task_by_id(db, id)?
                 .context("タスクが見つからない")?;
 
             let new_title = title.as_deref().unwrap_or(&task.title);
@@ -276,16 +264,16 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
                 None => task.fixed_start,
             };
 
-            db::update_task(conn, id, new_title, new_category, new_duration, new_fixed)?;
+            db::update_task(db, id, new_title, new_category, new_duration, new_fixed)?;
             print_json(&serde_json::json!({ "ok": true, "id": id }));
         }
         Commands::Delete { id } => {
-            db::delete_task(conn, id)?;
+            db::delete_task(db, id)?;
             print_json(&serde_json::json!({ "ok": true, "id": id }));
         }
         Commands::Start { id } => {
             let mins = current_minutes();
-            db::update_actual(conn, id, Some(mins), None)?;
+            db::update_actual(db, id, Some(mins), None)?;
             print_json(&serde_json::json!({
                 "ok": true,
                 "id": id,
@@ -295,15 +283,11 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
         Commands::Done { id } => {
             let mins = current_minutes();
             // actual_start が未設定なら同時に設定
-            let current_start: Option<i32> = conn
-                .query_row("SELECT actual_start FROM tasks WHERE id = ?1", [id], |r| {
-                    r.get(0)
-                })
-                .optional()
+            let current_start: Option<i32> = db::load_task_by_id(db, id)?
                 .context("タスクが見つからない")?
-                .flatten();
+                .actual_start;
             let start = current_start.unwrap_or(mins);
-            db::update_actual(conn, id, Some(start), Some(mins))?;
+            db::update_actual(db, id, Some(start), Some(mins))?;
             print_json(&serde_json::json!({
                 "ok": true,
                 "id": id,
@@ -312,13 +296,13 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             }));
         }
         Commands::Move { id, after } => {
-            db::swap_sort_order(conn, id, after)?;
+            db::swap_sort_order(db, id, after)?;
             print_json(&serde_json::json!({ "ok": true }));
         }
         Commands::Report { date } => {
             let date = date.unwrap_or_else(today);
-            let by_cat = db::report_by_category(conn, &date)?;
-            let by_title = db::report_by_title(conn, &date)?;
+            let by_cat = db::report_by_category(db, &date)?;
+            let by_title = db::report_by_title(db, &date)?;
             print_json(&serde_json::json!({
                 "date": date,
                 "by_category": by_cat,
@@ -326,11 +310,11 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             }));
         }
         Commands::Categories => {
-            let cats = db::load_categories(conn)?;
+            let cats = db::load_categories(db)?;
             print_json(&cats);
         }
         Commands::Backlog => {
-            let tasks = db::load_backlog_tasks(conn)?;
+            let tasks = db::load_backlog_tasks(db)?;
             print_json(&tasks);
         }
         Commands::AddBacklog {
@@ -340,7 +324,7 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             deadline,
         } => {
             let id =
-                db::insert_backlog_task(conn, &title, &category, duration, deadline.as_deref())?;
+                db::insert_backlog_task(db, &title, &category, duration, deadline.as_deref())?;
             print_json(&serde_json::json!({ "id": id }));
         }
         Commands::EditBacklog {
@@ -350,7 +334,7 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             duration,
             deadline,
         } => {
-            let task = db::load_task_by_id(conn, id)?.context("タスクが見つからない")?;
+            let task = db::load_task_by_id(db, id)?.context("タスクが見つからない")?;
 
             let new_title = title.as_deref().unwrap_or(&task.title);
             let new_category = category.as_deref().unwrap_or(&task.category_id);
@@ -362,7 +346,7 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             };
 
             db::update_task_with_deadline(
-                conn,
+                db,
                 id,
                 new_title,
                 new_category,
@@ -373,23 +357,23 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             print_json(&serde_json::json!({ "ok": true, "id": id }));
         }
         Commands::DeleteBacklog { id } => {
-            db::delete_task(conn, id)?;
+            db::delete_task(db, id)?;
             print_json(&serde_json::json!({ "ok": true, "id": id }));
         }
         Commands::ScheduleBacklog { id, date, position } => {
             let date = date.unwrap_or_else(today);
             match position {
-                Some(pos) => db::insert_backlog_task_at(conn, id, &date, pos)?,
-                None => db::append_backlog_task(conn, id, &date)?,
+                Some(pos) => db::insert_backlog_task_at(db, id, &date, pos)?,
+                None => db::append_backlog_task(db, id, &date)?,
             }
             print_json(&serde_json::json!({ "ok": true, "id": id, "date": date }));
         }
         Commands::ToBacklog { id } => {
-            db::set_backlog_flag(conn, id, true)?;
+            db::set_backlog_flag(db, id, true)?;
             print_json(&serde_json::json!({ "ok": true, "id": id }));
         }
         Commands::ListRecurrences => {
-            let recurrences = db::load_recurrences(conn)?;
+            let recurrences = db::load_recurrences(db)?;
             print_json(&recurrences);
         }
         Commands::AddRecurrence {
@@ -404,7 +388,7 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
         } => {
             let fixed = fixed_start.map(|s| parse_time(&s)).transpose()?;
             let id = db::insert_recurrence(
-                conn,
+                db,
                 &title,
                 &category,
                 duration,
@@ -427,7 +411,7 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             start_date,
             end_date,
         } => {
-            let recurrences = db::load_recurrences(conn)?;
+            let recurrences = db::load_recurrences(db)?;
             let current = recurrences
                 .into_iter()
                 .find(|item| item.id == id)
@@ -455,7 +439,7 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             };
 
             db::update_recurrence(
-                conn,
+                db,
                 id,
                 &new_title,
                 &new_category,
@@ -469,7 +453,7 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
             print_json(&serde_json::json!({ "ok": true, "id": id }));
         }
         Commands::DeleteRecurrence { id } => {
-            db::delete_recurrence(conn, id)?;
+            db::delete_recurrence(db, id)?;
             print_json(&serde_json::json!({ "ok": true, "id": id }));
         }
         Commands::Mcp => {

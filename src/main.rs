@@ -3,6 +3,7 @@ mod cli;
 mod db;
 mod history;
 mod init;
+#[cfg(feature = "mcp")]
 mod mcp;
 mod model;
 mod ui;
@@ -23,20 +24,34 @@ fn main() -> Result<()> {
 
     match args.command {
         None => run_tui(),
+        #[cfg(feature = "mcp")]
         Some(cli::Commands::Mcp) => run_mcp(),
+        #[cfg(not(feature = "mcp"))]
+        Some(cli::Commands::Mcp) => {
+            eprintln!("ytasky: MCP feature is not enabled. Rebuild with --features mcp.");
+            std::process::exit(1);
+        }
         Some(cli::Commands::Init { force, yes }) => init::run_init(force, yes),
         Some(cmd) => {
-            let conn = db::init()?;
-            cli::run(cmd, &conn)
+            let mut db = db::open()?;
+            cli::run(cmd, &mut db)
         }
     }
 }
 
+#[cfg(feature = "mcp")]
 #[tokio::main]
 async fn run_mcp() -> Result<()> {
     use rmcp::{ServiceExt, transport::stdio};
 
-    let conn = db::init()?;
+    let conn = {
+        use rusqlite::Connection;
+        let path = dirs::data_dir()
+            .expect("OS data dir not found")
+            .join("ytasky")
+            .join("ytasky.db");
+        Connection::open(path)?
+    };
     let server = mcp::YtaskyMcp::new(conn);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
@@ -44,8 +59,8 @@ async fn run_mcp() -> Result<()> {
 }
 
 fn run_tui() -> Result<()> {
-    let conn = db::init()?;
-    let mut app = app::App::new(conn)?;
+    let db = db::open()?;
+    let mut app = app::App::new(db)?;
 
     // Terminal setup
     enable_raw_mode()?;
