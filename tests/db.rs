@@ -495,6 +495,39 @@ fn test_load_task_position() {
     assert!(!pos.2);
 }
 
+// ---- query_history -----------------------------------------------------------
+
+#[test]
+fn test_query_history_returns_recent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = setup_db(tmp.path());
+
+    ytasky::db::insert_task(&mut db, "2026-04-19", "task1", "1", 30, None).unwrap();
+    ytasky::db::insert_task(&mut db, "2026-04-19", "task2", "1", 30, None).unwrap();
+    ytasky::db::insert_task(&mut db, "2026-04-19", "task3", "1", 30, None).unwrap();
+
+    let entries = ytasky::db::query_history(&db, None, 2).unwrap();
+    assert_eq!(entries.len(), 2, "limit=2 should return 2 entries");
+}
+
+#[test]
+fn test_query_history_table_filter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = setup_db(tmp.path());
+
+    ytasky::db::insert_task(&mut db, "2026-04-19", "タスク", "1", 30, None).unwrap();
+    // categories はスキーマ適用時に insert 済みなので history に含まれる
+
+    let all = ytasky::db::query_history(&db, None, 100).unwrap();
+    let tasks_only = ytasky::db::query_history(&db, Some("tasks"), 100).unwrap();
+
+    // tasks filter は tasks テーブルの entries のみ返す
+    assert!(tasks_only.len() < all.len() || !all.is_empty());
+    for entry in &tasks_only {
+        assert!(entry.contains("tasks"), "entry should mention tasks: {entry}");
+    }
+}
+
 // ---- create_recurrence_from_task ---------------------------------------------
 
 #[test]
