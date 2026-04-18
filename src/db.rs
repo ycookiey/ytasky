@@ -270,35 +270,21 @@ pub fn load_recurrences(db: &Database) -> Result<Vec<crate::model::Recurrence>> 
 
 /// ID 指定でタスク1件取得
 pub fn load_task_by_id(db: &Database, id: i64) -> Result<Option<crate::model::Task>> {
-    match db.table("tasks")?.get(id as u64) {
-        Ok(r) => Ok(Some(record_to_task(r))),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("NotFound") {
-                Ok(None)
-            } else {
-                Err(e.into())
-            }
-        }
-    }
+    let table = db.table("tasks")?;
+    Ok(table.list().into_iter().find(|r| r.id == id as u64).map(record_to_task))
 }
 
 /// タスクの位置情報 (date, sort_order, is_backlog) を取得
 pub fn load_task_position(db: &Database, id: i64) -> Result<Option<(String, i32, bool)>> {
-    match db.table("tasks")?.get(id as u64) {
-        Ok(r) => {
+    let table = db.table("tasks")?;
+    Ok(table
+        .list()
+        .into_iter()
+        .find(|r| r.id == id as u64)
+        .map(|r| {
             let t = record_to_task(r);
-            Ok(Some((t.date, t.sort_order, t.is_backlog)))
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") || msg.contains("NotFound") {
-                Ok(None)
-            } else {
-                Err(e.into())
-            }
-        }
-    }
+            (t.date, t.sort_order, t.is_backlog)
+        }))
 }
 
 // ---- Write 系 (task) -----------------------------------------------------------
