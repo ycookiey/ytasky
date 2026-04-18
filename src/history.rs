@@ -13,10 +13,16 @@ pub trait Command {
     fn redo(&mut self, db: &mut Database) -> Result<()>;
 }
 
-#[derive(Default)]
 pub struct UndoManager {
     undo_stack: Vec<Box<dyn Command>>,
     redo_stack: Vec<Box<dyn Command>>,
+    max_size: usize,
+}
+
+impl Default for UndoManager {
+    fn default() -> Self {
+        Self::with_max_size(100)
+    }
 }
 
 impl UndoManager {
@@ -24,8 +30,19 @@ impl UndoManager {
         Self::default()
     }
 
+    pub fn with_max_size(max_size: usize) -> Self {
+        Self {
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            max_size,
+        }
+    }
+
     pub fn execute_command(&mut self, db: &mut Database, mut command: Box<dyn Command>) -> Result<()> {
         command.execute(db)?;
+        if self.undo_stack.len() >= self.max_size {
+            self.undo_stack.remove(0);
+        }
         self.undo_stack.push(command);
         self.redo_stack.clear();
         Ok(())

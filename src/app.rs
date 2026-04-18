@@ -148,6 +148,14 @@ pub struct App {
 
 impl App {
     pub fn new(mut db: Database) -> anyhow::Result<Self> {
+        let expand_result = crate::recurrence::expand_recurrences_to_horizon(&mut db)?;
+        if expand_result.total_inserted > 0 {
+            eprintln!(
+                "ytasky: expanded {} recurrence tasks to horizon ({}ms)",
+                expand_result.total_inserted, expand_result.elapsed_ms
+            );
+        }
+
         let view_days = 3usize;
         let col_cursor = view_days / 2;
         let center_date = Local::now().date_naive();
@@ -220,6 +228,12 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('u') => {
+                if let Err(err) = self.undo() {
+                    self.status_message = Some(err.to_string());
+                }
+                return;
+            }
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Err(err) = self.undo() {
                     self.status_message = Some(err.to_string());
                 }
@@ -1016,6 +1030,13 @@ impl App {
                 &rec.start_date,
                 end_date.as_deref(),
             )?;
+            let result = crate::recurrence::replace_future_tasks(&mut self.db, recurrence_id)?;
+            if result.deleted > 0 || result.inserted > 0 {
+                self.status_message = Some(format!(
+                    "繰り返し更新: {}件削除, {}件生成",
+                    result.deleted, result.inserted
+                ));
+            }
         } else {
             crate::db::create_recurrence_from_task(
                 &mut self.db,
@@ -1606,7 +1627,14 @@ impl App {
     fn undo(&mut self) -> anyhow::Result<()> {
         if self.undo_manager.undo(&mut self.db)? {
             self.refresh_tasks()?;
+            return Ok(());
         }
+        // TODO: ybasey session undo fallback (opt-in)
+        // app 層 undo stack が空。ybasey session undo は粒度が異なるため現時点では無効。
+        // 将来的に設定で有効化する。
+        // let result = self.db.undo(UndoOptions::default())?;
+        // if result.undone_ops > 0 { self.refresh_tasks()?; }
+        self.status_message = Some("戻す操作がありません".into());
         Ok(())
     }
 

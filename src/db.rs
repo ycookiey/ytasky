@@ -67,7 +67,7 @@ fn get_opt_ref_id(r: &ybasey::engine::Record, field: &str) -> Option<i64> {
 
 // ---- Record → model struct 変換 ------------------------------------------------
 
-fn record_to_task(r: &ybasey::engine::Record) -> crate::model::Task {
+pub(crate) fn record_to_task(r: &ybasey::engine::Record) -> crate::model::Task {
     crate::model::Task {
         id: r.id as i64,
         date: get_str(r, "date"),
@@ -193,36 +193,14 @@ fn normalize_backlog_sort_order(db: &mut Database) -> Result<()> {
     Ok(())
 }
 
-// ---- recurrence pattern helpers (pure, unchanged from old db.rs) ---------------
+// ---- recurrence pattern helpers — recurrence.rs に移動済、ここでは委譲のみ --------
 
 fn matches_recurrence_pattern(
     pattern: &str,
     pattern_data: Option<&str>,
     target_date: NaiveDate,
 ) -> Result<bool> {
-    match pattern {
-        "daily" => Ok(true),
-        "weekly" => {
-            let weekday = target_date.weekday().number_from_monday() as u8;
-            let days = parse_pattern_days(pattern_data)?;
-            Ok(days.contains(&weekday))
-        }
-        "monthly" => {
-            let day = target_date.day() as u8;
-            let days = parse_pattern_days(pattern_data)?;
-            Ok(days.contains(&day))
-        }
-        _ => Ok(false),
-    }
-}
-
-fn parse_pattern_days(pattern_data: Option<&str>) -> Result<Vec<u8>> {
-    let Some(raw) = pattern_data else {
-        return Ok(Vec::new());
-    };
-    let parsed = serde_json::from_str::<crate::model::PatternData>(raw)
-        .with_context(|| format!("pattern_dataのJSONが不正です: {raw}"))?;
-    Ok(parsed.days.unwrap_or_default())
+    crate::recurrence::matches_recurrence_pattern(pattern, pattern_data, target_date)
 }
 
 // ---- データディレクトリ解決 -------------------------------------------------------

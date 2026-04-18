@@ -6,6 +6,7 @@ mod init;
 #[cfg(feature = "mcp")]
 mod mcp;
 mod model;
+mod recurrence;
 mod ui;
 
 use std::{io, time::Duration};
