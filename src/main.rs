@@ -40,22 +40,8 @@ fn main() -> Result<()> {
 }
 
 #[cfg(feature = "mcp")]
-#[tokio::main]
-async fn run_mcp() -> Result<()> {
-    use rmcp::{ServiceExt, transport::stdio};
-
-    let conn = {
-        use rusqlite::Connection;
-        let path = dirs::data_dir()
-            .expect("OS data dir not found")
-            .join("ytasky")
-            .join("ytasky.db");
-        Connection::open(path)?
-    };
-    let server = mcp::YtaskyMcp::new(conn);
-    let service = server.serve(stdio()).await?;
-    service.waiting().await?;
-    Ok(())
+fn run_mcp() -> Result<()> {
+    unreachable!("mcp.rs emits compile_error! until phase 6")
 }
 
 fn run_tui() -> Result<()> {
