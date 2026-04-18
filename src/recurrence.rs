@@ -134,35 +134,6 @@ pub fn generate_dates_for_recurrence(
     Ok(dates)
 }
 
-/// 日付列を NewRecord 列に変換 (sort_order は sort_start から連番)
-#[allow(dead_code)]
-pub fn build_task_records(
-    rec: &Recurrence,
-    dates: &[NaiveDate],
-    sort_start: i32,
-) -> Vec<NewRecord> {
-    dates
-        .iter()
-        .enumerate()
-        .map(|(i, date)| {
-            let mut fields = vec![
-                ("date".into(), date.format("%Y-%m-%d").to_string()),
-                ("title".into(), rec.title.clone()),
-                ("category_id".into(), rec.category_id.clone()),
-                ("duration_min".into(), rec.duration_min.to_string()),
-                ("status".into(), "todo".into()),
-                ("sort_order".into(), (sort_start + i as i32).to_string()),
-                ("is_backlog".into(), "0".into()),
-                ("recurrence_id".into(), rec.id.to_string()),
-            ];
-            if let Some(fs) = rec.fixed_start {
-                fields.push(("fixed_start".into(), fs.to_string()));
-            }
-            NewRecord::from(fields)
-        })
-        .collect()
-}
-
 // ---- helper: exception / existing map ----------------------------------------
 
 fn build_exception_map(db: &Database) -> Result<HashMap<i64, HashSet<String>>> {
