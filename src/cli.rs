@@ -191,6 +191,15 @@ pub enum Commands {
     },
     /// MCP サーバー起動
     Mcp,
+    /// ybasey schema を初期化
+    Init {
+        /// 既存 schema を上書き (data dir ごと再作成)
+        #[arg(long)]
+        force: bool,
+        /// 確認プロンプトを skip
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 fn today() -> String {
@@ -465,6 +474,10 @@ pub fn run(cmd: Commands, conn: &Connection) -> Result<()> {
         }
         Commands::Mcp => {
             // MCP は main.rs から直接呼ぶ
+            unreachable!();
+        }
+        Commands::Init { .. } => {
+            // Init は main.rs から直接呼ぶ (rusqlite Connection 不要)
             unreachable!();
         }
     }

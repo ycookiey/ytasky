@@ -43,6 +43,7 @@ pub struct PatternData {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct RecurrenceException {
     pub recurrence_id: i64,
     pub date: String,

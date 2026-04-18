@@ -35,6 +35,7 @@ pub enum FormTarget {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum ViewMode {
     TableView,
     TimelineView,

@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod db;
 mod history;
+mod init;
 mod mcp;
 mod model;
 mod ui;
@@ -23,6 +24,7 @@ fn main() -> Result<()> {
     match args.command {
         None => run_tui(),
         Some(cli::Commands::Mcp) => run_mcp(),
+        Some(cli::Commands::Init { force, yes }) => init::run_init(force, yes),
         Some(cmd) => {
             let conn = db::init()?;
             cli::run(cmd, &conn)

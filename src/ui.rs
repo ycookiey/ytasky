@@ -1353,7 +1353,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     .split(vertical[1])[1]
 }
 
-fn find_task_title<'a>(app: &'a App, task_id: i64) -> Option<&'a str> {
+fn find_task_title(app: &App, task_id: i64) -> Option<&str> {
     for (_, tasks) in &app.day_tasks {
         if let Some(task) = tasks.iter().find(|task| task.id == task_id) {
             return Some(task.title.as_str());

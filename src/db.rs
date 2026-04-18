@@ -321,6 +321,7 @@ pub fn insert_recurrence(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub fn add_recurrence(
     conn: &Connection,
     title: &str,
