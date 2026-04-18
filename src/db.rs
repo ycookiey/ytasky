@@ -3,12 +3,8 @@
 //! Sub-task 1: skeleton (all functions are todo!() stubs).
 //! Sub-task 2+: stubs will be replaced one by one.
 
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
-
 use anyhow::{Context, Result};
-use chrono::{Datelike, NaiveDate};
+use chrono::NaiveDate;
 use std::path::PathBuf;
 use ybasey::{Database, NewRecord, Op};
 
