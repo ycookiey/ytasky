@@ -187,6 +187,15 @@ pub enum Commands {
         /// ルールID
         id: i64,
     },
+    /// 操作履歴
+    History {
+        /// 表示件数 (default: 20)
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+        /// テーブルフィルタ
+        #[arg(short, long)]
+        table: Option<String>,
+    },
     /// MCP サーバー起動
     Mcp,
     /// ybasey schema を初期化
@@ -455,6 +464,15 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
         Commands::DeleteRecurrence { id } => {
             db::delete_recurrence(db, id)?;
             print_json(&serde_json::json!({ "ok": true, "id": id }));
+        }
+        Commands::History { limit, table } => {
+            let entries = db::query_history(db, table.as_deref(), limit)?;
+            for entry in &entries {
+                println!("{entry}");
+            }
+            if entries.is_empty() {
+                println!("(履歴なし)");
+            }
         }
         Commands::Mcp => {
             // MCP は main.rs から直接呼ぶ

@@ -909,6 +909,17 @@ pub fn generate_recurring_tasks(db: &mut Database, date: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- History 系 ----------------------------------------------------------------
+
+/// 操作履歴を取得 (ybasey query_log_tail 経由)
+pub fn query_history(
+    db: &Database,
+    table: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    db.query_log_tail(table, limit).map_err(Into::into)
+}
+
 // ---- Report 系 -----------------------------------------------------------------
 
 /// normalize_sort_order の公開 wrapper (history.rs から利用)
