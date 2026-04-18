@@ -46,6 +46,13 @@ fn run_mcp() -> Result<()> {
 }
 
 fn run_tui() -> Result<()> {
+    // panic hook: raw mode terminal を確実に復旧
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        original_hook(info);
+    }));
+
     let db = db::open()?;
     let mut app = app::App::new(db)?;
 

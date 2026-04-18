@@ -135,6 +135,7 @@ pub fn generate_dates_for_recurrence(
 }
 
 /// 日付列を NewRecord 列に変換 (sort_order は sort_start から連番)
+#[allow(dead_code)]
 pub fn build_task_records(
     rec: &Recurrence,
     dates: &[NaiveDate],
@@ -422,15 +423,67 @@ pub fn replace_future_tasks(db: &mut Database, recurrence_id: i64) -> Result<Rep
         })
         .collect();
 
-    let records = build_task_records(&rec, &filtered, 0);
-    let inserted_count = records.len();
+    // sort_order 衝突を避けるため delete 対象を除外した日付別 max sort_order を計算
+    let to_delete_set: std::collections::HashSet<u64> = to_delete.iter().copied().collect();
+    let mut date_sort_map = {
+        let table = db.table("tasks")?;
+        let mut map: HashMap<String, i32> = HashMap::new();
+        for r in table.list() {
+            if to_delete_set.contains(&r.id) {
+                continue;
+            }
+            let date = match r.get("date") {
+                Some(ybasey::schema::Value::Str(s)) => s.clone(),
+                _ => continue,
+            };
+            if matches!(r.get("is_backlog"), Some(ybasey::schema::Value::Int(v)) if *v != 0) {
+                continue;
+            }
+            let sort = match r.get("sort_order") {
+                Some(ybasey::schema::Value::Int(v)) => *v as i32,
+                _ => 0,
+            };
+            let entry = map.entry(date).or_insert(-1);
+            if sort > *entry {
+                *entry = sort;
+            }
+        }
+        for v in map.values_mut() {
+            *v += 1;
+        }
+        map
+    };
+
+    let inserted_count = filtered.len();
+    let insert_records: Vec<NewRecord> = filtered
+        .iter()
+        .map(|date| {
+            let ds = date.format("%Y-%m-%d").to_string();
+            let sort = *date_sort_map.entry(ds.clone()).or_insert(0);
+            *date_sort_map.get_mut(&ds).unwrap() += 1;
+            let mut fields = vec![
+                ("date".into(), ds),
+                ("title".into(), rec.title.clone()),
+                ("category_id".into(), rec.category_id.clone()),
+                ("duration_min".into(), rec.duration_min.to_string()),
+                ("status".into(), "todo".into()),
+                ("sort_order".into(), sort.to_string()),
+                ("is_backlog".into(), "0".into()),
+                ("recurrence_id".into(), rec.id.to_string()),
+            ];
+            if let Some(fs) = rec.fixed_start {
+                fields.push(("fixed_start".into(), fs.to_string()));
+            }
+            NewRecord::from(fields)
+        })
+        .collect();
 
     let mut ops: Vec<ybasey::Op> = to_delete
         .iter()
         .map(|&id| ybasey::Op::Delete { id })
         .collect();
     ops.extend(
-        records
+        insert_records
             .into_iter()
             .map(|r| ybasey::Op::Insert { record: r }),
     );

@@ -148,12 +148,17 @@ pub struct App {
 
 impl App {
     pub fn new(mut db: Database) -> anyhow::Result<Self> {
-        let expand_result = crate::recurrence::expand_recurrences_to_horizon(&mut db)?;
-        if expand_result.total_inserted > 0 {
-            eprintln!(
-                "ytasky: expanded {} recurrence tasks to horizon ({}ms)",
-                expand_result.total_inserted, expand_result.elapsed_ms
-            );
+        match crate::recurrence::expand_recurrences_to_horizon(&mut db) {
+            Ok(result) if result.total_inserted > 0 => {
+                eprintln!(
+                    "ytasky: expanded {} recurrence tasks to horizon ({}ms)",
+                    result.total_inserted, result.elapsed_ms
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("ytasky: warning: recurrence expansion failed: {e}");
+            }
         }
 
         let view_days = 3usize;
