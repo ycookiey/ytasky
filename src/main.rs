@@ -42,7 +42,21 @@ fn main() -> Result<()> {
 
 #[cfg(feature = "mcp")]
 fn run_mcp() -> Result<()> {
-    unreachable!("mcp.rs emits compile_error! until phase 6")
+    use rmcp::ServiceExt;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let db = db::open()?;
+        let server = mcp::YtaskyMcpServer::new(db);
+        let service = server
+            .serve(rmcp::transport::stdio())
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP serve error: {e}"))?;
+        service
+            .waiting()
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP wait error: {e}"))?;
+        Ok(())
+    })
 }
 
 fn run_tui() -> Result<()> {
