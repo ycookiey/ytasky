@@ -49,6 +49,22 @@ fn get_opt_str(r: &ybasey::engine::Record, field: &str) -> Option<String> {
     }
 }
 
+/// Ref 型 field を u64 id → String に変換。Value::Int で格納されている。
+fn get_ref_id_str(r: &ybasey::engine::Record, field: &str) -> String {
+    match r.get(field) {
+        Some(ybasey::schema::Value::Int(v)) => v.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// nullable Ref 型 field。Value::Int → Some(id), Null → None。
+fn get_opt_ref_id(r: &ybasey::engine::Record, field: &str) -> Option<i64> {
+    match r.get(field) {
+        Some(ybasey::schema::Value::Int(v)) => Some(*v),
+        _ => None,
+    }
+}
+
 // ---- Record → model struct 変換 ------------------------------------------------
 
 fn record_to_task(r: &ybasey::engine::Record) -> crate::model::Task {
@@ -57,12 +73,12 @@ fn record_to_task(r: &ybasey::engine::Record) -> crate::model::Task {
         date: get_str(r, "date"),
         sort_order: get_int(r, "sort_order") as i32,
         title: get_str(r, "title"),
-        category_id: get_str(r, "category_id"),
+        category_id: get_ref_id_str(r, "category_id"),
         duration_min: get_int(r, "duration_min") as i32,
         fixed_start: get_opt_int(r, "fixed_start").map(|v| v as i32),
         actual_start: get_opt_int(r, "actual_start").map(|v| v as i32),
         actual_end: get_opt_int(r, "actual_end").map(|v| v as i32),
-        recurrence_id: get_opt_int(r, "recurrence_id"),
+        recurrence_id: get_opt_ref_id(r, "recurrence_id"),
         is_backlog: get_int(r, "is_backlog") != 0,
         deadline: get_opt_str(r, "deadline"),
     }
@@ -81,7 +97,7 @@ fn record_to_recurrence(r: &ybasey::engine::Record) -> crate::model::Recurrence 
     crate::model::Recurrence {
         id: r.id as i64,
         title: get_str(r, "title"),
-        category_id: get_str(r, "category_id"),
+        category_id: get_ref_id_str(r, "category_id"),
         duration_min: get_int(r, "duration_min") as i32,
         fixed_start: get_opt_int(r, "fixed_start").map(|v| v as i32),
         pattern: get_str(r, "pattern"),
