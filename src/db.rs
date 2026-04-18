@@ -213,7 +213,23 @@ pub fn data_dir() -> Result<PathBuf> {
 /// ybasey Database を開く
 pub fn open() -> Result<Database> {
     let dir = data_dir()?;
+    warn_legacy_sqlite_files();
     Database::open(&dir, Some("ytasky")).map_err(Into::into)
+}
+
+fn warn_legacy_sqlite_files() {
+    if let Some(base) = dirs::data_dir() {
+        let legacy_dir = base.join("ytasky");
+        for name in ["ytasky.db", "ytasky_history.db"] {
+            let path = legacy_dir.join(name);
+            if path.exists() {
+                eprintln!(
+                    "ytasky: 旧 SQLite DB が存在します: {}. 不要であれば手動削除してください。",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 // ---- Read 系 -------------------------------------------------------------------
