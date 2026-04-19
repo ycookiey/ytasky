@@ -32,9 +32,9 @@ fn today() -> String {
 }
 
 fn current_minutes() -> i32 {
+    use chrono::Timelike;
     let now = chrono::Local::now();
-    now.format("%H").to_string().parse::<i32>().unwrap() * 60
-        + now.format("%M").to_string().parse::<i32>().unwrap()
+    now.hour() as i32 * 60 + now.minute() as i32
 }
 
 fn ok_json(value: serde_json::Value) -> Result<CallToolResult, McpError> {
