@@ -528,6 +528,163 @@ fn test_query_history_table_filter() {
     }
 }
 
+// ---- 固定タスク再配置: insert / edit / load 自動修正 -----------------------------
+
+#[test]
+fn test_insert_fixed_tasks_sorted_by_time_regardless_of_order() {
+    // 仕様: 固定タスクは登録順に関係なく fixed_start の時刻順に並ぶ
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = setup_db(tmp.path());
+
+    // 21:00(1260) を先に登録
+    ytasky::db::insert_task(&mut db, "2026-05-06", "会議", "9", 60, Some(1260)).unwrap();
+    // 後から 18:30(1110) を登録 → 会議より前に来るべき
+    ytasky::db::insert_task(&mut db, "2026-05-06", "運動", "5", 60, Some(1110)).unwrap();
+
+    let tasks = ytasky::db::load_tasks(&mut db, "2026-05-06").unwrap();
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0].title, "運動");
+    assert_eq!(tasks[1].title, "会議");
+}
+
+#[test]
+fn test_unscheduled_task_appended_to_end() {
+    // 仕様: 未定タスクは末尾に追加される (3-d)
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = setup_db(tmp.path());
+
+    ytasky::db::insert_task(&mut db, "2026-05-06", "固定", "1", 60, Some(600)).unwrap();
+    ytasky::db::insert_task(&mut db, "2026-05-06", "未定A", "1", 60, None).unwrap();
+    ytasky::db::insert_task(&mut db, "2026-05-06", "未定B", "1", 60, None).unwrap();
+
+    let tasks = ytasky::db::load_tasks(&mut db, "2026-05-06").unwrap();
+    assert_eq!(tasks[0].title, "固定");
+    assert_eq!(tasks[1].title, "未定A");
+    assert_eq!(tasks[2].title, "未定B");
+}
+
+#[test]
+fn test_fixed_task_inserted_between_existing_by_proximity() {
+    // 既存固定 9:00(540) と 18:00(1080) がある状態で 12:00(720) を追加
+    // dist_prev = 720 - (540+60) = 120, dist_next = 1080 - 720 = 360 → prev 寄り
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = setup_db(tmp.path());
+
+    ytasky::db::insert_task(&mut db, "2026-05-06", "朝", "1", 60, Some(540)).unwrap();
+    ytasky::db::insert_task(&mut db, "2026-05-06", "夕", "1", 60, Some(1080)).unwrap();
+    ytasky::db::insert_task(&mut db, "2026-05-06", "昼", "1", 60, Some(720)).unwrap();
+
+    let tasks = ytasky::db::load_tasks(&mut db, "2026-05-06").unwrap();
+    assert_eq!(tasks[0].title, "朝");
+    assert_eq!(tasks[1].title, "昼");
+    assert_eq!(tasks[2].title, "夕");
+}
+
+#[test]
+fn test_load_tasks_auto_normalizes_existing_misordered_fixed_tasks() {
+    // 既存データが時刻順で並んでいない場合、load_tasks 経由で自動修正される
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = setup_db(tmp.path());
+
+    // ybasey API で sort_order を直接書いて wrong order を作る
+    use ybasey::NewRecord;
+    let _ = db
+        .insert(
+            "tasks",
+            NewRecord::from(vec![
+                ("date".into(), "2026-05-06".into()),
+                ("title".into(), "会議".into()),
+                ("category_id".into(), "9".into()),
+                ("duration_min".into(), "60".into()),
+                ("status".into(), "todo".into()),
+                ("sort_order".into(), "0".into()),
+                ("is_backlog".into(), "0".into()),
+                ("fixed_start".into(), "1260".into()),
+            ]),
+        )
+        .unwrap();
+    let _ = db
+        .insert(
+            "tasks",
+            NewRecord::from(vec![
+                ("date".into(), "2026-05-06".into()),
+                ("title".into(), "運動".into()),
+                ("category_id".into(), "5".into()),
+                ("duration_min".into(), "60".into()),
+                ("status".into(), "todo".into()),
+                ("sort_order".into(), "1".into()),
+                ("is_backlog".into(), "0".into()),
+                ("fixed_start".into(), "1110".into()),
+            ]),
+        )
+        .unwrap();
+
+    let tasks = ytasky::db::load_tasks(&mut db, "2026-05-06").unwrap();
+    assert_eq!(tasks[0].title, "運動");
+    assert_eq!(tasks[1].title, "会議");
+}
+
+#[test]
+fn test_edit_fixed_start_relocates_task() {
+    // 4-a/5-a: edit で fixed_start を変更したら再配置
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = setup_db(tmp.path());
+
+    let a = ytasky::db::insert_task(&mut db, "2026-05-06", "A", "1", 60, Some(540)).unwrap(); // 9:00
+    let b = ytasky::db::insert_task(&mut db, "2026-05-06", "B", "1", 60, Some(720)).unwrap(); // 12:00
+    let _c = ytasky::db::insert_task(&mut db, "2026-05-06", "C", "1", 60, Some(1080)).unwrap(); // 18:00
+
+    // B を 19:00 (1140) に変更 → C(18:00) の後ろに来るべき
+    ytasky::db::update_task(&mut db, b, "B", "1", 60, Some(1140)).unwrap();
+
+    let tasks = ytasky::db::load_tasks(&mut db, "2026-05-06").unwrap();
+    assert_eq!(tasks[0].id, a);
+    assert_eq!(tasks[1].title, "C");
+    assert_eq!(tasks[2].title, "B");
+}
+
+#[test]
+fn test_edit_fixed_to_unscheduled_moves_to_end() {
+    // edit で固定 → 未定 にしたら末尾へ移動
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = setup_db(tmp.path());
+
+    let _a = ytasky::db::insert_task(&mut db, "2026-05-06", "A", "1", 60, Some(540)).unwrap();
+    let b = ytasky::db::insert_task(&mut db, "2026-05-06", "B", "1", 60, Some(720)).unwrap();
+    let _c = ytasky::db::insert_task(&mut db, "2026-05-06", "C", "1", 60, Some(1080)).unwrap();
+
+    ytasky::db::update_task(&mut db, b, "B", "1", 60, None).unwrap();
+
+    let tasks = ytasky::db::load_tasks(&mut db, "2026-05-06").unwrap();
+    assert_eq!(tasks[0].title, "A");
+    assert_eq!(tasks[1].title, "C");
+    assert_eq!(tasks[2].title, "B");
+}
+
+#[test]
+fn test_edit_fixed_same_rank_keeps_sort_order() {
+    // 8-a: time-rank が変わらないなら sort_order は変えない
+    let tmp = tempfile::tempdir().unwrap();
+    let mut db = setup_db(tmp.path());
+
+    let a = ytasky::db::insert_task(&mut db, "2026-05-06", "A", "1", 60, Some(540)).unwrap(); // 9:00
+    let b = ytasky::db::insert_task(&mut db, "2026-05-06", "B", "1", 60, Some(720)).unwrap(); // 12:00
+    let c = ytasky::db::insert_task(&mut db, "2026-05-06", "C", "1", 60, Some(1080)).unwrap(); // 18:00
+
+    let before = ytasky::db::load_task_by_id(&db, b).unwrap().unwrap();
+
+    // B を 13:00 (780) に変更 → A(9) < B < C(18) なので rank 不変
+    ytasky::db::update_task(&mut db, b, "B", "1", 60, Some(780)).unwrap();
+
+    let after = ytasky::db::load_task_by_id(&db, b).unwrap().unwrap();
+    assert_eq!(before.sort_order, after.sort_order);
+
+    let tasks = ytasky::db::load_tasks(&mut db, "2026-05-06").unwrap();
+    assert_eq!(tasks[0].id, a);
+    assert_eq!(tasks[1].id, b);
+    assert_eq!(tasks[2].id, c);
+}
+
 // ---- create_recurrence_from_task ---------------------------------------------
 
 #[test]

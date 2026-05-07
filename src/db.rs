@@ -103,19 +103,281 @@ fn record_to_recurrence(r: &ybasey::engine::Record) -> crate::model::Recurrence 
     }
 }
 
-// ---- next_sort_order helper ----------------------------------------------------
+// ---- 固定タスク再配置ヘルパー ---------------------------------------------------
 
-fn next_sort_order_for_date(db: &Database, date: &str) -> Result<i32> {
+/// 新規/移動タスクの fixed_start に応じた挿入 sort_order を計算する。
+/// exclude_id を指定するとそのタスクを除外して計算する (edit 時の自分自身)。
+///
+/// ルール:
+/// - fixed_start = None → 末尾 (3-d)
+/// - fixed_start = Some, 既存固定タスクなし → 末尾 (3-d)
+/// - fixed_start = Some, 既存固定タスクあり →
+///   時刻順に並べた既存固定タスクから直前/直後を求め、
+///   直前固定の effective_end と直後固定の fixed_start のうち、
+///   新規 fixed_start に近い方の隣に挿入。等距離は前優先 (1-a)。
+///   全既存より早い → 先頭固定の直前 (2-a)、遅い → 最終固定の直後 (3-a)。
+fn compute_insert_sort_order(
+    db: &Database,
+    date: &str,
+    fixed_start: Option<i32>,
+    exclude_id: Option<i64>,
+) -> Result<i32> {
     let table = db.table("tasks")?;
-    let max = table
+    let mut tasks: Vec<crate::model::Task> = table
+        .list()
+        .iter()
+        .map(|r| record_to_task(r))
+        .filter(|t| t.date == date && !t.is_backlog && Some(t.id) != exclude_id)
+        .collect();
+    tasks.sort_by_key(|t| t.sort_order);
+
+    let max_sort = tasks.last().map(|t| t.sort_order).unwrap_or(-1);
+
+    let Some(fs) = fixed_start else {
+        return Ok(max_sort + 1);
+    };
+
+    let mut fixed_tasks: Vec<&crate::model::Task> =
+        tasks.iter().filter(|t| t.fixed_start.is_some()).collect();
+    if fixed_tasks.is_empty() {
+        return Ok(max_sort + 1);
+    }
+    fixed_tasks.sort_by_key(|t| t.fixed_start.unwrap());
+
+    let pos = fixed_tasks
+        .iter()
+        .position(|t| t.fixed_start.unwrap() > fs)
+        .unwrap_or(fixed_tasks.len());
+
+    let prev_fixed = if pos > 0 {
+        Some(fixed_tasks[pos - 1])
+    } else {
+        None
+    };
+    let next_fixed = fixed_tasks.get(pos).copied();
+
+    let target = match (prev_fixed, next_fixed) {
+        (None, Some(n)) => n.sort_order,
+        (Some(p), None) => p.sort_order + 1,
+        (Some(p), Some(n)) => {
+            let dist_prev = fs - (p.fixed_start.unwrap() + p.duration_min);
+            let dist_next = n.fixed_start.unwrap() - fs;
+            if dist_prev <= dist_next {
+                p.sort_order + 1
+            } else {
+                n.sort_order
+            }
+        }
+        (None, None) => max_sort + 1,
+    };
+    Ok(target)
+}
+
+/// `sort_order >= threshold` のタスクを +1 シフトする。exclude_id は対象外。
+fn shift_sort_orders_at_or_after(
+    db: &mut Database,
+    date: &str,
+    threshold: i32,
+    exclude_id: Option<i64>,
+) -> Result<()> {
+    let to_shift: Vec<(u64, i32)> = {
+        let table = db.table("tasks")?;
+        table
+            .list()
+            .iter()
+            .map(|r| record_to_task(r))
+            .filter(|t| {
+                t.date == date
+                    && !t.is_backlog
+                    && t.sort_order >= threshold
+                    && Some(t.id) != exclude_id
+            })
+            .map(|t| (t.id as u64, t.sort_order))
+            .collect()
+    };
+    if to_shift.is_empty() {
+        return Ok(());
+    }
+    let ops: Vec<Op> = to_shift
+        .iter()
+        .map(|&(id, sort)| Op::Update {
+            id,
+            fields: vec![("sort_order".into(), (sort + 1).to_string())],
+        })
+        .collect();
+    db.batch("tasks", ops)?;
+    Ok(())
+}
+
+/// 同日の固定タスクが時刻順 sort_order で並んでいない場合に、固定タスクの位置だけ
+/// 時刻順に再配置する。未定タスクの sort_order スロットは保持する。
+fn normalize_fixed_tasks_by_time(db: &mut Database, date: &str) -> Result<()> {
+    let table = db.table("tasks")?;
+    let mut tasks: Vec<crate::model::Task> = table
         .list()
         .iter()
         .map(|r| record_to_task(r))
         .filter(|t| t.date == date && !t.is_backlog)
-        .map(|t| t.sort_order)
-        .max()
-        .unwrap_or(-1);
-    Ok(max + 1)
+        .collect();
+    if tasks.len() < 2 {
+        return Ok(());
+    }
+    tasks.sort_by_key(|t| t.sort_order);
+
+    // 現状 sort_order 順に並んだ固定タスク
+    let fixed_by_sort: Vec<&crate::model::Task> =
+        tasks.iter().filter(|t| t.fixed_start.is_some()).collect();
+    if fixed_by_sort.len() < 2 {
+        return Ok(());
+    }
+
+    // 時刻順
+    let mut fixed_by_time = fixed_by_sort.clone();
+    fixed_by_time.sort_by_key(|t| t.fixed_start.unwrap());
+
+    let already_ok = fixed_by_sort
+        .iter()
+        .zip(fixed_by_time.iter())
+        .all(|(a, b)| a.id == b.id);
+    if already_ok {
+        return Ok(());
+    }
+
+    // 固定タスクが入っているスロット (現状 sort_order 順での位置) を取得
+    let fixed_slots: Vec<usize> = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.fixed_start.is_some())
+        .map(|(i, _)| i)
+        .collect();
+
+    // 各スロットに時刻順の固定タスクを割り当て、各タスクの新 sort_order を構築
+    let mut slot_owner: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+    for (slot_idx, fx) in fixed_slots.iter().zip(fixed_by_time.iter()) {
+        slot_owner[*slot_idx] = fx.id;
+    }
+
+    let mut id_to_new_sort: std::collections::HashMap<i64, i32> = Default::default();
+    for (i, id) in slot_owner.iter().enumerate() {
+        id_to_new_sort.insert(*id, i as i32);
+    }
+
+    let ops: Vec<Op> = tasks
+        .iter()
+        .filter_map(|t| {
+            let new_sort = *id_to_new_sort.get(&t.id)?;
+            if new_sort != t.sort_order {
+                Some(Op::Update {
+                    id: t.id as u64,
+                    fields: vec![("sort_order".into(), new_sort.to_string())],
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !ops.is_empty() {
+        db.batch("tasks", ops)?;
+    }
+    Ok(())
+}
+
+/// 編集対象タスクを再配置する: gap fill → 新挿入位置算出 → shift。
+/// 戻り値は新しい sort_order。
+fn relocate_task_for_fixed_change(
+    db: &mut Database,
+    task_id: i64,
+    date: &str,
+    fixed_start: Option<i32>,
+) -> Result<i32> {
+    let current_sort = load_task_by_id(db, task_id)?
+        .context("relocate 対象タスクが見つかりません")?
+        .sort_order;
+
+    // gap fill: 自分以外で sort > current の人を -1
+    let to_decrement: Vec<(u64, i32)> = {
+        let table = db.table("tasks")?;
+        table
+            .list()
+            .iter()
+            .map(|r| record_to_task(r))
+            .filter(|t| {
+                t.date == date && !t.is_backlog && t.id != task_id && t.sort_order > current_sort
+            })
+            .map(|t| (t.id as u64, t.sort_order))
+            .collect()
+    };
+    if !to_decrement.is_empty() {
+        let ops: Vec<Op> = to_decrement
+            .iter()
+            .map(|&(id, s)| Op::Update {
+                id,
+                fields: vec![("sort_order".into(), (s - 1).to_string())],
+            })
+            .collect();
+        db.batch("tasks", ops)?;
+    }
+
+    // 自分を除外した状態で新挿入位置を計算
+    let new_target = compute_insert_sort_order(db, date, fixed_start, Some(task_id))?;
+    // 新位置 >= の他タスクを +1 (自分除く)
+    shift_sort_orders_at_or_after(db, date, new_target, Some(task_id))?;
+    Ok(new_target)
+}
+
+/// 同日の (id, sort_order) スナップショットを取得 (undo 用)
+pub fn snapshot_sort_orders(db: &Database, date: &str) -> Result<Vec<(i64, i32)>> {
+    let table = db.table("tasks")?;
+    let pairs: Vec<(i64, i32)> = table
+        .list()
+        .iter()
+        .map(|r| record_to_task(r))
+        .filter(|t| t.date == date && !t.is_backlog)
+        .map(|t| (t.id, t.sort_order))
+        .collect();
+    Ok(pairs)
+}
+
+/// スナップショットされた (id, sort_order) を一括反映する (undo 用)
+pub fn apply_sort_orders(db: &mut Database, pairs: &[(i64, i32)]) -> Result<()> {
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let ops: Vec<Op> = pairs
+        .iter()
+        .map(|&(id, sort)| Op::Update {
+            id: id as u64,
+            fields: vec![("sort_order".into(), sort.to_string())],
+        })
+        .collect();
+    db.batch("tasks", ops)?;
+    Ok(())
+}
+
+/// 編集前後の固定タスク time-rank が同じかどうか。両者 Some の場合のみ true 可能。
+fn fixed_position_unchanged(
+    db: &Database,
+    task_id: i64,
+    date: &str,
+    old_fs: Option<i32>,
+    new_fs: Option<i32>,
+) -> Result<bool> {
+    let (Some(old), Some(new)) = (old_fs, new_fs) else {
+        return Ok(false);
+    };
+    let table = db.table("tasks")?;
+    let other_fs: Vec<i32> = table
+        .list()
+        .iter()
+        .map(|r| record_to_task(r))
+        .filter(|t| {
+            t.date == date && !t.is_backlog && t.id != task_id && t.fixed_start.is_some()
+        })
+        .map(|t| t.fixed_start.unwrap())
+        .collect();
+    let rank_old = other_fs.iter().filter(|&&f| f < old).count();
+    let rank_new = other_fs.iter().filter(|&&f| f < new).count();
+    Ok(rank_old == rank_new)
 }
 
 fn next_sort_order_for_backlog(db: &Database) -> Result<i32> {
@@ -237,6 +499,8 @@ fn warn_legacy_sqlite_files() {
 /// 指定日のタスクを取得 (繰り返し生成も実行)
 pub fn load_tasks(db: &mut Database, date: &str) -> Result<Vec<crate::model::Task>> {
     generate_recurring_tasks(db, date)?;
+    // 既存データの自動修正: 固定タスクが時刻順 sort_order でなければ整える
+    normalize_fixed_tasks_by_time(db, date)?;
     let table = db.table("tasks")?;
     let mut tasks: Vec<crate::model::Task> = table
         .list()
@@ -327,14 +591,19 @@ pub fn insert_task_with_deadline(
     fixed_start: Option<i32>,
     deadline: Option<&str>,
 ) -> Result<i64> {
-    let sort_order = next_sort_order_for_date(db, date)?;
+    // 固定タスクが既存で時刻順に乱れている場合は先に整える
+    normalize_fixed_tasks_by_time(db, date)?;
+
+    let target_sort = compute_insert_sort_order(db, date, fixed_start, None)?;
+    shift_sort_orders_at_or_after(db, date, target_sort, None)?;
+
     let mut fields = vec![
         ("date".into(), date.into()),
         ("title".into(), title.into()),
         ("category_id".into(), category_id.into()),
         ("duration_min".into(), duration_min.to_string()),
         ("status".into(), "todo".into()),
-        ("sort_order".into(), sort_order.to_string()),
+        ("sort_order".into(), target_sort.to_string()),
         ("is_backlog".into(), "0".into()),
     ];
     if let Some(fs) = fixed_start {
@@ -344,6 +613,7 @@ pub fn insert_task_with_deadline(
         fields.push(("deadline".into(), dl.into()));
     }
     let id = db.insert("tasks", NewRecord::from(fields))?;
+    normalize_sort_order(db, date)?;
     Ok(id as i64)
 }
 
@@ -373,6 +643,57 @@ pub fn update_task(
 
 /// 期限付きタスク更新
 pub fn update_task_with_deadline(
+    db: &mut Database,
+    id: i64,
+    title: &str,
+    category_id: &str,
+    duration_min: i32,
+    fixed_start: Option<i32>,
+    deadline: Option<&str>,
+) -> Result<()> {
+    let before = load_task_by_id(db, id)?
+        .context("編集対象タスクが見つかりません")?;
+    let date = before.date.clone();
+    let fixed_changed = before.fixed_start != fixed_start;
+
+    let mut fields = vec![
+        ("title".into(), title.into()),
+        ("category_id".into(), category_id.into()),
+        ("duration_min".into(), duration_min.to_string()),
+    ];
+    match fixed_start {
+        Some(fs) => fields.push(("fixed_start".into(), fs.to_string())),
+        None => fields.push(("fixed_start".into(), "_".into())),
+    }
+    match deadline {
+        Some(dl) => fields.push(("deadline".into(), dl.into())),
+        None => fields.push(("deadline".into(), "_".into())),
+    }
+
+    let mut should_relocate = false;
+    if fixed_changed && !before.is_backlog {
+        // 8-a: 固定タスク同士で time-rank が同じなら sort_order を変えない
+        let unchanged =
+            fixed_position_unchanged(db, id, &date, before.fixed_start, fixed_start)?;
+        if !unchanged {
+            should_relocate = true;
+        }
+    }
+
+    if should_relocate {
+        let new_sort = relocate_task_for_fixed_change(db, id, &date, fixed_start)?;
+        fields.push(("sort_order".into(), new_sort.to_string()));
+    }
+
+    db.update("tasks", id as u64, fields)?;
+    if should_relocate {
+        normalize_sort_order(db, &date)?;
+    }
+    Ok(())
+}
+
+/// undo/redo 用: フィールド書き換えのみ。再配置は一切行わない。
+pub fn update_task_fields_only(
     db: &mut Database,
     id: i64,
     title: &str,
@@ -849,9 +1170,6 @@ pub fn generate_recurring_tasks(db: &mut Database, date: &str) -> Result<()> {
         return Ok(());
     }
 
-    let next_sort = next_sort_order_for_date(db, date)?;
-    let mut current_sort = next_sort;
-
     for rec in recurrences {
         if !matches_recurrence_pattern(&rec.pattern, rec.pattern_data.as_deref(), target_date)? {
             continue;
@@ -886,14 +1204,17 @@ pub fn generate_recurring_tasks(db: &mut Database, date: &str) -> Result<()> {
             continue;
         }
 
-        // insert
+        // 固定タスクの並びを保つため毎回 compute → shift → insert を通す
+        let target_sort = compute_insert_sort_order(db, date, rec.fixed_start, None)?;
+        shift_sort_orders_at_or_after(db, date, target_sort, None)?;
+
         let mut fields = vec![
             ("date".into(), date.into()),
             ("title".into(), rec.title.clone()),
             ("category_id".into(), rec.category_id.clone()),
             ("duration_min".into(), rec.duration_min.to_string()),
             ("status".into(), "todo".into()),
-            ("sort_order".into(), current_sort.to_string()),
+            ("sort_order".into(), target_sort.to_string()),
             ("is_backlog".into(), "0".into()),
             ("recurrence_id".into(), rec.id.to_string()),
         ];
@@ -901,7 +1222,7 @@ pub fn generate_recurring_tasks(db: &mut Database, date: &str) -> Result<()> {
             fields.push(("fixed_start".into(), fs.to_string()));
         }
         db.insert("tasks", NewRecord::from(fields))?;
-        current_sort += 1;
+        normalize_sort_order(db, date)?;
     }
 
     Ok(())

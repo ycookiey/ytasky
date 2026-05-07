@@ -147,6 +147,10 @@ pub struct EditTaskCommand {
     fixed_start: Option<i32>,
     before: Option<Task>,
     after: Option<Task>,
+    before_sort_orders: Vec<(i64, i32)>,
+    after_sort_orders: Vec<(i64, i32)>,
+    before_deadline: Option<String>,
+    after_deadline: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -166,6 +170,10 @@ impl EditTaskCommand {
             fixed_start,
             before: None,
             after: None,
+            before_sort_orders: Vec::new(),
+            after_sort_orders: Vec::new(),
+            before_deadline: None,
+            after_deadline: None,
         }
     }
 }
@@ -174,6 +182,10 @@ impl Command for EditTaskCommand {
     fn execute(&mut self, db: &mut Database) -> Result<()> {
         let before =
             crate::db::load_task_by_id(db, self.task_id)?.context("編集対象タスクが見つかりません")?;
+        let date = before.date.clone();
+        self.before_deadline = before.deadline.clone();
+        self.before_sort_orders = crate::db::snapshot_sort_orders(db, &date)?;
+
         crate::db::update_task(
             db,
             self.task_id,
@@ -182,8 +194,11 @@ impl Command for EditTaskCommand {
             self.duration_min,
             self.fixed_start,
         )?;
+
         let after = crate::db::load_task_by_id(db, self.task_id)?
             .context("編集後のタスク状態を取得できませんでした")?;
+        self.after_deadline = after.deadline.clone();
+        self.after_sort_orders = crate::db::snapshot_sort_orders(db, &date)?;
         self.before = Some(before);
         self.after = Some(after);
         Ok(())
@@ -194,14 +209,16 @@ impl Command for EditTaskCommand {
             .before
             .as_ref()
             .context("Undo対象の編集前状態がありません")?;
-        crate::db::update_task(
+        crate::db::update_task_fields_only(
             db,
             before.id,
             &before.title,
             &before.category_id,
             before.duration_min,
             before.fixed_start,
+            self.before_deadline.as_deref(),
         )?;
+        crate::db::apply_sort_orders(db, &self.before_sort_orders)?;
         Ok(())
     }
 
@@ -210,14 +227,16 @@ impl Command for EditTaskCommand {
             .after
             .as_ref()
             .context("Redo対象の編集後状態がありません")?;
-        crate::db::update_task(
+        crate::db::update_task_fields_only(
             db,
             after.id,
             &after.title,
             &after.category_id,
             after.duration_min,
             after.fixed_start,
+            self.after_deadline.as_deref(),
         )?;
+        crate::db::apply_sort_orders(db, &self.after_sort_orders)?;
         Ok(())
     }
 }
