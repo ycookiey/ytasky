@@ -59,3 +59,29 @@ provide tool: `list_tasks` / `add_task` / `edit_task` / `delete_task` / `start_t
 - Windows: `%APPDATA%\ytasky\data`
 - Linux/macOS: `~/.config/ytasky/data`
 - `YTASKY_DATA_DIR` 環境変数で上書き可
+
+## Google Calendar 連携 (gcal feature)
+
+`ytasky import-gcal` / `gcal-login` / TUI 上の `Shift+G` で Google Calendar の
+イベントを取り込める (`--features gcal` でビルド、default features に含まれる)。
+
+### Credential
+
+OAuth client は `~/.config/ytasky/gcal.json` で上書き可能。`gcal.json` の
+`auth_uri` / `token_uri` は **Google 公式エンドポイント** (`https://accounts.google.com/`,
+`https://oauth2.googleapis.com/`) で始まる必要があり、それ以外は拒否される
+(悪意ある設定ファイルによる token 漏洩を防ぐため)。
+
+### Token 保管とセキュリティ
+
+`~/.config/ytasky/gcal_token.json` に access_token / refresh_token を保存する。
+
+- **Unix**: ファイル権限 `0600` を自動設定 (所有者のみ読書き可)
+- **Windows**: OS のユーザープロファイル ACL に依存する。**共有 PC や別ユーザー
+  からアクセス可能な環境では、token が同マシン上の他ユーザー / 管理者 /
+  マルウェアから平文で読み取られるリスクがある**。重要な運用では
+  `icacls` でアクセスを当該ユーザーのみに絞るか、専用マシンでのみ使うこと
+
+### スコープ
+
+`https://www.googleapis.com/auth/calendar.readonly` のみ要求する (読取専用)。

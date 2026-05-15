@@ -247,7 +247,11 @@ impl App {
                         ),
                         Err(e) => format!("GCal auto-sync エラー: {e}"),
                     });
-                    // メインスレッドの DB 表示を最新化
+                    // 別スレッドが書き込んだ consolidated log を読み直して
+                    // メインスレッドの in-memory 状態を最新化する
+                    if let Err(e) = self.db.refresh() {
+                        eprintln!("ytasky: db refresh after gcal sync failed: {e}");
+                    }
                     let _ = self.refresh_tasks();
                     let _ = self.refresh_recurrences();
                     self.gcal_sync_rx = None;
@@ -676,10 +680,7 @@ impl App {
                     self.status_message = None;
                 }
                 KeyCode::Enter => {
-                    self.status_message = Some("Importing from Google Calendar...".to_string());
-                    if let Err(err) = self.run_gcal_import() {
-                        self.status_message = Some(format!("GCal import エラー: {err}"));
-                    }
+                    self.kick_gcal_import_background(30);
                 }
                 _ => self.input_mode = InputMode::GcalConfirm,
             },
@@ -687,21 +688,34 @@ impl App {
         }
     }
 
+    /// TUI から手動で発火する GCal import を別スレッドで起動する。
+    /// メインスレッドは status_message に "Importing..." を出し、HTTP の
+    /// 完了は `poll_background_sync` 経由でトーストとして拾う。
     #[cfg(feature = "gcal")]
-    fn run_gcal_import(&mut self) -> anyhow::Result<()> {
-        use chrono::NaiveDate;
-        let today: NaiveDate = chrono::Local::now().date_naive();
-        let to = today + chrono::Duration::days(30);
-        let opts = crate::gcal::import::ImportOptions::default();
-        let summary = crate::gcal::import::import_range(&mut self.db, today, to, &opts)?;
-        self.refresh_tasks()?;
-        self.refresh_recurrences()?;
-        let msg = format!(
-            "GCal: {} created / {} updated / {} skipped",
-            summary.created, summary.updated, summary.skipped
-        );
-        self.status_message = Some(msg);
-        Ok(())
+    fn kick_gcal_import_background(&mut self, days: u32) {
+        if self.gcal_sync_rx.is_some() {
+            self.status_message =
+                Some("GCal 同期が既に進行中です。完了までお待ちください。".to_string());
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("ytasky-gcal-manual-sync".into())
+            .spawn(move || {
+                let result = run_lazy_sync(days);
+                let _ = tx.send(GcalSyncMessage { result });
+            });
+        match spawn {
+            Ok(_) => {
+                self.gcal_sync_rx = Some(rx);
+                self.status_message =
+                    Some("Importing from Google Calendar...".to_string());
+            }
+            Err(e) => {
+                self.status_message =
+                    Some(format!("GCal import スレッド起動失敗: {e}"));
+            }
+        }
     }
 
     fn handle_task_form_key(&mut self, key: KeyEvent, form: &mut TaskFormState) -> FormAction {

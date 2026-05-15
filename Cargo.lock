@@ -3020,6 +3020,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "fs2",
+ "percent-encoding",
  "rand",
  "ratatui",
  "reqwest",

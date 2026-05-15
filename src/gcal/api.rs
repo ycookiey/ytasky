@@ -57,10 +57,13 @@ pub fn list_events(
         let status = resp.status();
         let body = resp.text().context("events.list レスポンス読込失敗")?;
         if !status.is_success() {
-            bail!("events.list エラー {status}: {body}");
+            bail!(
+                "events.list エラー {status}: {}",
+                truncate_for_log(&body, 200)
+            );
         }
         let parsed: EventList = serde_json::from_str(&body)
-            .with_context(|| format!("events.list レスポンス JSON 解析失敗: {body}"))?;
+            .with_context(|| format!("events.list レスポンス JSON 解析失敗 (status={status})"))?;
         all.extend(parsed.items);
         match parsed.next_page_token {
             Some(t) if !t.is_empty() => page_token = Some(t),
@@ -103,10 +106,13 @@ pub fn list_event_instances(
         let status = resp.status();
         let body = resp.text().context("events.instances レスポンス読込失敗")?;
         if !status.is_success() {
-            bail!("events.instances エラー {status}: {body}");
+            bail!(
+                "events.instances エラー {status}: {}",
+                truncate_for_log(&body, 200)
+            );
         }
         let parsed: EventList = serde_json::from_str(&body)
-            .with_context(|| format!("events.instances JSON 解析失敗: {body}"))?;
+            .with_context(|| format!("events.instances JSON 解析失敗 (status={status})"))?;
         all.extend(parsed.items);
         match parsed.next_page_token {
             Some(t) if !t.is_empty() => page_token = Some(t),
@@ -128,15 +134,30 @@ pub fn list_calendars(access_token: &str) -> Result<CalendarList> {
     let status = resp.status();
     let body = resp.text().context("calendarList.list レスポンス読込失敗")?;
     if !status.is_success() {
-        bail!("calendarList.list エラー {status}: {body}");
+        bail!(
+            "calendarList.list エラー {status}: {}",
+            truncate_for_log(&body, 200)
+        );
     }
     serde_json::from_str::<CalendarList>(&body)
-        .with_context(|| format!("calendarList.list JSON 解析失敗: {body}"))
+        .with_context(|| format!("calendarList.list JSON 解析失敗 (status={status})"))
 }
 
-/// path segment 用の url encoding (calendar_id に '@' などが含まれるため)。
+/// 長大なレスポンス本文をエラーメッセージに乗せる際の安全な truncate。
+fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}... ({} 文字省略)", s.chars().count() - max)
+}
+
+/// path segment 用の percent encoding。
+/// `form_urlencoded::byte_serialize` は application/x-www-form-urlencoded 用で
+/// スペースを `+` にエンコードしてしまい、URL path には不適切。
+/// `NON_ALPHANUMERIC` で `@`, `/`, space, `%` などすべてを `%XX` 化する。
 fn urlencoding(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 // ---- テスト -------------------------------------------------------------------
@@ -152,6 +173,18 @@ mod tests {
 
     #[test]
     fn urlencoding_escapes_at() {
-        assert_eq!(urlencoding("work@example.com"), "work%40example.com");
+        // NON_ALPHANUMERIC は '.' も escape する
+        assert_eq!(urlencoding("work@example.com"), "work%40example%2Ecom");
+    }
+
+    #[test]
+    fn urlencoding_escapes_space_as_percent_20_not_plus() {
+        // form_urlencoded は ' ' を '+' にしてしまうが、path には不適
+        assert_eq!(urlencoding("a b"), "a%20b");
+    }
+
+    #[test]
+    fn urlencoding_escapes_slash() {
+        assert_eq!(urlencoding("a/b"), "a%2Fb");
     }
 }

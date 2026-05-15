@@ -155,6 +155,7 @@ fn load_credential() -> Result<Credential> {
             .unwrap_or(value);
         let cred: Credential = serde_json::from_value(inner)
             .with_context(|| format!("credential JSON が不正: {}", path.display()))?;
+        validate_oauth_endpoints(&cred)?;
         return Ok(cred);
     }
     if let (Some(id), Some(secret)) = (BUNDLED_CLIENT_ID, BUNDLED_CLIENT_SECRET) {
@@ -176,6 +177,44 @@ fn load_credential() -> Result<Credential> {
     )
 }
 
+/// 悪意ある gcal.json で `auth_uri` / `token_uri` を攻撃者管理 URL に
+/// 差し替えられると `code` / `code_verifier` / `client_secret` が漏洩する。
+/// Google 公式エンドポイントの prefix にマッチすることを必須にする。
+fn validate_oauth_endpoints(cred: &Credential) -> Result<()> {
+    const ALLOWED_AUTH_PREFIXES: &[&str] = &[
+        "https://accounts.google.com/",
+    ];
+    const ALLOWED_TOKEN_PREFIXES: &[&str] = &[
+        "https://oauth2.googleapis.com/",
+        "https://accounts.google.com/",
+    ];
+    if !ALLOWED_AUTH_PREFIXES
+        .iter()
+        .any(|p| cred.auth_uri.starts_with(p))
+    {
+        bail!(
+            "credential.auth_uri が許可された prefix に一致しません: {}",
+            cred.auth_uri
+        );
+    }
+    if !ALLOWED_TOKEN_PREFIXES
+        .iter()
+        .any(|p| cred.token_uri.starts_with(p))
+    {
+        bail!(
+            "credential.token_uri が許可された prefix に一致しません: {}",
+            cred.token_uri
+        );
+    }
+    Ok(())
+}
+
+/// token を `~/.config/ytasky/gcal_token.json` に保存する。
+///
+/// セキュリティ:
+/// - **Unix**: `chmod 600` で所有者のみアクセス可
+/// - **Windows**: ユーザープロファイル配下の ACL に依存。共有環境では別ユーザーが
+///   読み取れるリスクが残る。詳細は README の Google Calendar 連携節を参照。
 fn save_token(token: &Token) -> Result<()> {
     let path = token_path()?;
     if let Some(parent) = path.parent() {
@@ -187,7 +226,12 @@ fn save_token(token: &Token) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(&path, perms);
+        if let Err(e) = std::fs::set_permissions(&path, perms) {
+            eprintln!(
+                "ytasky: warning: token ファイルの権限設定に失敗: {} ({e})",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -339,10 +383,18 @@ fn post_token(token_uri: &str, params: &[(&str, &str)]) -> Result<Token> {
     let status = resp.status();
     let body = resp.text()?;
     if !status.is_success() {
-        bail!("token endpoint エラー {status}: {body}");
+        // エラーレスポンス body は Google のエラー JSON で token は含まれないが
+        // 念のため先頭 200 文字に truncate して長大な漏洩を防ぐ
+        bail!(
+            "token endpoint エラー {status}: {}",
+            truncate_for_log(&body, 200)
+        );
     }
+    // 200 OK の body には access_token / refresh_token が平文で含まれる。
+    // パース失敗時に body を anyhow にそのまま乗せると token が伝搬するため
+    // status のみを残す。
     let parsed: TokenResponse = serde_json::from_str(&body)
-        .with_context(|| format!("token JSON 解析失敗: {body}"))?;
+        .with_context(|| format!("token JSON 解析失敗 (status={status})"))?;
     let expires_at = chrono::Utc::now().timestamp() + parsed.expires_in;
     Ok(Token {
         access_token: parsed.access_token,
@@ -350,6 +402,15 @@ fn post_token(token_uri: &str, params: &[(&str, &str)]) -> Result<Token> {
         expires_at,
         scope: parsed.scope.unwrap_or_else(|| SCOPE.to_string()),
     })
+}
+
+/// 長大なレスポンス本文をエラーメッセージに乗せる際の安全な truncate。
+fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}... ({} 文字省略)", s.chars().count() - max)
 }
 
 // ---- ロック -------------------------------------------------------------------
@@ -463,6 +524,41 @@ mod tests {
         assert!(t.is_expired(1000));
         // 31 秒以上前ならまだ有効
         assert!(!t.is_expired(969));
+    }
+
+    #[test]
+    fn validate_oauth_endpoints_accepts_google() {
+        let cred = Credential {
+            client_id: "x".into(),
+            client_secret: "y".into(),
+            auth_uri: AUTH_URI_DEFAULT.into(),
+            token_uri: TOKEN_URI_DEFAULT.into(),
+        };
+        validate_oauth_endpoints(&cred).unwrap();
+    }
+
+    #[test]
+    fn validate_oauth_endpoints_rejects_evil_auth_uri() {
+        let cred = Credential {
+            client_id: "x".into(),
+            client_secret: "y".into(),
+            auth_uri: "https://evil.example.com/auth".into(),
+            token_uri: TOKEN_URI_DEFAULT.into(),
+        };
+        let err = validate_oauth_endpoints(&cred).unwrap_err();
+        assert!(err.to_string().contains("auth_uri"));
+    }
+
+    #[test]
+    fn validate_oauth_endpoints_rejects_evil_token_uri() {
+        let cred = Credential {
+            client_id: "x".into(),
+            client_secret: "y".into(),
+            auth_uri: AUTH_URI_DEFAULT.into(),
+            token_uri: "https://evil.example.com/token".into(),
+        };
+        let err = validate_oauth_endpoints(&cred).unwrap_err();
+        assert!(err.to_string().contains("token_uri"));
     }
 
     #[test]
