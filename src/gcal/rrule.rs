@@ -9,6 +9,13 @@ use chrono::{Duration, NaiveDate};
 
 use crate::model::PatternData;
 
+/// EXDATE / RDATE のリスト長上限。これを超える RRULE は敵対カレンダー
+/// 起因の DoS とみなして Invalid を返す。
+const MAX_EXDATE_RDATE_ITEMS: usize = 1000;
+/// COUNT の上限。RFC 5545 上は無制限だが、ytasky の現実的な範囲では
+/// 10000 を超える繰り返しは想定外として弾く。
+const MAX_COUNT: u32 = 10_000;
+
 #[derive(Debug)]
 pub enum RruleError {
     /// ytasky の recurrence で表現不能。呼び出し側は個別 instance 展開へ。
@@ -63,10 +70,20 @@ pub fn parse_recurrence_rules(
         } else if let Some(body) = line.strip_prefix("EXDATE") {
             for d in parse_date_list_after_colon(body)? {
                 exdates.push(d);
+                if exdates.len() > MAX_EXDATE_RDATE_ITEMS {
+                    return Err(RruleError::Invalid(format!(
+                        "EXDATE が {MAX_EXDATE_RDATE_ITEMS} 件を超える"
+                    )));
+                }
             }
         } else if let Some(body) = line.strip_prefix("RDATE") {
             for d in parse_date_list_after_colon(body)? {
                 rdates.push(d);
+                if rdates.len() > MAX_EXDATE_RDATE_ITEMS {
+                    return Err(RruleError::Invalid(format!(
+                        "RDATE が {MAX_EXDATE_RDATE_ITEMS} 件を超える"
+                    )));
+                }
             }
         }
     }
@@ -83,17 +100,32 @@ pub fn parse_recurrence_rules(
         .get("FREQ")
         .ok_or_else(|| RruleError::Invalid("FREQ が無い".into()))?
         .as_str();
-    let interval: Option<u8> = parts
+    let interval_raw: Option<u8> = parts
         .get("INTERVAL")
         .map(|v| v.parse::<u8>())
         .transpose()
-        .map_err(|_| RruleError::Invalid("INTERVAL は数値".into()))?
-        .filter(|n| *n != 1);
+        .map_err(|_| RruleError::Invalid("INTERVAL は数値".into()))?;
+    // INTERVAL=0 は RFC 5545 違反。サイレントに 1 と解釈せず明示的に弾く
+    if interval_raw == Some(0) {
+        return Err(RruleError::Invalid("INTERVAL=0 は不正".into()));
+    }
+    // pattern_data 上では interval=1 を None として持つ (DB に書かない)
+    let interval: Option<u8> = interval_raw.filter(|n| *n != 1);
     let count: Option<u32> = parts
         .get("COUNT")
         .map(|v| v.parse::<u32>())
         .transpose()
         .map_err(|_| RruleError::Invalid("COUNT は数値".into()))?;
+    if let Some(c) = count {
+        if c == 0 {
+            return Err(RruleError::Invalid("COUNT=0 は不正".into()));
+        }
+        if c > MAX_COUNT {
+            return Err(RruleError::Invalid(format!(
+                "COUNT={c} は上限 {MAX_COUNT} を超える"
+            )));
+        }
+    }
     let until_date: Option<NaiveDate> = parts
         .get("UNTIL")
         .map(|v| parse_until_value(v))
@@ -557,5 +589,47 @@ mod tests {
     fn invalid_missing_freq() {
         let err = parse(&["RRULE:INTERVAL=2"], d(2026, 5, 16)).unwrap_err();
         assert!(matches!(err, RruleError::Invalid(_)));
+    }
+
+    #[test]
+    fn invalid_interval_zero() {
+        let err = parse(&["RRULE:FREQ=DAILY;INTERVAL=0"], d(2026, 5, 16)).unwrap_err();
+        assert!(matches!(err, RruleError::Invalid(_)));
+    }
+
+    #[test]
+    fn invalid_count_zero() {
+        let err = parse(&["RRULE:FREQ=DAILY;COUNT=0"], d(2026, 5, 16)).unwrap_err();
+        assert!(matches!(err, RruleError::Invalid(_)));
+    }
+
+    #[test]
+    fn invalid_count_above_max() {
+        let err = parse(&["RRULE:FREQ=DAILY;COUNT=99999"], d(2026, 5, 16)).unwrap_err();
+        match err {
+            RruleError::Invalid(msg) => assert!(msg.contains("COUNT")),
+            _ => panic!("expected Invalid"),
+        }
+    }
+
+    #[test]
+    fn invalid_exdate_over_limit() {
+        // 1001 個の EXDATE をカンマ区切りで作る
+        let dates: Vec<String> = (1..=1001)
+            .map(|i| format!("2026{:02}{:02}", (i / 28) + 1, (i % 28) + 1))
+            .collect();
+        let exdate_line = format!("EXDATE:{}", dates.join(","));
+        let err = parse(
+            &["RRULE:FREQ=DAILY", exdate_line.as_str()],
+            d(2026, 5, 16),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RruleError::Invalid(_)));
+    }
+
+    #[test]
+    fn interval_1_normalized_to_none() {
+        let r = parse(&["RRULE:FREQ=DAILY;INTERVAL=1"], d(2026, 5, 16)).unwrap();
+        assert_eq!(r.pattern_data.interval, None);
     }
 }
