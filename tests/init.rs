@@ -100,6 +100,75 @@ fn test_init_force_reinitializes() {
     assert!(result.contains("count=9"), "expected count=9 after reinit, got: {result}");
 }
 
+/// ケース5: migrate_schema は apply_schema 済み DB に対して冪等
+#[test]
+fn test_migrate_schema_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+
+    let mut db = setup_db(&data_dir);
+    ytasky::init::apply_schema(&mut db).unwrap();
+
+    // external_id は apply_schema で既に作られているため、migrate は no-op
+    ytasky::init::migrate_schema(&mut db).expect("first migrate should succeed");
+    ytasky::init::migrate_schema(&mut db).expect("second migrate should also succeed");
+
+    assert!(
+        db.table("tasks").unwrap().schema.has_field("external_id"),
+        "tasks.external_id missing"
+    );
+    assert!(
+        db.table("recurrences")
+            .unwrap()
+            .schema
+            .has_field("external_id"),
+        "recurrences.external_id missing"
+    );
+}
+
+/// ケース6: external_id を含むタスクの upsert (insert/update) が機能する
+#[test]
+fn test_external_id_upsert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().to_path_buf();
+
+    let mut db = setup_db(&data_dir);
+    ytasky::init::apply_schema(&mut db).unwrap();
+
+    let ext = "gcal:primary:abc123";
+    let fields_v1 = vec![
+        ("date".to_string(), "2026-05-16".to_string()),
+        ("title".to_string(), "Meeting".to_string()),
+        ("category_id".to_string(), "3".to_string()),
+        ("duration_min".to_string(), "30".to_string()),
+        ("status".to_string(), "todo".to_string()),
+        ("sort_order".to_string(), "0".to_string()),
+        ("is_backlog".to_string(), "0".to_string()),
+        ("external_id".to_string(), ext.to_string()),
+    ];
+    let (id1, inserted1) = db.upsert("tasks", "external_id", ext, fields_v1).unwrap();
+    assert!(inserted1, "first upsert should insert");
+
+    // 同じ external_id で再 upsert → update 扱い、id 不変
+    let fields_v2 = vec![
+        ("date".to_string(), "2026-05-16".to_string()),
+        ("title".to_string(), "Meeting (updated)".to_string()),
+        ("category_id".to_string(), "3".to_string()),
+        ("duration_min".to_string(), "45".to_string()),
+        ("status".to_string(), "todo".to_string()),
+        ("sort_order".to_string(), "0".to_string()),
+        ("is_backlog".to_string(), "0".to_string()),
+        ("external_id".to_string(), ext.to_string()),
+    ];
+    let (id2, inserted2) = db.upsert("tasks", "external_id", ext, fields_v2).unwrap();
+    assert!(!inserted2, "second upsert should update, not insert");
+    assert_eq!(id1, id2, "upsert by external_id must keep id stable");
+
+    // 件数は1
+    let result = db.query("tasks", "| count").unwrap();
+    assert!(result.contains("count=1"), "expected count=1, got: {result}");
+}
+
 /// ケース4: sample record CRUD + view file 生成確認
 #[test]
 fn test_init_insert_and_view() {

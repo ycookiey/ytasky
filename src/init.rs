@@ -97,6 +97,7 @@ pub fn apply_schema(db: &mut ybasey::Database) -> Result<()> {
     db.add_field("recurrences", "pattern_data", "str", true)?;
     db.add_field("recurrences", "start_date", "date", false)?;
     db.add_field("recurrences", "end_date", "date", true)?;
+    db.add_field("recurrences", "external_id", "str", true)?;
 
     // ---- recurrence_exceptions ----
     db.create_table("recurrence_exceptions")?;
@@ -134,6 +135,7 @@ pub fn apply_schema(db: &mut ybasey::Database) -> Result<()> {
     db.add_field("tasks", "note", "str", true)?;
     db.add_field("tasks", "is_backlog", "int", false)?;
     db.add_field("tasks", "deadline", "str", true)?;
+    db.add_field("tasks", "external_id", "str", true)?;
 
     // ---- views ----
     apply_views(db)?;
@@ -192,6 +194,28 @@ fn apply_views(db: &mut ybasey::Database) -> Result<()> {
         r#"status == "todo" sort by date asc, sort_order asc"#,
     )?;
 
+    Ok(())
+}
+
+/// 既存 DB に対して差分スキーマを適用する。
+/// 新規 init では `apply_schema` が全部入れるため、ここは「既存ユーザー向けの追加分」を冪等に処理する。
+pub fn migrate_schema(db: &mut ybasey::Database) -> Result<()> {
+    add_field_if_absent(db, "tasks", "external_id", "str", true)?;
+    add_field_if_absent(db, "recurrences", "external_id", "str", true)?;
+    Ok(())
+}
+
+fn add_field_if_absent(
+    db: &mut ybasey::Database,
+    table: &str,
+    name: &str,
+    type_spec: &str,
+    nullable: bool,
+) -> Result<()> {
+    if db.table(table)?.schema.has_field(name) {
+        return Ok(());
+    }
+    db.add_field(table, name, type_spec, nullable)?;
     Ok(())
 }
 

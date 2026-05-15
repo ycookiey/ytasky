@@ -77,6 +77,7 @@ pub(crate) fn record_to_task(r: &ybasey::engine::Record) -> crate::model::Task {
         recurrence_id: get_opt_ref_id(r, "recurrence_id"),
         is_backlog: get_int(r, "is_backlog") != 0,
         deadline: get_opt_str(r, "deadline"),
+        external_id: get_opt_str(r, "external_id"),
     }
 }
 
@@ -100,6 +101,7 @@ fn record_to_recurrence(r: &ybasey::engine::Record) -> crate::model::Recurrence 
         pattern_data: get_opt_str(r, "pattern_data"),
         start_date: get_str(r, "start_date"),
         end_date: get_opt_str(r, "end_date"),
+        external_id: get_opt_str(r, "external_id"),
     }
 }
 
@@ -476,7 +478,9 @@ pub fn data_dir() -> Result<PathBuf> {
 pub fn open() -> Result<Database> {
     let dir = data_dir()?;
     warn_legacy_sqlite_files();
-    Database::open(&dir, Some("ytasky")).map_err(Into::into)
+    let mut db = Database::open(&dir, Some("ytasky"))?;
+    crate::init::migrate_schema(&mut db)?;
+    Ok(db)
 }
 
 fn warn_legacy_sqlite_files() {

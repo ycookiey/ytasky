@@ -23,6 +23,7 @@ pub struct Task {
     pub recurrence_id: Option<i64>,
     pub is_backlog: bool,
     pub deadline: Option<String>,
+    pub external_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,6 +37,7 @@ pub struct Recurrence {
     pub pattern_data: Option<String>,
     pub start_date: String,
     pub end_date: Option<String>,
+    pub external_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

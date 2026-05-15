@@ -56,6 +56,7 @@ fn test_generate_dates_daily_7days() {
         pattern_data: None,
         start_date: "2026-04-01".into(),
         end_date: None,
+        external_id: None,
     };
     use chrono::NaiveDate;
     let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
@@ -77,6 +78,7 @@ fn test_generate_dates_weekly_14days() {
         pattern_data: Some(r#"{"days":[1,3]}"#.into()),
         start_date: "2026-04-01".into(),
         end_date: None,
+        external_id: None,
     };
     use chrono::NaiveDate;
     // 2026-04-01 は水曜。14日間 → 月曜2回 + 水曜2回 = 4件
@@ -99,6 +101,7 @@ fn test_generate_dates_monthly_60days() {
         pattern_data: Some(r#"{"days":[15]}"#.into()),
         start_date: "2026-04-01".into(),
         end_date: None,
+        external_id: None,
     };
     use chrono::NaiveDate;
     // 2026-04-01 から 60日: 4/15, 5/15 → 2件
