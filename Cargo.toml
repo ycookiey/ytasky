@@ -12,8 +12,18 @@ name = "ytasky"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["gcal"]
 mcp = ["dep:rmcp", "dep:tokio", "dep:schemars"]
+gcal = [
+    "dep:reqwest",
+    "dep:tiny_http",
+    "dep:base64",
+    "dep:sha2",
+    "dep:rand",
+    "dep:url",
+    "dep:webbrowser",
+    "dep:fs2",
+]
 
 [dependencies]
 ratatui = "0.29"
@@ -25,6 +35,14 @@ clap = { version = "4", features = ["derive"] }
 rmcp = { version = "0.16", features = ["server", "transport-io"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 schemars = { version = "0.8", optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"], optional = true }
+tiny_http = { version = "0.12", optional = true }
+base64 = { version = "0.22", optional = true }
+sha2 = { version = "0.10", optional = true }
+rand = { version = "0.9", optional = true }
+url = { version = "2", optional = true }
+webbrowser = { version = "1", optional = true }
+fs2 = { version = "0.4", optional = true }
 anyhow = "1"
 dirs = "6"
 ybasey = { path = "../ybasey" }

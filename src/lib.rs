@@ -1,4 +1,6 @@
 pub mod db;
+#[cfg(feature = "gcal")]
+pub mod gcal;
 pub mod history;
 pub mod init;
 #[cfg(feature = "mcp")]
