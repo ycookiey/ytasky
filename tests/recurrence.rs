@@ -111,6 +111,124 @@ fn test_generate_dates_monthly_60days() {
     assert_eq!(dates.len(), 2);
 }
 
+// ---- M2: interval / setpos の境界テスト --------------------------------------
+
+fn make_rec(pattern: &str, pattern_data: Option<&str>, start: &str) -> ytasky::model::Recurrence {
+    ytasky::model::Recurrence {
+        id: 1,
+        title: "t".into(),
+        category_id: "1".into(),
+        duration_min: 30,
+        fixed_start: None,
+        pattern: pattern.into(),
+        pattern_data: pattern_data.map(Into::into),
+        start_date: start.into(),
+        end_date: None,
+        external_id: None,
+    }
+}
+
+#[test]
+fn test_daily_interval_2() {
+    use chrono::NaiveDate;
+    let rec = make_rec("daily", Some(r#"{"interval":2}"#), "2026-04-01");
+    let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2026, 4, 10).unwrap();
+    let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
+    // 4/1, 4/3, 4/5, 4/7, 4/9 = 5件
+    assert_eq!(dates.len(), 5);
+    assert_eq!(dates[0], NaiveDate::from_ymd_opt(2026, 4, 1).unwrap());
+    assert_eq!(dates[4], NaiveDate::from_ymd_opt(2026, 4, 9).unwrap());
+}
+
+#[test]
+fn test_weekly_interval_2_tuesday() {
+    use chrono::NaiveDate;
+    // 2026-04-01 = 水曜。火曜 (day=2) で interval=2
+    // 4/7 (火) → 開始週は 3/30〜4/5、 4/7 は次週(4/6〜4/12) なので delta_weeks=1 (interval=2 で false)
+    // 4/14 (火) → delta_weeks=2 (true), 4/28 (火) → delta_weeks=4 (true)
+    let rec = make_rec("weekly", Some(r#"{"days":[2],"interval":2}"#), "2026-04-01");
+    let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+    let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
+    assert_eq!(dates, vec![
+        NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
+    ]);
+}
+
+#[test]
+fn test_monthly_interval_2_bymonthday() {
+    use chrono::NaiveDate;
+    // 毎隔月15日。start=2026-04-15
+    let rec = make_rec("monthly", Some(r#"{"days":[15],"interval":2}"#), "2026-04-15");
+    let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+    let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
+    // 4/15, 6/15, 8/15, 10/15, 12/15 = 5件
+    assert_eq!(dates.len(), 5);
+}
+
+#[test]
+fn test_monthly_setpos_2nd_tuesday() {
+    use chrono::NaiveDate;
+    // 第2火曜 (days=[2] setpos=2)
+    let rec = make_rec("monthly", Some(r#"{"days":[2],"setpos":2}"#), "2026-04-01");
+    let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+    let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
+    // 4月: 4/14, 5月: 5/12, 6月: 6/9, 7月: 7/14
+    assert_eq!(dates, vec![
+        NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 5, 12).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 6, 9).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+    ]);
+}
+
+#[test]
+fn test_monthly_setpos_last_friday() {
+    use chrono::NaiveDate;
+    // 最終金曜 (days=[5] setpos=-1)
+    let rec = make_rec("monthly", Some(r#"{"days":[5],"setpos":-1}"#), "2026-04-01");
+    let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+    let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
+    // 4月最終金: 4/24, 5月: 5/29, 6月: 6/26, 7月: 7/31
+    assert_eq!(dates, vec![
+        NaiveDate::from_ymd_opt(2026, 4, 24).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 5, 29).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 6, 26).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+    ]);
+}
+
+#[test]
+fn test_monthly_setpos_last_day_boundary() {
+    use chrono::NaiveDate;
+    // 月末日数が異なる月で最終水曜が正しく取れる: 2/2026 (28日, 平年) と 1/2026 (31日)
+    let rec = make_rec("monthly", Some(r#"{"days":[3],"setpos":-1}"#), "2026-01-01");
+    let from = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
+    let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
+    // 1月最終水: 1/28, 2月: 2/25, 3月: 3/25
+    assert_eq!(dates, vec![
+        NaiveDate::from_ymd_opt(2026, 1, 28).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 2, 25).unwrap(),
+        NaiveDate::from_ymd_opt(2026, 3, 25).unwrap(),
+    ]);
+}
+
+#[test]
+fn test_target_before_start_date_returns_false() {
+    use chrono::NaiveDate;
+    let rec = make_rec("daily", None, "2026-04-10");
+    let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2026, 4, 9).unwrap();
+    let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
+    assert!(dates.is_empty(), "expected no dates before start_date, got {dates:?}");
+}
+
 // ---- Sub-task 3: expand_recurrences_to_horizon --------------------------------
 
 #[test]

@@ -84,35 +84,93 @@ pub fn write_horizon(config: &HorizonConfig) -> Result<()> {
 
 // ---- pattern matching (db.rs から移動) ----------------------------------------
 
-pub fn matches_recurrence_pattern(
-    pattern: &str,
-    pattern_data: Option<&str>,
-    target_date: NaiveDate,
-) -> Result<bool> {
+pub fn matches_recurrence_pattern(rec: &Recurrence, target_date: NaiveDate) -> Result<bool> {
     use chrono::Datelike;
-    match pattern {
-        "daily" => Ok(true),
+
+    let start_date = NaiveDate::parse_from_str(&rec.start_date, "%Y-%m-%d")
+        .with_context(|| format!("start_date の形式が不正です: {}", rec.start_date))?;
+    if target_date < start_date {
+        return Ok(false);
+    }
+
+    let pd = parse_pattern_data(rec.pattern_data.as_deref())?;
+    let interval = pd.interval.unwrap_or(1).max(1) as i64;
+    let days = pd.days.unwrap_or_default();
+
+    match rec.pattern.as_str() {
+        "daily" => {
+            let delta_days = (target_date - start_date).num_days();
+            Ok(delta_days >= 0 && delta_days % interval == 0)
+        }
         "weekly" => {
+            let delta_days = (target_date - start_date).num_days();
+            if delta_days < 0 {
+                return Ok(false);
+            }
+            // 開始日と同週始まり (月曜) からの経過週で interval を判定
+            let start_monday =
+                start_date - chrono::Duration::days(start_date.weekday().num_days_from_monday() as i64);
+            let target_monday = target_date
+                - chrono::Duration::days(target_date.weekday().num_days_from_monday() as i64);
+            let delta_weeks = (target_monday - start_monday).num_days() / 7;
+            if delta_weeks % interval != 0 {
+                return Ok(false);
+            }
             let weekday = target_date.weekday().number_from_monday() as u8;
-            let days = parse_pattern_days(pattern_data)?;
             Ok(days.contains(&weekday))
         }
         "monthly" => {
-            let day = target_date.day() as u8;
-            let days = parse_pattern_days(pattern_data)?;
-            Ok(days.contains(&day))
+            let delta_months = (target_date.year() as i32 - start_date.year() as i32) * 12
+                + (target_date.month() as i32 - start_date.month() as i32);
+            if delta_months < 0 || (delta_months as i64) % interval != 0 {
+                return Ok(false);
+            }
+            match pd.setpos {
+                None => {
+                    // BYMONTHDAY: days を日番号として比較
+                    let day = target_date.day() as u8;
+                    Ok(days.contains(&day))
+                }
+                Some(n) => {
+                    // BYDAY=NTU 等: days を曜日番号 1..=7、setpos は何番目か
+                    let target_weekday = target_date.weekday().number_from_monday() as u8;
+                    if !days.contains(&target_weekday) {
+                        return Ok(false);
+                    }
+                    let nth = if n > 0 {
+                        ((target_date.day() - 1) / 7 + 1) as i8
+                    } else {
+                        let last_day = last_day_of_month(target_date);
+                        ((last_day - target_date.day()) / 7 + 1) as i8
+                    };
+                    Ok(if n > 0 { nth == n } else { nth == -n })
+                }
+            }
         }
         _ => Ok(false),
     }
 }
 
-pub fn parse_pattern_days(pattern_data: Option<&str>) -> Result<Vec<u8>> {
+fn parse_pattern_data(pattern_data: Option<&str>) -> Result<crate::model::PatternData> {
     let Some(raw) = pattern_data else {
-        return Ok(Vec::new());
+        return Ok(crate::model::PatternData::default());
     };
-    let parsed = serde_json::from_str::<crate::model::PatternData>(raw)
-        .with_context(|| format!("pattern_data の JSON が不正です: {raw}"))?;
-    Ok(parsed.days.unwrap_or_default())
+    serde_json::from_str::<crate::model::PatternData>(raw)
+        .with_context(|| format!("pattern_data の JSON が不正です: {raw}"))
+}
+
+/// 指定月の最終日 (1-31)
+fn last_day_of_month(d: NaiveDate) -> u32 {
+    use chrono::Datelike;
+    let (y, m) = if d.month() == 12 {
+        (d.year() + 1, 1)
+    } else {
+        (d.year(), d.month() + 1)
+    };
+    NaiveDate::from_ymd_opt(y, m, 1)
+        .and_then(|nm| nm.pred_opt())
+        .map(|last| last.day())
+        .unwrap_or(28)
 }
 
 // ---- Sub-task 2: 展開ロジック --------------------------------------------------
@@ -126,7 +184,7 @@ pub fn generate_dates_for_recurrence(
     let mut dates = Vec::new();
     let mut d = from;
     while d <= to {
-        if matches_recurrence_pattern(&rec.pattern, rec.pattern_data.as_deref(), d)? {
+        if matches_recurrence_pattern(rec, d)? {
             dates.push(d);
         }
         d += chrono::Duration::days(1);

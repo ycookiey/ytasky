@@ -1002,6 +1002,7 @@ impl App {
                 }
                 Some(serde_json::to_string(&crate::model::PatternData {
                     days: Some(form.weekly_days.clone()),
+                    ..Default::default()
                 })?)
             }
             "monthly" => {
@@ -1010,6 +1011,7 @@ impl App {
                 }
                 Some(serde_json::to_string(&crate::model::PatternData {
                     days: Some(form.monthly_days.clone()),
+                    ..Default::default()
                 })?)
             }
             _ => bail!("未対応の繰り返しパターンです"),

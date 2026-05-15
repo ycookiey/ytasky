@@ -40,9 +40,17 @@ pub struct Recurrence {
     pub external_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PatternData {
+    /// weekly: 曜日番号 1..=7 (MO=1..SU=7) / monthly: setpos なしなら BYMONTHDAY、ありなら曜日番号
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub days: Option<Vec<u8>>,
+    /// INTERVAL=N (未指定=1)。daily/weekly/monthly に共通
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<u8>,
+    /// BYSETPOS。monthly で「第N曜日」「最終曜日(-1)」を表す
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setpos: Option<i8>,
 }
 
 #[derive(Debug, Clone)]

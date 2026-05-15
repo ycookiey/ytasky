@@ -453,16 +453,6 @@ fn normalize_backlog_sort_order(db: &mut Database) -> Result<()> {
     Ok(())
 }
 
-// ---- recurrence pattern helpers — recurrence.rs に移動済、ここでは委譲のみ --------
-
-fn matches_recurrence_pattern(
-    pattern: &str,
-    pattern_data: Option<&str>,
-    target_date: NaiveDate,
-) -> Result<bool> {
-    crate::recurrence::matches_recurrence_pattern(pattern, pattern_data, target_date)
-}
-
 // ---- データディレクトリ解決 -------------------------------------------------------
 
 /// ybasey data dir を返す (init.rs と同一ロジック)
@@ -1175,7 +1165,7 @@ pub fn generate_recurring_tasks(db: &mut Database, date: &str) -> Result<()> {
     }
 
     for rec in recurrences {
-        if !matches_recurrence_pattern(&rec.pattern, rec.pattern_data.as_deref(), target_date)? {
+        if !crate::recurrence::matches_recurrence_pattern(&rec, target_date)? {
             continue;
         }
 
