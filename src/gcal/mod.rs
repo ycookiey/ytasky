@@ -10,5 +10,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod import;
+pub mod rrule;
 pub mod types;
 pub mod tz;
