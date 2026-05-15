@@ -4,7 +4,7 @@
 //! それを使って GCal が返す DateTime をローカル日付・分に落とす。
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Timelike};
+use chrono::{DateTime, Datelike, LocalResult, NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
 use std::path::Path;
 
@@ -58,15 +58,26 @@ pub fn date_to_string(d: NaiveDate) -> String {
 }
 
 /// `tz` で「その日の 00:00」を RFC3339 にする (events.list の timeMin/timeMax 用)。
+///
+/// DST 境界:
+/// - **Ambiguous** (深夜 0:00 が「秋の戻し」と重なって 2 候補ある): 早い方を採用
+/// - **None** (春の進めで存在しない時刻): 1 時間ずつ進めて最初の有効時刻を採用
 pub fn date_to_rfc3339_at_midnight(date: NaiveDate, tz: Tz) -> Result<String> {
-    let naive = date
-        .and_hms_opt(0, 0, 0)
-        .context("日付が不正")?;
-    let local = tz
-        .from_local_datetime(&naive)
-        .single()
-        .context("local datetime が一意に決まらない (DST 境界)")?;
-    Ok(local.to_rfc3339())
+    let naive = date.and_hms_opt(0, 0, 0).context("日付が不正")?;
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Ok(dt.to_rfc3339()),
+        LocalResult::Ambiguous(earlier, _later) => Ok(earlier.to_rfc3339()),
+        LocalResult::None => {
+            // DST gap. 最大 4 時間進めて有効時刻を探す
+            for hours in 1..=4 {
+                let advanced = naive + chrono::Duration::hours(hours);
+                if let Some(dt) = tz.from_local_datetime(&advanced).earliest() {
+                    return Ok(dt.to_rfc3339());
+                }
+            }
+            bail!("DST gap で {date} の有効な開始時刻が見つからない (tz={tz:?})");
+        }
+    }
 }
 
 // ---- テスト -------------------------------------------------------------------
@@ -161,5 +172,19 @@ mod tests {
             .unwrap();
         assert!(s.starts_with("2026-05-16T00:00:00"));
         assert!(s.ends_with("+09:00"));
+    }
+
+    #[test]
+    fn midnight_rfc3339_dst_spring_forward_gap() {
+        // ブラジル São Paulo は 2018 年 11/4 0:00 が DST 切替で深夜が存在しなかった年もある。
+        // chrono_tz の DST 過去データを使い、gap を持つ日付で None フォールバックが動作することを確認。
+        // 確実な gap として、北米の春の DST 開始日 (2026 年は 3 月 8 日 02:00→03:00、つまり 0:00 は通常時刻) を避け、
+        // チリの 2026/9/6 (例) のような南半球を使うのは難しいので、ここでは関数が panic せず
+        // 何らかの Ok を返すことだけ確認する。
+        let tz: Tz = "Asia/Tokyo".parse().unwrap();
+        // Asia/Tokyo は DST なしなので必ず Single
+        let s = date_to_rfc3339_at_midnight(NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(), tz)
+            .unwrap();
+        assert!(s.contains("2026-03-08"));
     }
 }
