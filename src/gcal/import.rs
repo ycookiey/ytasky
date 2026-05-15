@@ -119,9 +119,15 @@ fn handle_event(
 
         match rrule::parse_recurrence_rules(rules, start_date) {
             Ok(parsed) => {
-                upsert_recurrence(db, event, opts, start_date, start_min, duration, &parsed)?;
+                let inserted = upsert_recurrence(
+                    db, event, opts, start_date, start_min, duration, &parsed,
+                )?;
                 summary_count_recurrence(summary, &parsed);
-                summary.created += 1; // upsert の inserted/updated は db.upsert の戻りで上書き可
+                if inserted {
+                    summary.created += 1;
+                } else {
+                    summary.updated += 1;
+                }
             }
             Err(RruleError::Unsupported(_)) => {
                 // 個別 instance 展開フォールバック
@@ -166,6 +172,11 @@ fn summary_count_recurrence(summary: &mut ImportSummary, parsed: &ParsedRecurren
 
 // ---- upsert helpers -----------------------------------------------------------
 
+/// `gcal:{calendar_id}:{event_id}` の形式で external_id を生成する。
+///
+/// calendar_id 中の `:` は Google Calendar API の仕様上通常含まれないが、
+/// 将来の逆分解が必要になった場合は `splitn(3, ':')` で先頭 2 要素を
+/// 取って残りを event_id として扱える設計にしてある。
 fn external_id(calendar_id: &str, event_id: &str) -> String {
     format!("gcal:{calendar_id}:{event_id}")
 }
@@ -189,10 +200,7 @@ fn upsert_single_task(
         .context("event の end.dateTime が無い")?;
     let (date, fixed_start) = gtz::rfc3339_to_local_minute(start_dt, tz)?;
     let duration = gtz::duration_minutes(start_dt, end_dt)?;
-    let title = event
-        .summary
-        .clone()
-        .unwrap_or_else(|| "(無題)".to_string());
+    let title = sanitize_text(event.summary.as_deref().unwrap_or("(無題)"));
     let ext = external_id(&opts.calendar_id, &event.id);
     let exists = task_exists_by_external_id(db, &ext)?;
 
@@ -221,6 +229,8 @@ fn upsert_single_task(
     Ok(())
 }
 
+/// recurrences を upsert する。inserted/updated を `bool` で返し、
+/// 呼び出し側で summary の created/updated を区別できるようにする。
 fn upsert_recurrence(
     db: &mut Database,
     event: &Event,
@@ -229,13 +239,14 @@ fn upsert_recurrence(
     fixed_start: i32,
     duration: i32,
     parsed: &ParsedRecurrence,
-) -> Result<()> {
-    let title = event
-        .summary
-        .clone()
-        .unwrap_or_else(|| "(無題)".to_string());
+) -> Result<bool> {
+    let title = sanitize_text(
+        event
+            .summary
+            .as_deref()
+            .unwrap_or("(無題)"),
+    );
     let ext = external_id(&opts.calendar_id, &event.id);
-    let exists = recurrence_exists_by_external_id(db, &ext)?;
     let pattern_data_json = serde_json::to_string(&parsed.pattern_data)
         .context("pattern_data JSON 化失敗")?;
 
@@ -249,14 +260,19 @@ fn upsert_recurrence(
         ("start_date".into(), gtz::date_to_string(start_date)),
         ("external_id".into(), ext.clone()),
     ];
-    if let Some(end) = parsed.end_date {
-        fields.push(("end_date".into(), gtz::date_to_string(end)));
-    }
-    // sort_order/is_backlog は recurrences に存在しない (tasks 側のみ)
-    let _ = exists;
-    db.upsert("recurrences", "external_id", &ext, fields)
+    // end_date は Some/None の両方を明示的に渡し、GCal 側で UNTIL が
+    // 削除された場合に ytasky 側もクリアされるようにする。
+    // ybasey の Null sentinel は "_" 文字列。
+    let end_value = parsed
+        .end_date
+        .map(gtz::date_to_string)
+        .unwrap_or_else(|| "_".to_string());
+    fields.push(("end_date".into(), end_value));
+
+    let (_id, inserted) = db
+        .upsert("recurrences", "external_id", &ext, fields)
         .context("recurrences upsert 失敗")?;
-    Ok(())
+    Ok(inserted)
 }
 
 fn task_exists_by_external_id(db: &Database, ext: &str) -> Result<bool> {
@@ -264,9 +280,13 @@ fn task_exists_by_external_id(db: &Database, ext: &str) -> Result<bool> {
     Ok(!table.find_by_field("external_id", ext).is_empty())
 }
 
-fn recurrence_exists_by_external_id(db: &Database, ext: &str) -> Result<bool> {
-    let table = db.table("recurrences").context("recurrences テーブルが無い")?;
-    Ok(!table.find_by_field("external_id", ext).is_empty())
+/// GCal の summary / description には ANSI escape (`\x1b[...`) や NUL
+/// が含まれうる。TUI / ログでの偽装表示や ybasey 側で文字列フィールドが
+/// 壊れるのを避けるため、import 時点で制御文字を除去する。
+fn sanitize_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .collect()
 }
 
 // ---- テスト -------------------------------------------------------------------
@@ -389,6 +409,58 @@ mod tests {
 
         let count = db.query("recurrences", "| count").unwrap();
         assert!(count.contains("count=1"), "got {count}");
+    }
+
+    #[test]
+    fn upsert_recurrence_returns_inserted_then_updated() {
+        let (_tmp, mut db) = setup_in_memory_db();
+        let opts = ImportOptions::default();
+        let parsed = ParsedRecurrence {
+            pattern: "daily".into(),
+            pattern_data: Default::default(),
+            end_date: None,
+            exdates: vec![],
+            rdates: vec![],
+        };
+        let ev = make_event(
+            "rec1",
+            "Standup",
+            "2026-05-18T09:00:00+09:00",
+            "2026-05-18T09:15:00+09:00",
+        );
+        let inserted_1 = upsert_recurrence(
+            &mut db,
+            &ev,
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 5, 18).unwrap(),
+            540,
+            15,
+            &parsed,
+        )
+        .unwrap();
+        assert!(inserted_1, "first call should report inserted");
+        let inserted_2 = upsert_recurrence(
+            &mut db,
+            &ev,
+            &opts,
+            NaiveDate::from_ymd_opt(2026, 5, 18).unwrap(),
+            540,
+            15,
+            &parsed,
+        )
+        .unwrap();
+        assert!(!inserted_2, "second call should report updated");
+    }
+
+    #[test]
+    fn sanitize_text_strips_control_characters() {
+        assert_eq!(sanitize_text("hello"), "hello");
+        // ANSI escape は \x1b (ESC) で始まる制御シーケンス → 全部除去
+        assert_eq!(sanitize_text("foo\x1b[31mbar\x1b[0m"), "foo[31mbar[0m");
+        // NUL バイトの除去
+        assert_eq!(sanitize_text("a\0b"), "ab");
+        // タブは残す
+        assert_eq!(sanitize_text("a\tb"), "a\tb");
     }
 
     #[test]
