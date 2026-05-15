@@ -2559,14 +2559,18 @@ fn spawn_gcal_lazy_sync() -> Option<std::sync::mpsc::Receiver<GcalSyncMessage>> 
     }
     let days = cfg.gcal_auto_sync_days;
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("ytasky-gcal-lazy-sync".into())
         .spawn(move || {
             let result = run_lazy_sync(days);
             let _ = tx.send(GcalSyncMessage { result });
-        })
-        .ok()?;
-    Some(rx)
+        }) {
+        Ok(_) => Some(rx),
+        Err(e) => {
+            eprintln!("ytasky: GCal lazy sync スレッドの起動に失敗: {e}");
+            None
+        }
+    }
 }
 
 #[cfg(feature = "gcal")]

@@ -92,9 +92,20 @@ pub fn login() -> Result<()> {
     let redirect_uri = format!("http://127.0.0.1:{port}/cb");
 
     let url = build_authorize_url(&credential, &redirect_uri, &challenge, &state);
-    eprintln!("ブラウザで認可してください: {url}");
+    // state を含む URL は同マシン上のローカルプロセスから観測されると
+    // 偽コールバック攻撃の素材になる。eprintln は state を伏字化し、
+    // 完全 URL はブラウザにのみ渡す。
+    eprintln!(
+        "ブラウザで認可してください: {}",
+        redact_state_in_url(&url)
+    );
     if let Err(e) = webbrowser::open(&url) {
-        eprintln!("ブラウザを自動起動できませんでした ({e})。URL を手動で開いてください。");
+        eprintln!(
+            "ブラウザを自動起動できませんでした ({e})。設定で許可した上で再試行してください。"
+        );
+        eprintln!(
+            "(注意: ブラウザに渡されるべき state を含む完全 URL は安全のため stderr に出力しません)"
+        );
     }
 
     let code = run_loopback_callback(&server, &state, CALLBACK_TIMEOUT)?;
@@ -314,26 +325,43 @@ fn run_loopback_callback(
         }
     }
 
-    // レスポンス送信は state 検証より先に終わらせる（ブラウザを止めない）
-    let body = match (&code, &error) {
-        (Some(_), None) => "認証完了。このタブを閉じてください。",
-        _ => "認証失敗。ターミナルを確認してください。",
-    };
-    let response =
-        tiny_http::Response::from_string(body).with_header(tiny_http::Header::from_bytes(
-            &b"Content-Type"[..],
-            &b"text/plain; charset=utf-8"[..],
-        ).unwrap());
-    let _ = request.respond(response);
-
+    // ユーザー誤認を防ぐため、レスポンス送信より先に state を検証する
+    // (CSRF / 偽コールバックの場合に「認証完了」を表示しない)
     if let Some(err) = error {
+        respond_plain(request, "認証失敗。ターミナルを確認してください。");
         bail!("OAuth エラー: {err}");
     }
-    let received_state = state.context("state パラメータが無い")?;
-    if received_state != expected_state {
+    let received_state = match state {
+        Some(s) => s,
+        None => {
+            respond_plain(request, "認証失敗。ターミナルを確認してください。");
+            bail!("state パラメータが無い");
+        }
+    };
+    if !constant_time_eq(&received_state, expected_state) {
+        respond_plain(request, "認証失敗。ターミナルを確認してください。");
         bail!("state 不一致 (CSRF 検知)");
     }
-    code.context("code パラメータが無い")
+    let code = match code {
+        Some(c) => c,
+        None => {
+            respond_plain(request, "認証失敗。ターミナルを確認してください。");
+            bail!("code パラメータが無い");
+        }
+    };
+    respond_plain(request, "認証完了。このタブを閉じてください。");
+    Ok(code)
+}
+
+fn respond_plain(request: tiny_http::Request, body: &str) {
+    let response = tiny_http::Response::from_string(body).with_header(
+        tiny_http::Header::from_bytes(
+            &b"Content-Type"[..],
+            &b"text/plain; charset=utf-8"[..],
+        )
+        .unwrap(),
+    );
+    let _ = request.respond(response);
 }
 
 // ---- token 交換 / refresh -----------------------------------------------------
@@ -402,6 +430,44 @@ fn post_token(token_uri: &str, params: &[(&str, &str)]) -> Result<Token> {
         expires_at,
         scope: parsed.scope.unwrap_or_else(|| SCOPE.to_string()),
     })
+}
+
+/// 認可 URL の `state=...` を `state=REDACTED` に置換する (表示用)。
+fn redact_state_in_url(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    let mut rest = url;
+    loop {
+        match rest.find("state=") {
+            Some(pos) => {
+                out.push_str(&rest[..pos + "state=".len()]);
+                out.push_str("REDACTED");
+                let after = &rest[pos + "state=".len()..];
+                match after.find('&') {
+                    Some(amp) => rest = &after[amp..],
+                    None => return out,
+                }
+            }
+            None => {
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+}
+
+/// state パラメータの定数時間比較。文字列の長さも長さ自体で先漏れ
+/// しないよう、長さが異なれば直ちに不一致を返す。
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 /// 長大なレスポンス本文をエラーメッセージに乗せる際の安全な truncate。
@@ -524,6 +590,32 @@ mod tests {
         assert!(t.is_expired(1000));
         // 31 秒以上前ならまだ有効
         assert!(!t.is_expired(969));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_normal_eq() {
+        assert!(constant_time_eq("abc123", "abc123"));
+        assert!(!constant_time_eq("abc123", "abc124"));
+        assert!(!constant_time_eq("abc", "abc1"));
+        assert!(constant_time_eq("", ""));
+    }
+
+    #[test]
+    fn redact_state_replaces_value_only() {
+        let url = "https://example.com/auth?client_id=foo&state=SECRET_VALUE&prompt=consent";
+        let red = redact_state_in_url(url);
+        assert!(red.contains("state=REDACTED"));
+        assert!(!red.contains("SECRET_VALUE"));
+        assert!(red.contains("client_id=foo"));
+        assert!(red.contains("prompt=consent"));
+    }
+
+    #[test]
+    fn redact_state_handles_state_at_end() {
+        let url = "https://example.com/auth?client_id=foo&state=SECRET";
+        let red = redact_state_in_url(url);
+        assert!(red.ends_with("state=REDACTED"));
+        assert!(!red.contains("SECRET"));
     }
 
     #[test]
