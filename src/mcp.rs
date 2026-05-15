@@ -10,6 +10,73 @@ use ybasey::Database;
 
 use crate::{db, model};
 
+fn build_pattern_data_for_add_mcp(
+    pattern_data: Option<&str>,
+    interval: Option<u8>,
+    setpos: Option<i8>,
+) -> Result<Option<String>, McpError> {
+    if let Some(raw) = pattern_data {
+        return Ok(Some(raw.to_string()));
+    }
+    if interval.is_none() && setpos.is_none() {
+        return Ok(None);
+    }
+    let pd = model::PatternData {
+        days: None,
+        interval,
+        setpos,
+    };
+    serde_json::to_string(&pd)
+        .map(Some)
+        .map_err(|e| McpError::invalid_params(format!("pattern_data JSON 生成失敗: {e}"), None))
+}
+
+fn build_pattern_data_for_edit_mcp(
+    pattern_data_arg: Option<&str>,
+    interval_arg: Option<&str>,
+    setpos_arg: Option<&str>,
+    current: Option<&str>,
+) -> Result<Option<String>, McpError> {
+    if let Some(raw) = pattern_data_arg {
+        if raw == "none" {
+            return Ok(None);
+        }
+        return Ok(Some(raw.to_string()));
+    }
+    if interval_arg.is_none() && setpos_arg.is_none() {
+        return Ok(current.map(|s| s.to_string()));
+    }
+    let mut pd: model::PatternData = match current {
+        Some(raw) => serde_json::from_str(raw).map_err(|e| {
+            McpError::invalid_params(format!("既存 pattern_data JSON が不正: {raw} ({e})"), None)
+        })?,
+        None => model::PatternData::default(),
+    };
+    if let Some(v) = interval_arg {
+        pd.interval = if v == "none" {
+            None
+        } else {
+            Some(
+                v.parse()
+                    .map_err(|_| McpError::invalid_params("interval は数値", None))?,
+            )
+        };
+    }
+    if let Some(v) = setpos_arg {
+        pd.setpos = if v == "none" {
+            None
+        } else {
+            Some(
+                v.parse()
+                    .map_err(|_| McpError::invalid_params("setpos は数値", None))?,
+            )
+        };
+    }
+    serde_json::to_string(&pd)
+        .map(Some)
+        .map_err(|e| McpError::invalid_params(format!("pattern_data JSON 生成失敗: {e}"), None))
+}
+
 fn parse_time(s: &str) -> Result<i32, McpError> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 {
@@ -193,9 +260,15 @@ struct AddRecurrenceParams {
     fixed_start: Option<String>,
     /// Pattern: daily, weekly, monthly
     pattern: String,
-    /// Pattern data JSON (optional), e.g. {"days":[1,3,5]}
+    /// Pattern data JSON (optional). Takes precedence over interval/setpos. e.g. {"days":[1,3,5],"interval":2}
     #[serde(default)]
     pattern_data: Option<String>,
+    /// INTERVAL=N (every N days/weeks/months). Optional
+    #[serde(default)]
+    interval: Option<u8>,
+    /// BYSETPOS for monthly: positive (Nth weekday) or -1 (last)
+    #[serde(default)]
+    setpos: Option<i8>,
     /// Start date in YYYY-MM-DD
     start_date: String,
     /// End date in YYYY-MM-DD (optional)
@@ -222,9 +295,15 @@ struct EditRecurrenceParams {
     /// New pattern (optional)
     #[serde(default)]
     pattern: Option<String>,
-    /// New pattern data JSON, or "none" (optional)
+    /// New pattern data JSON, or "none" (optional). Takes precedence over interval/setpos
     #[serde(default)]
     pattern_data: Option<String>,
+    /// New INTERVAL, or "none" (optional)
+    #[serde(default)]
+    interval: Option<String>,
+    /// New BYSETPOS, or "none" (optional)
+    #[serde(default)]
+    setpos: Option<String>,
     /// New start date YYYY-MM-DD (optional)
     #[serde(default)]
     start_date: Option<String>,
@@ -489,13 +568,18 @@ impl YtaskyMcpServer {
     }
 
     #[tool(
-        description = "Add a recurrence rule. Pattern must be one of: daily, weekly, monthly. pattern_data may contain JSON like {\"days\":[1,3,5]}."
+        description = "Add a recurrence rule. Pattern must be one of: daily, weekly, monthly. pattern_data may contain JSON like {\"days\":[1,3,5],\"interval\":2,\"setpos\":-1}. If pattern_data is omitted, interval/setpos build it."
     )]
     async fn add_recurrence(
         &self,
         Parameters(params): Parameters<AddRecurrenceParams>,
     ) -> Result<CallToolResult, McpError> {
         let fixed = params.fixed_start.map(|s| parse_time(&s)).transpose()?;
+        let pd = build_pattern_data_for_add_mcp(
+            params.pattern_data.as_deref(),
+            params.interval,
+            params.setpos,
+        )?;
         let mut db = self.db.write().await;
         let id = db::insert_recurrence(
             &mut db,
@@ -504,7 +588,7 @@ impl YtaskyMcpServer {
             params.duration,
             fixed,
             &params.pattern,
-            params.pattern_data.as_deref(),
+            pd.as_deref(),
             &params.start_date,
             params.end_date.as_deref(),
         )
@@ -535,11 +619,12 @@ impl YtaskyMcpServer {
             None => current.fixed_start,
         };
         let new_pattern = params.pattern.unwrap_or(current.pattern);
-        let new_pattern_data = match params.pattern_data.as_deref() {
-            Some("none") => None,
-            Some(data) => Some(data),
-            None => current.pattern_data.as_deref(),
-        };
+        let new_pattern_data = build_pattern_data_for_edit_mcp(
+            params.pattern_data.as_deref(),
+            params.interval.as_deref(),
+            params.setpos.as_deref(),
+            current.pattern_data.as_deref(),
+        )?;
         let new_start_date = params.start_date.unwrap_or(current.start_date);
         let new_end_date = match params.end_date.as_deref() {
             Some("none") => None,
@@ -555,7 +640,7 @@ impl YtaskyMcpServer {
             new_duration,
             new_fixed_start,
             &new_pattern,
-            new_pattern_data,
+            new_pattern_data.as_deref(),
             &new_start_date,
             new_end_date,
         )

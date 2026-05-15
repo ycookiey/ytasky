@@ -54,6 +54,8 @@ pub enum FormField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecurrenceFormField {
     Pattern,
+    Interval,
+    Setpos,
     EndDate,
 }
 
@@ -65,6 +67,12 @@ pub struct RecurrenceFormState {
     pub pattern_idx: usize,
     pub weekly_days: Vec<u8>,
     pub monthly_days: Vec<u8>,
+    /// INTERVAL 入力（空文字で未指定=1）
+    pub interval_input: String,
+    /// BYSETPOS (monthly のみ)。None / 1..=5 / -1 をサイクル
+    pub setpos: Option<i8>,
+    /// monthly + setpos のとき選ぶ曜日 (1..=7)。setpos=None なら無視
+    pub monthly_weekday: u8,
     pub end_date: Option<String>,
     pub end_date_input: String,
     pub field: RecurrenceFormField,
@@ -831,38 +839,53 @@ impl App {
     ) -> FormAction {
         const PATTERNS: [&str; 3] = ["daily", "weekly", "monthly"];
 
+        let next_field = |f: RecurrenceFormField, pattern: &str| -> RecurrenceFormField {
+            match f {
+                RecurrenceFormField::Pattern => RecurrenceFormField::Interval,
+                RecurrenceFormField::Interval if pattern == "monthly" => {
+                    RecurrenceFormField::Setpos
+                }
+                RecurrenceFormField::Interval => RecurrenceFormField::EndDate,
+                RecurrenceFormField::Setpos => RecurrenceFormField::EndDate,
+                RecurrenceFormField::EndDate => RecurrenceFormField::Pattern,
+            }
+        };
+
         match key.code {
             KeyCode::Esc => {
-                if form.field == RecurrenceFormField::EndDate {
+                if form.field != RecurrenceFormField::Pattern {
                     form.field = RecurrenceFormField::Pattern;
                     FormAction::KeepOpen
                 } else {
                     FormAction::Cancel
                 }
             }
-            KeyCode::Enter => match form.field {
-                RecurrenceFormField::Pattern => {
-                    form.field = RecurrenceFormField::EndDate;
+            KeyCode::Enter => {
+                if form.field == RecurrenceFormField::EndDate {
+                    FormAction::Submit
+                } else {
+                    form.field = next_field(form.field, form.pattern.as_str());
                     FormAction::KeepOpen
                 }
-                RecurrenceFormField::EndDate => FormAction::Submit,
-            },
+            }
             KeyCode::Tab => {
-                form.field = match form.field {
-                    RecurrenceFormField::Pattern => RecurrenceFormField::EndDate,
-                    RecurrenceFormField::EndDate => RecurrenceFormField::Pattern,
-                };
+                form.field = next_field(form.field, form.pattern.as_str());
                 FormAction::KeepOpen
             }
             KeyCode::Backspace => {
                 match form.field {
                     RecurrenceFormField::Pattern if form.pattern == "monthly" => {
-                        if let Some(day) = form.monthly_days.first_mut() {
-                            *day /= 10;
-                            if *day == 0 {
-                                form.monthly_days.clear();
+                        if form.setpos.is_none() {
+                            if let Some(day) = form.monthly_days.first_mut() {
+                                *day /= 10;
+                                if *day == 0 {
+                                    form.monthly_days.clear();
+                                }
                             }
                         }
+                    }
+                    RecurrenceFormField::Interval => {
+                        form.interval_input.pop();
                     }
                     RecurrenceFormField::EndDate => {
                         if !form.end_date_input.is_empty() {
@@ -872,7 +895,7 @@ impl App {
                             form.end_date = None;
                         }
                     }
-                    RecurrenceFormField::Pattern => {}
+                    _ => {}
                 }
                 FormAction::KeepOpen
             }
@@ -943,6 +966,28 @@ impl App {
                 self.shift_recurrence_end_date(form, 7);
                 FormAction::KeepOpen
             }
+            // Setpos zone: h/l でサイクル (None → 1 → 2 → 3 → 4 → 5 → -1 → None)
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k')
+                if form.field == RecurrenceFormField::Setpos =>
+            {
+                form.setpos = cycle_setpos(form.setpos, -1);
+                FormAction::KeepOpen
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j')
+                if form.field == RecurrenceFormField::Setpos =>
+            {
+                form.setpos = cycle_setpos(form.setpos, 1);
+                FormAction::KeepOpen
+            }
+            // Setpos zone (monthly): 1-7 で曜日選択
+            KeyCode::Char(c)
+                if form.field == RecurrenceFormField::Setpos
+                    && form.setpos.is_some()
+                    && ('1'..='7').contains(&c) =>
+            {
+                form.monthly_weekday = (c as u8) - b'0';
+                FormAction::KeepOpen
+            }
             KeyCode::Char(c) => {
                 match form.field {
                     RecurrenceFormField::Pattern if form.pattern == "weekly" => {
@@ -958,8 +1003,8 @@ impl App {
                         }
                     }
                     RecurrenceFormField::Pattern if form.pattern == "monthly" => {
-                        // 数字で日付入力
-                        if c.is_ascii_digit() {
+                        // 数字で日付入力 (setpos なしのとき)
+                        if form.setpos.is_none() && c.is_ascii_digit() {
                             let digit = (c as u8 - b'0') as i32;
                             let current = form.monthly_days.first().copied().unwrap_or(0) as i32;
                             let mut next = current * 10 + digit;
@@ -975,6 +1020,14 @@ impl App {
                             }
                         }
                     }
+                    RecurrenceFormField::Interval => {
+                        if c.is_ascii_digit() && form.interval_input.len() < 3 {
+                            // 先頭 0 を防ぐ
+                            if !(form.interval_input.is_empty() && c == '0') {
+                                form.interval_input.push(c);
+                            }
+                        }
+                    }
                     RecurrenceFormField::EndDate => {
                         if c.is_ascii_digit() || c == '-' {
                             if form.end_date_input.len() < 10 {
@@ -983,7 +1036,7 @@ impl App {
                             self.try_resolve_recurrence_end_date_input(form);
                         }
                     }
-                    RecurrenceFormField::Pattern => {}
+                    _ => {}
                 }
                 FormAction::KeepOpen
             }
@@ -994,26 +1047,58 @@ impl App {
     fn submit_recurrence_form(&mut self, form: &RecurrenceFormState) -> anyhow::Result<()> {
         let pattern = form.pattern.as_str();
 
+        let interval_value: Option<u8> = if form.interval_input.is_empty() {
+            None
+        } else {
+            let n: u8 = form
+                .interval_input
+                .parse()
+                .map_err(|_| anyhow::anyhow!("INTERVAL は 1-255 の数値"))?;
+            if n == 0 {
+                bail!("INTERVAL は 1 以上");
+            }
+            if n == 1 { None } else { Some(n) }
+        };
+
         let pattern_data = match pattern {
-            "daily" => None,
+            "daily" => {
+                if interval_value.is_none() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&crate::model::PatternData {
+                        days: None,
+                        interval: interval_value,
+                        setpos: None,
+                    })?)
+                }
+            }
             "weekly" => {
                 if form.weekly_days.is_empty() {
                     bail!("weekly は曜日を1つ以上選択してください (1=月..7=日)");
                 }
                 Some(serde_json::to_string(&crate::model::PatternData {
                     days: Some(form.weekly_days.clone()),
-                    ..Default::default()
+                    interval: interval_value,
+                    setpos: None,
                 })?)
             }
-            "monthly" => {
-                if form.monthly_days.is_empty() {
-                    bail!("monthly は日付を入力してください (1-31)");
+            "monthly" => match form.setpos {
+                None => {
+                    if form.monthly_days.is_empty() {
+                        bail!("monthly は日付を入力してください (1-31)");
+                    }
+                    Some(serde_json::to_string(&crate::model::PatternData {
+                        days: Some(form.monthly_days.clone()),
+                        interval: interval_value,
+                        setpos: None,
+                    })?)
                 }
-                Some(serde_json::to_string(&crate::model::PatternData {
-                    days: Some(form.monthly_days.clone()),
-                    ..Default::default()
-                })?)
-            }
+                Some(n) => Some(serde_json::to_string(&crate::model::PatternData {
+                    days: Some(vec![form.monthly_weekday]),
+                    interval: interval_value,
+                    setpos: Some(n),
+                })?),
+            },
             _ => bail!("未対応の繰り返しパターンです"),
         };
 
@@ -1280,16 +1365,27 @@ impl App {
                 "monthly" => 2,
                 _ => 0,
             };
-            let days = rec
+            let pd_parsed = rec
                 .pattern_data
                 .as_deref()
                 .and_then(|d| serde_json::from_str::<crate::model::PatternData>(d).ok())
-                .and_then(|pd| pd.days)
                 .unwrap_or_default();
-            let (weekly_days, monthly_days) = match rec.pattern.as_str() {
-                "weekly" => (days, Vec::new()),
-                "monthly" => (Vec::new(), days),
-                _ => (Vec::new(), Vec::new()),
+            let days = pd_parsed.days.clone().unwrap_or_default();
+            let setpos = pd_parsed.setpos;
+            let interval_input = pd_parsed
+                .interval
+                .filter(|n| *n != 1)
+                .map(|n| n.to_string())
+                .unwrap_or_default();
+            // monthly + setpos のとき days は曜日番号1つ。setpos なしなら従来通り日付列
+            let (weekly_days, monthly_days, monthly_weekday) = match rec.pattern.as_str() {
+                "weekly" => (days, Vec::new(), 1),
+                "monthly" if setpos.is_some() => {
+                    let wd = days.first().copied().unwrap_or(1).clamp(1, 7);
+                    (Vec::new(), Vec::new(), wd)
+                }
+                "monthly" => (Vec::new(), days, 1),
+                _ => (Vec::new(), Vec::new(), 1),
             };
             let day_cursor = weekly_days
                 .first()
@@ -1303,6 +1399,9 @@ impl App {
                 pattern_idx,
                 weekly_days,
                 monthly_days,
+                interval_input,
+                setpos,
+                monthly_weekday,
                 end_date: rec.end_date.clone(),
                 end_date_input: String::new(),
                 field: RecurrenceFormField::Pattern,
@@ -1318,6 +1417,9 @@ impl App {
                 pattern_idx: 0,
                 weekly_days: Vec::new(),
                 monthly_days: Vec::new(),
+                interval_input: String::new(),
+                setpos: None,
+                monthly_weekday: 1,
                 end_date: None,
                 end_date_input: String::new(),
                 field: RecurrenceFormField::Pattern,
@@ -2348,4 +2450,13 @@ fn round_up_to_next_15_minutes(minutes: i32) -> i32 {
     } else {
         (normalized + (15 - remainder)) % DAY_MINUTES
     }
+}
+
+/// BYSETPOS のサイクル: None → 1 → 2 → 3 → 4 → 5 → -1 → None
+fn cycle_setpos(current: Option<i8>, direction: i32) -> Option<i8> {
+    const SEQ: [Option<i8>; 7] = [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(-1)];
+    let idx = SEQ.iter().position(|v| *v == current).unwrap_or(0);
+    let n = SEQ.len() as i32;
+    let next_idx = ((idx as i32 + direction).rem_euclid(n)) as usize;
+    SEQ[next_idx]
 }

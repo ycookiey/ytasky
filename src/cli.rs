@@ -151,9 +151,15 @@ pub enum Commands {
         /// daily, weekly, monthly
         #[arg(short, long)]
         pattern: String,
-        /// JSON: {\"days\": [1,3,5]}
+        /// JSON: {\"days\":[1,3,5],\"interval\":2,\"setpos\":-1} 等。指定時は --interval/--setpos を上書き
         #[arg(long)]
         pattern_data: Option<String>,
+        /// INTERVAL=N (隔日/隔週/隔月)
+        #[arg(long)]
+        interval: Option<u8>,
+        /// BYSETPOS。monthly で "第N曜日" (1,2,..) / "最終曜日" (-1)
+        #[arg(long)]
+        setpos: Option<i8>,
         /// 開始日 (YYYY-MM-DD)
         #[arg(long)]
         start_date: String,
@@ -175,8 +181,15 @@ pub enum Commands {
         fixed_start: Option<String>,
         #[arg(short, long)]
         pattern: Option<String>,
+        /// JSON 完全置換。"none" で削除。指定時は --interval/--setpos を上書き
         #[arg(long)]
         pattern_data: Option<String>,
+        /// INTERVAL を上書き。"none" で削除
+        #[arg(long)]
+        interval: Option<String>,
+        /// BYSETPOS を上書き。"none" で削除
+        #[arg(long)]
+        setpos: Option<String>,
         #[arg(long)]
         start_date: Option<String>,
         #[arg(long)]
@@ -232,6 +245,64 @@ fn parse_time(s: &str) -> Result<i32> {
 
 fn print_json(value: &impl serde::Serialize) {
     println!("{}", serde_json::to_string_pretty(value).unwrap());
+}
+
+/// AddRecurrence 用: --pattern-data 指定があれば優先、無ければ --interval/--setpos から JSON 生成
+fn build_pattern_data_for_add(
+    pattern_data: Option<&str>,
+    interval: Option<u8>,
+    setpos: Option<i8>,
+) -> Result<Option<String>> {
+    if let Some(raw) = pattern_data {
+        return Ok(Some(raw.to_string()));
+    }
+    if interval.is_none() && setpos.is_none() {
+        return Ok(None);
+    }
+    let pd = model::PatternData {
+        days: None,
+        interval,
+        setpos,
+    };
+    Ok(Some(serde_json::to_string(&pd)?))
+}
+
+/// EditRecurrence 用: --pattern-data で完全置換、無ければ --interval/--setpos を current にマージ
+fn build_pattern_data_for_edit(
+    pattern_data_arg: Option<&str>,
+    interval_arg: Option<&str>,
+    setpos_arg: Option<&str>,
+    current: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(raw) = pattern_data_arg {
+        if raw == "none" {
+            return Ok(None);
+        }
+        return Ok(Some(raw.to_string()));
+    }
+    if interval_arg.is_none() && setpos_arg.is_none() {
+        return Ok(current.map(|s| s.to_string()));
+    }
+    let mut pd: model::PatternData = match current {
+        Some(raw) => serde_json::from_str(raw)
+            .with_context(|| format!("既存 pattern_data JSON が不正: {raw}"))?,
+        None => model::PatternData::default(),
+    };
+    if let Some(v) = interval_arg {
+        pd.interval = if v == "none" {
+            None
+        } else {
+            Some(v.parse().context("--interval は数値")?)
+        };
+    }
+    if let Some(v) = setpos_arg {
+        pd.setpos = if v == "none" {
+            None
+        } else {
+            Some(v.parse().context("--setpos は数値")?)
+        };
+    }
+    Ok(Some(serde_json::to_string(&pd)?))
 }
 
 pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
@@ -392,10 +463,13 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
             fixed_start,
             pattern,
             pattern_data,
+            interval,
+            setpos,
             start_date,
             end_date,
         } => {
             let fixed = fixed_start.map(|s| parse_time(&s)).transpose()?;
+            let pd = build_pattern_data_for_add(pattern_data.as_deref(), interval, setpos)?;
             let id = db::insert_recurrence(
                 db,
                 &title,
@@ -403,7 +477,7 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
                 duration,
                 fixed,
                 &pattern,
-                pattern_data.as_deref(),
+                pd.as_deref(),
                 &start_date,
                 end_date.as_deref(),
             )?;
@@ -417,6 +491,8 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
             fixed_start,
             pattern,
             pattern_data,
+            interval,
+            setpos,
             start_date,
             end_date,
         } => {
@@ -435,11 +511,12 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
                 None => current.fixed_start,
             };
             let new_pattern = pattern.unwrap_or(current.pattern);
-            let new_pattern_data = match pattern_data.as_deref() {
-                Some("none") => None,
-                Some(data) => Some(data),
-                None => current.pattern_data.as_deref(),
-            };
+            let new_pattern_data = build_pattern_data_for_edit(
+                pattern_data.as_deref(),
+                interval.as_deref(),
+                setpos.as_deref(),
+                current.pattern_data.as_deref(),
+            )?;
             let new_start_date = start_date.unwrap_or(current.start_date);
             let new_end_date = match end_date.as_deref() {
                 Some("none") => None,
@@ -455,7 +532,7 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
                 new_duration,
                 new_fixed_start,
                 &new_pattern,
-                new_pattern_data,
+                new_pattern_data.as_deref(),
                 &new_start_date,
                 new_end_date,
             )?;

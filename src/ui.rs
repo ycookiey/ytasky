@@ -1224,25 +1224,87 @@ fn draw_recurrence_form_modal(f: &mut Frame, app: &App, form: &RecurrenceFormSta
             }
         }
 
-        // monthly行: 日付入力（monthlyパターン時のみ値表示）
+        // monthly行: setpos=None は日付、setpos=Some は "第N <曜日>"
         if idx == 2 {
             spans.push(Span::raw("    "));
-            let day_text = if form.pattern != "monthly" || form.monthly_days.is_empty() {
-                "--".to_string()
+            if form.pattern != "monthly" {
+                spans.push(Span::styled("[--]", muted));
+                spans.push(Span::styled(" 日", muted));
+            } else if form.setpos.is_none() {
+                let day_text = if form.monthly_days.is_empty() {
+                    "--".to_string()
+                } else {
+                    format!("{:>2}", form.monthly_days[0])
+                };
+                let day_style = if in_pattern && is_current { active } else { normal };
+                spans.push(Span::styled(format!("[{day_text}]"), day_style));
+                spans.push(Span::styled(" 日", normal));
             } else {
-                format!("{:>2}", form.monthly_days[0])
-            };
-            let day_style = if in_pattern && is_current {
-                active
-            } else {
-                normal
-            };
-            spans.push(Span::styled(format!("[{day_text}]"), day_style));
-            spans.push(Span::styled(" 日", normal));
+                let weekday_label = day_labels
+                    .get((form.monthly_weekday as usize).saturating_sub(1))
+                    .copied()
+                    .unwrap_or("?");
+                spans.push(Span::styled(
+                    format!("第N {weekday_label}曜 (Setpos で設定)"),
+                    if in_pattern && is_current { active } else { normal },
+                ));
+            }
         }
 
         lines.push(Line::from(spans));
     }
+
+    // INTERVAL 行
+    lines.push(Line::from(""));
+    let interval_display = if form.interval_input.is_empty() {
+        "1".to_string()
+    } else {
+        form.interval_input.clone()
+    };
+    let interval_style = if form.field == RecurrenceFormField::Interval {
+        active
+    } else {
+        normal
+    };
+    let interval_unit = match form.pattern.as_str() {
+        "daily" => "日ごと",
+        "weekly" => "週ごと",
+        "monthly" => "月ごと",
+        _ => "ごと",
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  間隔  ", muted),
+        Span::styled(format!("[{interval_display:>3}]"), interval_style),
+        Span::styled(format!(" {interval_unit}"), normal),
+    ]));
+
+    // SETPOS 行 (monthly のみ意味があるが、常時表示で OFF 状態を見せる)
+    let setpos_display = match form.setpos {
+        None => "なし (BYMONTHDAY)".to_string(),
+        Some(-1) => "最終".to_string(),
+        Some(n) => format!("第{n}"),
+    };
+    let setpos_style = if form.field == RecurrenceFormField::Setpos {
+        active
+    } else if form.pattern == "monthly" {
+        normal
+    } else {
+        muted
+    };
+    let weekday_hint = if form.pattern == "monthly" && form.setpos.is_some() {
+        let weekday_label = day_labels
+            .get((form.monthly_weekday as usize).saturating_sub(1))
+            .copied()
+            .unwrap_or("?");
+        format!(" {weekday_label}曜 (1-7 で変更)")
+    } else {
+        String::new()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  曜順  ", muted),
+        Span::styled(format!("[{setpos_display:<18}]"), setpos_style),
+        Span::styled(weekday_hint, normal),
+    ]));
 
     // 終了日
     lines.push(Line::from(""));
@@ -1263,14 +1325,15 @@ fn draw_recurrence_form_modal(f: &mut Frame, app: &App, form: &RecurrenceFormSta
 
     // ヘルプ
     lines.push(Line::from(""));
-    let help = if form.field == RecurrenceFormField::Pattern {
-        match form.pattern.as_str() {
-            "weekly" => "j/k:選択 h/l:曜日移動 Space:切替 Tab:終了日 Enter:保存",
-            "monthly" => "j/k:選択 0-9:日入力 BS:削除 Tab:終了日 Enter:保存",
-            _ => "j/k:選択 Tab:終了日 Enter:保存",
-        }
-    } else {
-        "0-9/-:日付入力 j/k:±1日 h/l:±7日 n:なし Tab:戻る Enter:保存"
+    let help = match form.field {
+        RecurrenceFormField::Pattern => match form.pattern.as_str() {
+            "weekly" => "j/k:選択 h/l:曜日移動 Space:切替 Tab:次へ Enter:次へ",
+            "monthly" => "j/k:選択 0-9:日入力 BS:削除 Tab:次へ Enter:次へ",
+            _ => "j/k:選択 Tab:次へ Enter:次へ",
+        },
+        RecurrenceFormField::Interval => "0-9:数値入力 BS:削除 Tab:次へ Enter:次へ",
+        RecurrenceFormField::Setpos => "h/l/j/k:サイクル 1-7:曜日 Tab:次へ Enter:次へ",
+        RecurrenceFormField::EndDate => "0-9/-:日付入力 j/k:±1日 h/l:±7日 n:なし Enter:保存",
     };
     lines.push(Line::from(Span::styled(help, muted)));
 
