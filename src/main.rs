@@ -1,6 +1,8 @@
 mod app;
 mod cli;
 mod db;
+#[cfg(feature = "gcal")]
+mod gcal;
 mod history;
 mod init;
 #[cfg(feature = "mcp")]

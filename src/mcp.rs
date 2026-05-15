@@ -319,6 +319,22 @@ struct RecurrenceIdParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ImportGcalParams {
+    /// Start date (YYYY-MM-DD). Defaults to today.
+    #[serde(default)]
+    from_date: Option<String>,
+    /// End date (YYYY-MM-DD). Defaults to from_date + 30 days.
+    #[serde(default)]
+    to_date: Option<String>,
+    /// Calendar ID. Defaults to "primary".
+    #[serde(default)]
+    calendar_id: Option<String>,
+    /// Default ytasky category ID for imported tasks. Defaults to "6".
+    #[serde(default)]
+    category: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct HistoryParams {
     /// Number of entries to return (default: 20)
     #[serde(default)]
@@ -674,6 +690,55 @@ impl YtaskyMcpServer {
         let db = self.db.read().await;
         let entries = db::query_history(&db, params.table.as_deref(), limit).map_err(db_err)?;
         ok_json(json!({ "entries": entries }))
+    }
+
+    #[tool(
+        description = "Import Google Calendar events into ytasky tasks/recurrences for the given date range. Single events become fixed_start tasks; recurring events become recurrences when the RRULE is supported, otherwise their instances become individual tasks. Idempotent via external_id."
+    )]
+    async fn import_gcal(
+        &self,
+        Parameters(params): Parameters<ImportGcalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(feature = "gcal")]
+        {
+            use chrono::NaiveDate;
+            let from_str = params.from_date.unwrap_or_else(today);
+            let from = NaiveDate::parse_from_str(&from_str, "%Y-%m-%d").map_err(|_| {
+                McpError::invalid_params(format!("from_date 形式不正: {from_str}"), None)
+            })?;
+            let to = match params.to_date {
+                Some(s) => NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(|_| {
+                    McpError::invalid_params(format!("to_date 形式不正: {s}"), None)
+                })?,
+                None => from + chrono::Duration::days(30),
+            };
+            let opts = crate::gcal::import::ImportOptions {
+                calendar_id: params.calendar_id.unwrap_or_else(|| "primary".into()),
+                category_id: params.category.unwrap_or_else(|| "6".into()),
+            };
+            let mut db = self.db.write().await;
+            let summary =
+                crate::gcal::import::import_range(&mut db, from, to, &opts).map_err(db_err)?;
+            ok_json(json!({
+                "ok": true,
+                "from": from.format("%Y-%m-%d").to_string(),
+                "to": to.format("%Y-%m-%d").to_string(),
+                "created": summary.created,
+                "updated": summary.updated,
+                "skipped": summary.skipped,
+                "skipped_exdates": summary.skipped_exdates,
+                "skipped_rdates": summary.skipped_rdates,
+                "errors": summary.errors,
+            }))
+        }
+        #[cfg(not(feature = "gcal"))]
+        {
+            let _ = params;
+            Err(McpError::invalid_params(
+                "gcal feature is not enabled in this build",
+                None,
+            ))
+        }
     }
 }
 

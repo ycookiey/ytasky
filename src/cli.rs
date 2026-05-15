@@ -220,6 +220,28 @@ pub enum Commands {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Google Calendar からイベントを import
+    #[cfg(feature = "gcal")]
+    ImportGcal {
+        /// 開始日 (YYYY-MM-DD, デフォルト: 今日)
+        #[arg(long)]
+        from: Option<String>,
+        /// 終了日 (YYYY-MM-DD, デフォルト: from + 30 日)
+        #[arg(long)]
+        to: Option<String>,
+        /// カレンダー ID (デフォルト: primary)
+        #[arg(long)]
+        calendar: Option<String>,
+        /// 既定カテゴリ ID (デフォルト: 6 = 身支度・自由時間)
+        #[arg(long)]
+        category: Option<String>,
+    },
+    /// Google Calendar への OAuth ログインを実行
+    #[cfg(feature = "gcal")]
+    GcalLogin,
+    /// 保存済み Google Calendar token を削除
+    #[cfg(feature = "gcal")]
+    GcalLogout,
 }
 
 fn today() -> String {
@@ -558,6 +580,44 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
         Commands::Init { .. } => {
             // Init は main.rs から直接呼ぶ (rusqlite Connection 不要)
             unreachable!();
+        }
+        #[cfg(feature = "gcal")]
+        Commands::ImportGcal { from, to, calendar, category } => {
+            use chrono::NaiveDate;
+            let from_str = from.unwrap_or_else(today);
+            let from_date = NaiveDate::parse_from_str(&from_str, "%Y-%m-%d")
+                .with_context(|| format!("--from の形式不正: {from_str}"))?;
+            let to_date = match to {
+                Some(s) => NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                    .with_context(|| format!("--to の形式不正: {s}"))?,
+                None => from_date + chrono::Duration::days(30),
+            };
+            let opts = crate::gcal::import::ImportOptions {
+                calendar_id: calendar.unwrap_or_else(|| "primary".into()),
+                category_id: category.unwrap_or_else(|| "6".into()),
+            };
+            let summary = crate::gcal::import::import_range(db, from_date, to_date, &opts)?;
+            print_json(&serde_json::json!({
+                "ok": true,
+                "from": from_date.format("%Y-%m-%d").to_string(),
+                "to": to_date.format("%Y-%m-%d").to_string(),
+                "created": summary.created,
+                "updated": summary.updated,
+                "skipped": summary.skipped,
+                "skipped_exdates": summary.skipped_exdates,
+                "skipped_rdates": summary.skipped_rdates,
+                "errors": summary.errors,
+            }));
+        }
+        #[cfg(feature = "gcal")]
+        Commands::GcalLogin => {
+            crate::gcal::auth::login()?;
+            print_json(&serde_json::json!({ "ok": true }));
+        }
+        #[cfg(feature = "gcal")]
+        Commands::GcalLogout => {
+            crate::gcal::auth::logout()?;
+            print_json(&serde_json::json!({ "ok": true }));
         }
     }
     Ok(())
