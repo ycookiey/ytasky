@@ -107,6 +107,10 @@ fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
         InputMode::BacklogSelect { .. } => {
             vec![("j/k", "移動"), ("Enter", "挿入"), ("Esc", "キャンセル")]
         }
+        #[cfg(feature = "gcal")]
+        InputMode::GcalConfirm => {
+            vec![("Enter", "実行"), ("Esc", "キャンセル")]
+        }
         InputMode::Normal => match app.view_mode {
             ViewMode::ReportView => vec![("q/Esc", "閉じる")],
             ViewMode::TimelineView => vec![
@@ -959,7 +963,37 @@ fn draw_modal_if_needed(f: &mut Frame, app: &App) {
         }
         InputMode::BacklogSelect { .. } => {}
         InputMode::RecurrenceForm(form) => draw_recurrence_form_modal(f, app, form),
+        #[cfg(feature = "gcal")]
+        InputMode::GcalConfirm => draw_gcal_confirm_modal(f),
     }
+}
+
+#[cfg(feature = "gcal")]
+fn draw_gcal_confirm_modal(f: &mut Frame) {
+    let area = centered_rect(60, 28, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Google Calendar Import ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+    f.render_widget(block, area);
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    let muted = Style::default().fg(Color::DarkGray);
+    let lines = vec![
+        Line::from("Google Calendar から今日〜+30日のイベントを import します。"),
+        Line::from("対象: primary カレンダー / 既定カテゴリ"),
+        Line::from(""),
+        Line::from("詳細指定や別カレンダーは `ytasky import-gcal --calendar ...` を使用。"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter: 実行    Esc: キャンセル",
+            muted,
+        )),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 fn draw_task_form_modal(f: &mut Frame, app: &App, form: &TaskFormState) {

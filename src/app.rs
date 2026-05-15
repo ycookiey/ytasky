@@ -122,6 +122,8 @@ pub enum InputMode {
         cursor: usize,
     },
     RecurrenceForm(RecurrenceFormState),
+    #[cfg(feature = "gcal")]
+    GcalConfirm,
 }
 
 enum FormAction {
@@ -277,6 +279,11 @@ impl App {
                 if self.view_mode != ViewMode::TableView {
                     self.focus = PanelFocus::Table;
                 }
+                return;
+            }
+            #[cfg(feature = "gcal")]
+            KeyCode::Char('G') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.input_mode = InputMode::GcalConfirm;
                 return;
             }
             _ => {}
@@ -623,8 +630,38 @@ impl App {
                     }
                 }
             }
+            #[cfg(feature = "gcal")]
+            InputMode::GcalConfirm => match key.code {
+                KeyCode::Esc => {
+                    self.status_message = None;
+                }
+                KeyCode::Enter => {
+                    self.status_message = Some("Importing from Google Calendar...".to_string());
+                    if let Err(err) = self.run_gcal_import() {
+                        self.status_message = Some(format!("GCal import エラー: {err}"));
+                    }
+                }
+                _ => self.input_mode = InputMode::GcalConfirm,
+            },
             InputMode::Normal => {}
         }
+    }
+
+    #[cfg(feature = "gcal")]
+    fn run_gcal_import(&mut self) -> anyhow::Result<()> {
+        use chrono::NaiveDate;
+        let today: NaiveDate = chrono::Local::now().date_naive();
+        let to = today + chrono::Duration::days(30);
+        let opts = crate::gcal::import::ImportOptions::default();
+        let summary = crate::gcal::import::import_range(&mut self.db, today, to, &opts)?;
+        self.refresh_tasks()?;
+        self.refresh_recurrences()?;
+        let msg = format!(
+            "GCal: {} created / {} updated / {} skipped",
+            summary.created, summary.updated, summary.skipped
+        );
+        self.status_message = Some(msg);
+        Ok(())
     }
 
     fn handle_task_form_key(&mut self, key: KeyEvent, form: &mut TaskFormState) -> FormAction {
