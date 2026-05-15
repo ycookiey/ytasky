@@ -154,6 +154,13 @@ pub struct App {
     pub input_mode: InputMode,
     pub status_message: Option<String>,
     undo_manager: UndoManager,
+    #[cfg(feature = "gcal")]
+    gcal_sync_rx: Option<std::sync::mpsc::Receiver<GcalSyncMessage>>,
+}
+
+#[cfg(feature = "gcal")]
+pub(crate) struct GcalSyncMessage {
+    pub result: anyhow::Result<crate::gcal::import::ImportSummary>,
 }
 
 impl App {
@@ -216,9 +223,42 @@ impl App {
             input_mode: InputMode::Normal,
             status_message: None,
             undo_manager: UndoManager::new(),
+            #[cfg(feature = "gcal")]
+            gcal_sync_rx: spawn_gcal_lazy_sync(),
         };
         app.refresh_recurrences()?;
         Ok(app)
+    }
+
+    /// lazy sync スレッドからの完了通知を取り込み、status_message に反映する。
+    /// メインイベントループから定期的に呼ぶ。
+    pub fn poll_background_sync(&mut self) {
+        #[cfg(feature = "gcal")]
+        {
+            let Some(rx) = self.gcal_sync_rx.as_ref() else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(msg) => {
+                    self.status_message = Some(match msg.result {
+                        Ok(s) => format!(
+                            "GCal auto-sync: {} created / {} updated / {} skipped",
+                            s.created, s.updated, s.skipped
+                        ),
+                        Err(e) => format!("GCal auto-sync エラー: {e}"),
+                    });
+                    // メインスレッドの DB 表示を最新化
+                    let _ = self.refresh_tasks();
+                    let _ = self.refresh_recurrences();
+                    self.gcal_sync_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // スレッドが panic で終了 → 諦め
+                    self.gcal_sync_rx = None;
+                }
+            }
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -2487,6 +2527,43 @@ fn round_up_to_next_15_minutes(minutes: i32) -> i32 {
     } else {
         (normalized + (15 - remainder)) % DAY_MINUTES
     }
+}
+
+/// 起動時 lazy sync を std::thread::spawn で起動する。
+/// - `gcal_token.json` が無ければ何もしない (Receiver は None)
+/// - `~/.config/ytasky/config.json` で `gcal_auto_sync: false` なら無効
+/// - 別ハンドルで `Database::open` するため、ybasey の write 排他に従う
+#[cfg(feature = "gcal")]
+fn spawn_gcal_lazy_sync() -> Option<std::sync::mpsc::Receiver<GcalSyncMessage>> {
+    let cfg = crate::gcal::load_config().unwrap_or_default();
+    if !cfg.gcal_auto_sync {
+        return None;
+    }
+    let config_dir = crate::recurrence::config_dir().ok()?;
+    if !config_dir.join("gcal_token.json").exists() {
+        return None;
+    }
+    let days = cfg.gcal_auto_sync_days;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("ytasky-gcal-lazy-sync".into())
+        .spawn(move || {
+            let result = run_lazy_sync(days);
+            let _ = tx.send(GcalSyncMessage { result });
+        })
+        .ok()?;
+    Some(rx)
+}
+
+#[cfg(feature = "gcal")]
+fn run_lazy_sync(days: u32) -> anyhow::Result<crate::gcal::import::ImportSummary> {
+    let data_dir = crate::db::data_dir()?;
+    let mut db = ybasey::Database::open(&data_dir, Some("ytasky-gcal-sync"))?;
+    crate::init::migrate_schema(&mut db)?;
+    let today = chrono::Local::now().date_naive();
+    let to = today + chrono::Duration::days(days as i64);
+    let opts = crate::gcal::import::ImportOptions::default();
+    crate::gcal::import::import_range(&mut db, today, to, &opts)
 }
 
 /// BYSETPOS のサイクル: None → 1 → 2 → 3 → 4 → 5 → -1 → None

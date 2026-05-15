@@ -83,12 +83,14 @@ fn run_tui() -> Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        if event::poll(Duration::from_secs(10))?
+        if event::poll(Duration::from_millis(500))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
             app.handle_key(key);
         }
+        // バックグラウンド (gcal lazy sync 等) からの結果を取り込む
+        app.poll_background_sync();
 
         if app.should_quit {
             break;
