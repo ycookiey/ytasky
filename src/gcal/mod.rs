@@ -19,6 +19,16 @@ pub mod rrule;
 pub mod types;
 pub mod tz;
 
+/// 長大なレスポンス本文をエラーメッセージに乗せる際の安全な truncate。
+/// auth / api 両方で OAuth レスポンスや API エラー body の表示に使う。
+pub(crate) fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}... ({} 文字省略)", s.chars().count() - max)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GcalConfig {
     /// TUI 起動時にバックグラウンドで GCal を同期するか (default: true)

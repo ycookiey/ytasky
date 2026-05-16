@@ -248,12 +248,13 @@ impl App {
                         Err(e) => format!("GCal auto-sync エラー: {e}"),
                     });
                     // 別スレッドが書き込んだ consolidated log を読み直して
-                    // メインスレッドの in-memory 状態を最新化する
+                    // メインスレッドの in-memory 状態を最新化する。
+                    // refresh_tasks が内部で refresh_recurrences も呼ぶので
+                    // ここでは tasks 側だけ更新すれば十分。
                     if let Err(e) = self.db.refresh() {
                         eprintln!("ytasky: db refresh after gcal sync failed: {e}");
                     }
                     let _ = self.refresh_tasks();
-                    let _ = self.refresh_recurrences();
                     self.gcal_sync_rx = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}

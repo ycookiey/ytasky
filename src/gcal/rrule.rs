@@ -100,17 +100,29 @@ pub fn parse_recurrence_rules(
         .get("FREQ")
         .ok_or_else(|| RruleError::Invalid("FREQ が無い".into()))?
         .as_str();
-    let interval_raw: Option<u8> = parts
+    // INTERVAL は RFC 5545 上 INTEGER (1..) で、ytasky では pattern_data に
+    // Option<u8> で保存する。u32 でパースして RFC 範囲を許容しつつ、
+    // ytasky 内部表現に収まらない値は Unsupported として弾く。
+    let interval_raw: Option<u32> = parts
         .get("INTERVAL")
-        .map(|v| v.parse::<u8>())
+        .map(|v| v.parse::<u32>())
         .transpose()
         .map_err(|_| RruleError::Invalid("INTERVAL は数値".into()))?;
     // INTERVAL=0 は RFC 5545 違反。サイレントに 1 と解釈せず明示的に弾く
     if interval_raw == Some(0) {
         return Err(RruleError::Invalid("INTERVAL=0 は不正".into()));
     }
-    // pattern_data 上では interval=1 を None として持つ (DB に書かない)
-    let interval: Option<u8> = interval_raw.filter(|n| *n != 1);
+    // pattern_data 上では interval=1 を None として持つ (DB に書かない)。
+    // 内部表現 (u8) に収まらないものは Unsupported を返してフォールバックさせる。
+    let interval: Option<u8> = match interval_raw {
+        None | Some(1) => None,
+        Some(n) if n <= u8::MAX as u32 => Some(n as u8),
+        Some(n) => {
+            return Err(RruleError::Unsupported(format!(
+                "INTERVAL={n} (ytasky の interval は 1..=255 のみ対応)"
+            )));
+        }
+    };
     let count: Option<u32> = parts
         .get("COUNT")
         .map(|v| v.parse::<u32>())
@@ -135,12 +147,9 @@ pub fn parse_recurrence_rules(
         return Err(RruleError::Unsupported(format!("FREQ={freq} BYWEEKNO/BYYEARDAY")));
     }
 
-    let interval_step: u32 = parts
-        .get("INTERVAL")
-        .map(|v| v.parse::<u32>())
-        .transpose()
-        .map_err(|_| RruleError::Invalid("INTERVAL は数値".into()))?
-        .unwrap_or(1);
+    // compute_end_from_count 用の数値 (COUNT 計算で interval=1 を 0 にしないため
+    // unwrap_or(1) を適用)。重複パースを避けて interval_raw を再利用する。
+    let interval_step: u32 = interval_raw.unwrap_or(1);
 
     match freq {
         "DAILY" => {
@@ -631,5 +640,26 @@ mod tests {
     fn interval_1_normalized_to_none() {
         let r = parse(&["RRULE:FREQ=DAILY;INTERVAL=1"], d(2026, 5, 16)).unwrap();
         assert_eq!(r.pattern_data.interval, None);
+    }
+
+    #[test]
+    fn interval_above_u8_max_is_unsupported() {
+        // RFC 5545 上は 256 も有効値だが ytasky の u8 表現に収まらないので Unsupported
+        let err = parse(
+            &["RRULE:FREQ=DAILY;INTERVAL=256"],
+            d(2026, 5, 16),
+        )
+        .unwrap_err();
+        match err {
+            RruleError::Unsupported(msg) => assert!(msg.contains("INTERVAL=256")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interval_u8_boundary_is_supported() {
+        // u8::MAX = 255 はちょうど収まる
+        let r = parse(&["RRULE:FREQ=DAILY;INTERVAL=255"], d(2026, 5, 16)).unwrap();
+        assert_eq!(r.pattern_data.interval, Some(255));
     }
 }

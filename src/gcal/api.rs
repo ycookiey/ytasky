@@ -88,7 +88,7 @@ pub fn list_events(
         if !status.is_success() {
             bail!(
                 "events.list エラー {status}: {}",
-                truncate_for_log(&body, 200)
+                crate::gcal::truncate_for_log(&body, 200)
             );
         }
         let parsed: EventList = serde_json::from_str(&body)
@@ -157,7 +157,7 @@ pub fn list_event_instances(
         if !status.is_success() {
             bail!(
                 "events.instances エラー {status}: {}",
-                truncate_for_log(&body, 200)
+                crate::gcal::truncate_for_log(&body, 200)
             );
         }
         let parsed: EventList = serde_json::from_str(&body)
@@ -196,20 +196,11 @@ pub fn list_calendars(access_token: &str) -> Result<CalendarList> {
     if !status.is_success() {
         bail!(
             "calendarList.list エラー {status}: {}",
-            truncate_for_log(&body, 200)
+            crate::gcal::truncate_for_log(&body, 200)
         );
     }
     serde_json::from_str::<CalendarList>(&body)
         .with_context(|| format!("calendarList.list JSON 解析失敗 (status={status})"))
-}
-
-/// 長大なレスポンス本文をエラーメッセージに乗せる際の安全な truncate。
-fn truncate_for_log(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max).collect();
-    format!("{head}... ({} 文字省略)", s.chars().count() - max)
 }
 
 /// path segment 用の percent encoding。

@@ -23,7 +23,7 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 const BUNDLED_CLIENT_ID: Option<&str> = option_env!("YTASKY_GCAL_CLIENT_ID");
 const BUNDLED_CLIENT_SECRET: Option<&str> = option_env!("YTASKY_GCAL_CLIENT_SECRET");
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Credential {
     pub client_id: String,
     pub client_secret: String,
@@ -31,6 +31,17 @@ pub struct Credential {
     pub auth_uri: String,
     #[serde(default = "default_token_uri")]
     pub token_uri: String,
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credential")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("auth_uri", &self.auth_uri)
+            .field("token_uri", &self.token_uri)
+            .finish()
+    }
 }
 
 fn default_auth_uri() -> String {
@@ -41,12 +52,23 @@ fn default_token_uri() -> String {
     TOKEN_URI_DEFAULT.to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Token {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub expires_at: i64,
     pub scope: String,
+}
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Token")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
+            .field("expires_at", &self.expires_at)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 impl Token {
@@ -366,7 +388,7 @@ fn respond_plain(request: tiny_http::Request, body: &str) {
 
 // ---- token 交換 / refresh -----------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
     #[serde(default)]
@@ -374,6 +396,17 @@ struct TokenResponse {
     expires_in: i64,
     #[serde(default)]
     scope: Option<String>,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 fn exchange_code(
@@ -415,7 +448,7 @@ fn post_token(token_uri: &str, params: &[(&str, &str)]) -> Result<Token> {
         // 念のため先頭 200 文字に truncate して長大な漏洩を防ぐ
         bail!(
             "token endpoint エラー {status}: {}",
-            truncate_for_log(&body, 200)
+            crate::gcal::truncate_for_log(&body, 200)
         );
     }
     // 200 OK の body には access_token / refresh_token が平文で含まれる。
@@ -468,15 +501,6 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         diff |= a[i] ^ b[i];
     }
     diff == 0
-}
-
-/// 長大なレスポンス本文をエラーメッセージに乗せる際の安全な truncate。
-fn truncate_for_log(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max).collect();
-    format!("{head}... ({} 文字省略)", s.chars().count() - max)
 }
 
 // ---- ロック -------------------------------------------------------------------
@@ -590,6 +614,35 @@ mod tests {
         assert!(t.is_expired(1000));
         // 31 秒以上前ならまだ有効
         assert!(!t.is_expired(969));
+    }
+
+    #[test]
+    fn credential_debug_masks_secret() {
+        let cred = Credential {
+            client_id: "PUBLIC_ID".into(),
+            client_secret: "SUPER_SECRET".into(),
+            auth_uri: AUTH_URI_DEFAULT.into(),
+            token_uri: TOKEN_URI_DEFAULT.into(),
+        };
+        let s = format!("{cred:?}");
+        assert!(s.contains("PUBLIC_ID"));
+        assert!(!s.contains("SUPER_SECRET"));
+        assert!(s.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn token_debug_masks_secret() {
+        let token = Token {
+            access_token: "AT_SECRET".into(),
+            refresh_token: Some("RT_SECRET".into()),
+            expires_at: 1747400000,
+            scope: SCOPE.into(),
+        };
+        let s = format!("{token:?}");
+        assert!(!s.contains("AT_SECRET"));
+        assert!(!s.contains("RT_SECRET"));
+        assert!(s.contains("[REDACTED]"));
+        assert!(s.contains("1747400000"));
     }
 
     #[test]
