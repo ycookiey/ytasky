@@ -610,14 +610,9 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
             }));
         }
         #[cfg(feature = "gcal")]
-        Commands::GcalLogin => {
-            crate::gcal::auth::login()?;
-            print_json(&serde_json::json!({ "ok": true }));
-        }
-        #[cfg(feature = "gcal")]
-        Commands::GcalLogout => {
-            crate::gcal::auth::logout()?;
-            print_json(&serde_json::json!({ "ok": true }));
+        Commands::GcalLogin | Commands::GcalLogout => {
+            // DB 不要のため main.rs で db::open() を経由せず処理する
+            unreachable!();
         }
     }
     Ok(())

@@ -35,6 +35,20 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
         Some(cli::Commands::Init { force, yes }) => init::run_init(force, yes),
+        // gcal-login / gcal-logout は OAuth token のみ扱い DB を必要としない。
+        // 未 init 環境でも認証できるよう db::open() を経由しない。
+        #[cfg(feature = "gcal")]
+        Some(cli::Commands::GcalLogin) => {
+            gcal::auth::login()?;
+            println!("{}", serde_json::json!({ "ok": true }));
+            Ok(())
+        }
+        #[cfg(feature = "gcal")]
+        Some(cli::Commands::GcalLogout) => {
+            gcal::auth::logout()?;
+            println!("{}", serde_json::json!({ "ok": true }));
+            Ok(())
+        }
         Some(cmd) => {
             let mut db = db::open()?;
             cli::run(cmd, &mut db)
