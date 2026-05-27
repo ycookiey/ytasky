@@ -93,6 +93,19 @@ fn draw_title_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(bar, area);
 }
 
+/// view 別テーブル → 共通テーブルの順で、表示対象 (hint=Some) のキー一覧を集める。
+/// keymap の単一テーブルから生成するため、ハンドラに追加したキーが自動で
+/// 下部バーにも現れる (表示漏れが起きない)。
+fn collect_hints(
+    view: &[crate::app::Binding],
+    common: &[crate::app::Binding],
+) -> Vec<(&'static str, &'static str)> {
+    view.iter()
+        .chain(common.iter())
+        .filter_map(|b| b.hint)
+        .collect()
+}
+
 fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
     let items: Vec<(&str, &str)> = match &app.input_mode {
         InputMode::TaskForm(_) => {
@@ -113,41 +126,13 @@ fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
         }
         InputMode::Normal => match app.view_mode {
             ViewMode::ReportView => vec![("q/Esc", "閉じる")],
-            ViewMode::TimelineView => vec![
-                ("j/k", "移動"),
-                ("h/l", "日"),
-                ("a", "追加"),
-                ("e", "編集"),
-                ("d", "削除"),
-                ("J/K", "並替"),
-                ("Space", "実績"),
-                ("t", "Table"),
-                ("r", "Report"),
-                ("1-9", "日数"),
-                #[cfg(feature = "gcal")]
-                ("G", "GCal"),
-                ("q", "終了"),
-            ],
+            ViewMode::TimelineView => {
+                collect_hints(crate::app::TIMELINE_BINDINGS, crate::app::COMMON_BINDINGS)
+            }
             ViewMode::TableView => match app.focus {
-                PanelFocus::Table => vec![
-                    ("j/k", "移動"),
-                    ("h/l", "日"),
-                    ("a", "追加"),
-                    ("e", "編集"),
-                    ("d", "削除"),
-                    ("J/K", "並替"),
-                    ("Space", "実績"),
-                    ("Tab", "BL"),
-                    ("B", "→BL"),
-                    ("p", "←BL"),
-                    ("t", "TL"),
-                    ("r", "Report"),
-                    ("1-9", "日数"),
-                    ("u/^r", "undo/redo"),
-                    #[cfg(feature = "gcal")]
-                    ("G", "GCal"),
-                    ("q", "終了"),
-                ],
+                PanelFocus::Table => {
+                    collect_hints(crate::app::TABLE_BINDINGS, crate::app::COMMON_BINDINGS)
+                }
                 PanelFocus::Backlog => vec![
                     ("j/k", "移動"),
                     ("Enter", "挿入"),

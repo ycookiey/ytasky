@@ -276,181 +276,72 @@ impl App {
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
         if self.view_mode == ViewMode::ReportView {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    self.view_mode = ViewMode::TableView;
-                    return;
-                }
-                _ => return,
+            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                self.view_mode = ViewMode::TableView;
             }
+            return;
         }
 
-        match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('u') => {
-                if let Err(err) = self.undo() {
-                    self.status_message = Some(err.to_string());
-                }
-                return;
-            }
-            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Err(err) = self.undo() {
-                    self.status_message = Some(err.to_string());
-                }
-                return;
-            }
-            KeyCode::Char('r') if key.modifiers.is_empty() => {
-                self.view_mode = ViewMode::ReportView;
-                return;
-            }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Err(err) = self.redo() {
-                    self.status_message = Some(err.to_string());
-                }
-                return;
-            }
-            KeyCode::Char(c @ '1'..='9') if key.modifiers.is_empty() => {
-                if let Err(err) = self.set_view_days((c as usize) - ('0' as usize)) {
-                    self.status_message = Some(err.to_string());
-                }
-                return;
-            }
-            KeyCode::Char('t') => {
-                self.view_mode = match self.view_mode {
-                    ViewMode::TableView => ViewMode::TimelineView,
-                    ViewMode::TimelineView => ViewMode::TableView,
-                    ViewMode::ReportView => ViewMode::TableView,
-                };
-                if self.view_mode != ViewMode::TableView {
-                    self.focus = PanelFocus::Table;
-                }
-                return;
-            }
-            #[cfg(feature = "gcal")]
-            KeyCode::Char('G') if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.input_mode = InputMode::GcalConfirm;
-                return;
-            }
-            _ => {}
+        // 共通キー (view 横断)。ハンドラと下部バー表示は keymap の単一テーブルから
+        // 生成されるため、ここに 1 行足せば両方に反映される。
+        if dispatch_binding(self, &key, COMMON_BINDINGS) {
+            return;
         }
 
-        if self.view_mode == ViewMode::TableView {
-            match self.focus {
-                PanelFocus::Table => self.handle_table_panel_key(key),
-                PanelFocus::Backlog => self.handle_backlog_panel_key(key),
+        match (self.view_mode, self.focus) {
+            (ViewMode::TableView, PanelFocus::Table) => {
+                dispatch_binding(self, &key, TABLE_BINDINGS);
             }
-        } else if self.view_mode == ViewMode::TimelineView {
-            self.handle_timeline_key(key);
-        }
-    }
-
-    fn handle_table_panel_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                let max_row = self.cursor_tasks().len().saturating_sub(1);
-                if self.row_cursor < max_row {
-                    self.row_cursor += 1;
-                }
-                self.preferred_row = self.row_cursor;
+            (ViewMode::TableView, PanelFocus::Backlog) => {
+                self.handle_backlog_panel_key(key);
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.row_cursor > 0 {
-                    self.row_cursor -= 1;
-                }
-                self.preferred_row = self.row_cursor;
-            }
-            KeyCode::Char('h') => {
-                if let Err(err) = self.move_column_left() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char('l') => {
-                if let Err(err) = self.move_column_right() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char('a') => self.open_add_task_form(FormTarget::Schedule),
-            KeyCode::Char('e') => self.open_edit_task_form(FormTarget::Schedule),
-            KeyCode::Char('d') => self.open_delete_confirm(),
-            KeyCode::Char('R') => self.open_recurrence_form(),
-            KeyCode::Char('J') => {
-                if let Err(err) = self.move_task_down() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char('K') => {
-                if let Err(err) = self.move_task_up() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char(' ') => {
-                if let Err(err) = self.toggle_actual_for_selected() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Tab => {
-                self.focus = PanelFocus::Backlog;
-            }
-            KeyCode::Char('B') => {
-                if let Err(err) = self.move_selected_task_to_backlog() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char('p') => {
-                let cursor = self
-                    .backlog_cursor
-                    .min(self.backlog_tasks.len().saturating_sub(1));
-                self.input_mode = InputMode::BacklogSelect { cursor };
+            (ViewMode::TimelineView, _) => {
+                dispatch_binding(self, &key, TIMELINE_BINDINGS);
             }
             _ => {}
         }
     }
 
-    fn handle_timeline_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                let max_row = self.cursor_tasks().len().saturating_sub(1);
-                if self.row_cursor < max_row {
-                    self.row_cursor += 1;
-                }
-                self.preferred_row = self.row_cursor;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.row_cursor > 0 {
-                    self.row_cursor -= 1;
-                }
-                self.preferred_row = self.row_cursor;
-            }
-            KeyCode::Char('h') => {
-                if let Err(err) = self.move_column_left() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char('l') => {
-                if let Err(err) = self.move_column_right() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char('a') => self.open_add_task_form(FormTarget::Schedule),
-            KeyCode::Char('e') => self.open_edit_task_form(FormTarget::Schedule),
-            KeyCode::Char('d') => self.open_delete_confirm(),
-            KeyCode::Char('J') => {
-                if let Err(err) = self.move_task_down() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char('K') => {
-                if let Err(err) = self.move_task_up() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            KeyCode::Char(' ') => {
-                if let Err(err) = self.toggle_actual_for_selected() {
-                    self.status_message = Some(err.to_string());
-                }
-            }
-            _ => {}
+    // ---- keymap action から呼ぶ薄い helper -------------------------------------
+
+    fn select_row_down(&mut self) {
+        let max_row = self.cursor_tasks().len().saturating_sub(1);
+        if self.row_cursor < max_row {
+            self.row_cursor += 1;
         }
+        self.preferred_row = self.row_cursor;
+    }
+
+    fn select_row_up(&mut self) {
+        if self.row_cursor > 0 {
+            self.row_cursor -= 1;
+        }
+        self.preferred_row = self.row_cursor;
+    }
+
+    /// Result を返す操作の結果を status_message に反映する共通処理。
+    fn report_err(&mut self, result: anyhow::Result<()>) {
+        if let Err(err) = result {
+            self.status_message = Some(err.to_string());
+        }
+    }
+
+    fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::TableView => ViewMode::TimelineView,
+            ViewMode::TimelineView => ViewMode::TableView,
+            ViewMode::ReportView => ViewMode::TableView,
+        };
+        if self.view_mode != ViewMode::TableView {
+            self.focus = PanelFocus::Table;
+        }
+    }
+
+    fn open_backlog_select(&mut self) {
+        let cursor = self
+            .backlog_cursor
+            .min(self.backlog_tasks.len().saturating_sub(1));
+        self.input_mode = InputMode::BacklogSelect { cursor };
     }
 
     fn handle_backlog_panel_key(&mut self, key: KeyEvent) {
@@ -2584,6 +2475,266 @@ fn run_lazy_sync(days: u32) -> anyhow::Result<crate::gcal::import::ImportSummary
     let opts = crate::gcal::import::ImportOptions::default();
     crate::gcal::import::import_range(&mut db, today, to, &opts)
 }
+
+// ---- keymap: キーバインドの single source ------------------------------------
+//
+// 1 つの Binding にキー判定 (matcher)・下部バー表示 (hint)・処理 (action) を
+// まとめ、handle_normal_key の dispatch と draw_keybindings_bar の表示生成が
+// 同じテーブルを参照する。新しいショートカットはテーブルに 1 行足すだけで
+// ハンドラと下部バー表示の両方に反映され、表示漏れが構造的に起きない。
+//
+// 対象は Normal モードの共通キー / TableView / TimelineView。Backlog パネルや
+// Form/Modal 系はテキスト入力や tab 分岐を含むため従来の match を維持する。
+
+pub(crate) struct Binding {
+    pub matcher: fn(&KeyEvent) -> bool,
+    /// 下部バー表示 (キー表記, 説明)。None なら表示しない (内部キー)。
+    pub hint: Option<(&'static str, &'static str)>,
+    pub action: fn(&mut App, &KeyEvent),
+}
+
+/// table 内の最初にマッチした Binding の action を実行し、true を返す。
+/// マッチしなければ false。
+fn dispatch_binding(app: &mut App, key: &KeyEvent, table: &[Binding]) -> bool {
+    for b in table {
+        if (b.matcher)(key) {
+            (b.action)(app, key);
+            return true;
+        }
+    }
+    false
+}
+
+/// 共通キー (view 横断、ReportView を除く Normal モード)。
+pub(crate) const COMMON_BINDINGS: &[Binding] = &[
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('q'),
+        hint: Some(("q", "終了")),
+        action: |a, _| a.should_quit = true,
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('u'),
+        hint: Some(("u/^r", "undo/redo")),
+        action: |a, _| {
+            let r = a.undo();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| {
+            k.code == KeyCode::Char('z') && k.modifiers.contains(KeyModifiers::CONTROL)
+        },
+        hint: None,
+        action: |a, _| {
+            let r = a.undo();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| {
+            k.code == KeyCode::Char('r') && k.modifiers.contains(KeyModifiers::CONTROL)
+        },
+        hint: None,
+        action: |a, _| {
+            let r = a.redo();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('r') && k.modifiers.is_empty(),
+        hint: Some(("r", "Report")),
+        action: |a, _| a.view_mode = ViewMode::ReportView,
+    },
+    Binding {
+        matcher: |k| matches!(k.code, KeyCode::Char('1'..='9')) && k.modifiers.is_empty(),
+        hint: Some(("1-9", "日数")),
+        action: |a, k| {
+            if let KeyCode::Char(c) = k.code {
+                let r = a.set_view_days((c as usize) - ('0' as usize));
+                a.report_err(r);
+            }
+        },
+    },
+    #[cfg(feature = "gcal")]
+    Binding {
+        matcher: |k| {
+            k.code == KeyCode::Char('G') && k.modifiers.contains(KeyModifiers::SHIFT)
+        },
+        hint: Some(("G", "GCal")),
+        action: |a, _| a.input_mode = InputMode::GcalConfirm,
+    },
+];
+
+/// TableView (Table focus) 専用キー。
+pub(crate) const TABLE_BINDINGS: &[Binding] = &[
+    Binding {
+        matcher: |k| matches!(k.code, KeyCode::Char('j') | KeyCode::Down),
+        hint: Some(("j/k", "移動")),
+        action: |a, _| a.select_row_down(),
+    },
+    Binding {
+        matcher: |k| matches!(k.code, KeyCode::Char('k') | KeyCode::Up),
+        hint: None,
+        action: |a, _| a.select_row_up(),
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('h'),
+        hint: Some(("h/l", "日")),
+        action: |a, _| {
+            let r = a.move_column_left();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('l'),
+        hint: None,
+        action: |a, _| {
+            let r = a.move_column_right();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('a'),
+        hint: Some(("a", "追加")),
+        action: |a, _| a.open_add_task_form(FormTarget::Schedule),
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('e'),
+        hint: Some(("e", "編集")),
+        action: |a, _| a.open_edit_task_form(FormTarget::Schedule),
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('d'),
+        hint: Some(("d", "削除")),
+        action: |a, _| a.open_delete_confirm(),
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('R'),
+        hint: Some(("R", "繰返")),
+        action: |a, _| a.open_recurrence_form(),
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('J'),
+        hint: Some(("J/K", "並替")),
+        action: |a, _| {
+            let r = a.move_task_down();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('K'),
+        hint: None,
+        action: |a, _| {
+            let r = a.move_task_up();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char(' '),
+        hint: Some(("Space", "実績")),
+        action: |a, _| {
+            let r = a.toggle_actual_for_selected();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Tab,
+        hint: Some(("Tab", "BL")),
+        action: |a, _| a.focus = PanelFocus::Backlog,
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('B'),
+        hint: Some(("B", "→BL")),
+        action: |a, _| {
+            let r = a.move_selected_task_to_backlog();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('p'),
+        hint: Some(("p", "←BL")),
+        action: |a, _| a.open_backlog_select(),
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('t'),
+        hint: Some(("t", "TL")),
+        action: |a, _| a.toggle_view_mode(),
+    },
+];
+
+/// TimelineView 専用キー。
+pub(crate) const TIMELINE_BINDINGS: &[Binding] = &[
+    Binding {
+        matcher: |k| matches!(k.code, KeyCode::Char('j') | KeyCode::Down),
+        hint: Some(("j/k", "移動")),
+        action: |a, _| a.select_row_down(),
+    },
+    Binding {
+        matcher: |k| matches!(k.code, KeyCode::Char('k') | KeyCode::Up),
+        hint: None,
+        action: |a, _| a.select_row_up(),
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('h'),
+        hint: Some(("h/l", "日")),
+        action: |a, _| {
+            let r = a.move_column_left();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('l'),
+        hint: None,
+        action: |a, _| {
+            let r = a.move_column_right();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('a'),
+        hint: Some(("a", "追加")),
+        action: |a, _| a.open_add_task_form(FormTarget::Schedule),
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('e'),
+        hint: Some(("e", "編集")),
+        action: |a, _| a.open_edit_task_form(FormTarget::Schedule),
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('d'),
+        hint: Some(("d", "削除")),
+        action: |a, _| a.open_delete_confirm(),
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('J'),
+        hint: Some(("J/K", "並替")),
+        action: |a, _| {
+            let r = a.move_task_down();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('K'),
+        hint: None,
+        action: |a, _| {
+            let r = a.move_task_up();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char(' '),
+        hint: Some(("Space", "実績")),
+        action: |a, _| {
+            let r = a.toggle_actual_for_selected();
+            a.report_err(r);
+        },
+    },
+    Binding {
+        matcher: |k| k.code == KeyCode::Char('t'),
+        hint: Some(("t", "Table")),
+        action: |a, _| a.toggle_view_mode(),
+    },
+];
 
 /// BYSETPOS のサイクル: None → 1 → 2 → 3 → 4 → 5 → -1 → None
 fn cycle_setpos(current: Option<i8>, direction: i32) -> Option<i8> {
