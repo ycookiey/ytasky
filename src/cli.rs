@@ -211,6 +211,8 @@ pub enum Commands {
     },
     /// MCP サーバー起動
     Mcp,
+    /// Scoop でインストールした ytasky を自己更新 (Windows/Scoop 専用)
+    Update,
     /// ybasey schema を初期化
     Init {
         /// 既存 schema を上書き (data dir ごと再作成)
@@ -575,6 +577,10 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
         }
         Commands::Mcp => {
             // MCP は main.rs から直接呼ぶ
+            unreachable!();
+        }
+        Commands::Update => {
+            // update は DB 不要のため main.rs から直接呼ぶ
             unreachable!();
         }
         Commands::Init { .. } => {

@@ -10,6 +10,7 @@ mod mcp;
 mod model;
 mod recurrence;
 mod ui;
+mod update;
 
 use std::{io, time::Duration};
 
@@ -35,6 +36,8 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
         Some(cli::Commands::Init { force, yes }) => init::run_init(force, yes),
+        // update は ytasky.exe を置換するため DB を開かない (ロックを掴まない)。
+        Some(cli::Commands::Update) => update::run(),
         // gcal-login / gcal-logout は OAuth token のみ扱い DB を必要としない。
         // 未 init 環境でも認証できるよう db::open() を経由しない。
         #[cfg(feature = "gcal")]
