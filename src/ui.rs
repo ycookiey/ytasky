@@ -124,6 +124,8 @@ fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
                 ("t", "Table"),
                 ("r", "Report"),
                 ("1-9", "日数"),
+                #[cfg(feature = "gcal")]
+                ("G", "GCal"),
                 ("q", "終了"),
             ],
             ViewMode::TableView => match app.focus {
@@ -142,6 +144,8 @@ fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
                     ("r", "Report"),
                     ("1-9", "日数"),
                     ("u/^r", "undo/redo"),
+                    #[cfg(feature = "gcal")]
+                    ("G", "GCal"),
                     ("q", "終了"),
                 ],
                 PanelFocus::Backlog => vec![
