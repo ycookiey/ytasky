@@ -1,489 +1,380 @@
-# Google Calendar Import 設計
+# Google Calendar Import
 
-ytasky に Google Calendar からのイベント import を組み込むための設計ドキュメント。
+ytasky の Google Calendar import 機能のドキュメント。**M1〜M7 実装済み**（`gcal` feature）。
+本書は設計意図と実装結果の両方を反映する。設計段階からの主な変更点は各節と §11 に記す。
 
 ## 1. ゴール
 
 - Google Calendar のイベントを ytasky の `tasks` / `recurrences` に取り込む
 - 単発イベントは `tasks` に `fixed_start` 付きで挿入
 - 繰り返しイベントは `recurrences` に変換し、ytasky の horizon 展開で日々のタスクへ反映
-- 同じイベントを再度 import しても重複しない（external_id ベースの upsert）
+- 同じイベントを再 import しても重複しない（external_id ベースの upsert）
 - 操作面は CLI / MCP / TUI キー / 起動時 1 回の lazy sync の 4 経路で対応
 
-ノンゴール（現フェーズで扱わない）:
+ノンゴール（現フェーズで扱わない、§12 で将来拡張）:
 
 - GCal への書き込み（Export / 双方向同期）
-- **終日イベントの取り込み**（複日跨ぎや 1440 分占有問題を回避するため当面サポート外）
+- 終日イベントの取り込み（複日跨ぎ・1440 分占有問題のため当面スキップ）
 - 複数カレンダーの同時 import（`--calendar` で 1 つずつ）
-- カテゴリ自動推定（一律デフォルトカテゴリに入れる）
-- GCal 完全削除イベントの ytasky 側削除伝播（`events.list` に出現しないため検知不可。link 解除 or 手動削除で対応）
+- カテゴリ自動推定（一律デフォルトカテゴリ）
+- GCal 完全削除イベントの削除伝播（`events.list` に出現しないため検知不可）
+- EXDATE / RDATE の反映（パースして summary に件数集計するのみ。recurrence_exceptions への登録は未実装）
 
 ## 2. アーキテクチャ
 
 ```
 src/
 ├── gcal/
-│   ├── mod.rs        # 公開 API: import_range(), login(), logout()
-│   ├── auth.rs       # OAuth + PKCE + Loopback サーバー + token 保管/refresh
-│   ├── api.rs        # events.list / events.instances / calendarList.list の薄いクライアント
-│   ├── rrule.rs      # RRULE 文字列 → ytasky pattern/pattern_data 変換
-│   ├── tz.rs         # RFC3339 ↔ 「日付 + 分」変換、_meta.tz 解決
+│   ├── mod.rs        # GcalConfig / load_config / truncate_for_log
+│   ├── auth.rs       # OAuth + PKCE + Loopback + token 保管/refresh
+│   ├── api.rs        # events.list / events.instances の薄いクライアント
+│   ├── rrule.rs      # GCal recurrence 配列 → ytasky pattern/pattern_data
+│   ├── tz.rs         # RFC3339 ↔ (NaiveDate, 分)、_meta.tz 解決
 │   ├── import.rs     # event → task/recurrence の upsert オーケストレータ
 │   └── types.rs      # API レスポンス用 serde 型
+build.rs              # gcal_client.json を読み credential をビルド時埋め込み
 ```
 
 呼び出し階層:
 
 ```
-cli.rs / mcp.rs / app.rs (TUI) / main.rs (lazy)
-        └─ gcal::import_range(db, from, to, options)
-                 ├─ auth::get_valid_token()           (必要なら refresh / login)
-                 ├─ api::list_events(token, …)
-                 ├─ rrule::parse_to_pattern(rrule)    (recurrence 振り分け)
-                 ├─ api::list_instances(eventId)     (フォールバック時)
-                 ├─ tz::rfc3339_to_local_min(...)    (タイムゾーン変換)
+cli.rs / mcp.rs / app.rs (TUI Shift+G・lazy sync)
+        └─ gcal::import::import_range(db, from, to, &ImportOptions)
+                 ├─ auth::get_valid_token()            (必要なら refresh)
+                 ├─ api::list_events(token, …, singleEvents=false)
+                 ├─ rrule::parse_recurrence_rules(...) (recurrence 振り分け)
+                 ├─ api::list_event_instances(eventId) (Unsupported のフォールバック)
+                 ├─ tz::rfc3339_to_local_minute(...)
                  └─ db.upsert(table, "external_id", ext_id, fields)
 ```
 
-`gcal` モジュール全体は **`gcal` feature flag** 配下に置き、デフォルト features に含める一方、`--no-default-features` でビルドする人は外せるようにする（重い依存を持ち込むため。詳細は §8）。
+`gcal` モジュールは **`gcal` feature flag** 配下。default features に含めるが
+`--no-default-features` で外せる（§8）。
 
 ## 3. スキーマ変更
 
-### 3.1 tasks に追加
+### 3.1 / 3.2 external_id 列（tasks / recurrences）
 
 | field | type | nullable | 用途 |
 |---|---|---|---|
-| `external_id` | `str` | true | `gcal:<calendarId>:<eventId>` 形式。同じ event の再 import 時に行を更新するキー |
-
-### 3.2 recurrences に追加
-
-| field | type | nullable | 用途 |
-|---|---|---|---|
-| `external_id` | `str` | true | `gcal:<calendarId>:<eventId>` 形式（繰り返しイベントは主 event UID を保持） |
+| `external_id` | `str` | true | `gcal:<calendarId>:<eventId>` 形式。再 import 時の upsert キー |
 
 ### 3.3 pattern_data の拡張
 
-現状の `PatternData` は `{ "days": [..] }` のみ。これに以下を追加。
-
 ```rust
+#[derive(Default, Serialize, Deserialize)]
 pub struct PatternData {
-    pub days: Option<Vec<i8>>,        // 既存。pattern により解釈が変わる（後述）
-    pub interval: Option<u8>,         // 新規 (INTERVAL=N。未指定=1)
-    pub setpos: Option<i8>,           // 新規 (BYSETPOS。1=第1, 2=第2, -1=最終 …)
+    pub days: Option<Vec<u8>>,   // 既存。pattern により解釈が変わる（下表）
+    pub interval: Option<u8>,    // INTERVAL=N（未指定/1 は None）
+    pub setpos: Option<i8>,      // BYSETPOS（1=第1 … -1=最終）
 }
 ```
 
-`days` の解釈（pattern と `setpos` の組み合わせで変わる）:
+`days` の解釈:
 
 | pattern | setpos | days の意味 | 例 |
 |---|---|---|---|
 | `daily` | — | 未使用 | — |
-| `weekly` | — | 曜日番号 (1=MO, 2=TU, … 7=SU) | `[1,3,5]` = 月水金 |
+| `weekly` | — | 曜日番号 (1=MO … 7=SU) | `[1,3,5]` = 月水金 |
 | `monthly` | None | BYMONTHDAY (1-31) | `[15]` = 毎月15日 |
 | `monthly` | Some(N) | BYDAY 曜日番号 (1-7) | `days=[2], setpos=2` = 第2火曜 |
 
-互換維持: 既存の `monthly` で `setpos=None` なら従来通り `days` を BYMONTHDAY として扱う。**`month_days` 等の追加フィールドは YAGNI のため当面追加しない。** 将来「BYDAY と BYMONTHDAY を併用したい RRULE」が来たら拡張検討。
+**設計変更**: 当初 `days: Vec<i8>` を検討したが、`days` に負値が来るケース（BYDAY=-1MO 等）は
+`setpos` 側に逃がせるため `Vec<u8>` を維持。app.rs / ui.rs のフォーム実装への波及も避けた。
+全フィールドに `#[serde(default)]` + `Option` を付けており、既存 `{"days":[1,3]}` JSON は
+そのまま読める（後方互換）。`month_days` 等は YAGNI で追加しない。
 
-`days` の型を `Vec<u8>` → `Vec<i8>` に変更（`setpos` の負値統一とは独立だが、将来 BYDAY の負値（例: `-1MO`=最終月曜）にも対応しやすくする）。既存データへの互換性は serde が JSON 整数を i8 として読めるので問題なし。
+### 3.4 migration
 
-### 3.4 init.rs / db.rs / migration
-
-`apply_schema` は `create_table` + `add_field` の組み合わせだが、いずれも **冪等ではない**（既存テーブル/フィールドで `Error::TableExists` / `Error::FieldExists` を返す）。既存ユーザーの DB に対しては、新規スキーマ追加分だけを差分適用する **migration 関数** を別途用意する。
+`apply_schema`（`create_table` + `add_field`）は冪等でない（既存で `TableExists`/`FieldExists`）。
+既存 DB 向けに差分適用する `migrate_schema` を新設し、`db::open()` 内で毎回呼ぶ。
 
 ```rust
-// src/init.rs に追加
 pub fn migrate_schema(db: &mut ybasey::Database) -> Result<()> {
     add_field_if_absent(db, "tasks", "external_id", "str", true)?;
     add_field_if_absent(db, "recurrences", "external_id", "str", true)?;
     Ok(())
 }
-
-fn add_field_if_absent(
-    db: &mut ybasey::Database,
-    table: &str,
-    name: &str,
-    type_spec: &str,
-    nullable: bool,
-) -> Result<()> {
-    if db.table(table)?.schema.has_field(name) {
-        return Ok(());
-    }
-    db.add_field(table, name, type_spec, nullable)?;
-    Ok(())
-}
+// add_field_if_absent は db.table(t)?.schema.has_field(name) で存在確認してから add_field
 ```
 
-`Database::table(name)?.schema` は pub、`Schema::has_field(name)` も pub であることを確認済み（`ybasey/src/schema/mod.rs:56`）。ybasey 側の変更は不要。
-
-`main.rs` の起動経路で `migrate_schema(&mut db)` を一度実行する。`apply_schema`（init 時）にも `external_id` 追加を含めるので、新規 init と既存 DB の両方で整合する。
-
-`record_to_task` / `record_to_recurrence` も `external_id` を `Option<String>` で読むよう更新する。
+`Database::table()?.schema` / `Schema::has_field()` はいずれも pub のため ybasey 変更は不要。
+`record_to_task` / `record_to_recurrence` も `external_id` を `Option<String>` で読む。
 
 ## 4. RRULE → ytasky pattern マッピング
 
-GCal が返す `recurrence` フィールドは `["RRULE:...", "EXDATE:...", "RDATE:..."]` の配列。RRULE 1 本を主とし、それ以外は `recurrence_exceptions` または個別タスクで補う。
+GCal の `recurrence` は `["RRULE:...", "EXDATE:...", "RDATE:..."]` 配列。RRULE 1 本を主とする
+（複数 RRULE 行は Unsupported）。手書きパーサ（`gcal/rrule.rs`）。
 
 ### 4.1 サポートマトリクス
 
 | RRULE | ytasky 表現 | 備考 |
 |---|---|---|
-| `FREQ=DAILY` | `pattern=daily` | |
-| `FREQ=DAILY;INTERVAL=N` | `pattern=daily, interval=N` | |
-| `FREQ=WEEKLY;BYDAY=MO,WE,FR` | `pattern=weekly, days=[1,3,5]` | |
+| `FREQ=DAILY[;INTERVAL=N]` | `pattern=daily[, interval=N]` | |
+| `FREQ=WEEKLY;BYDAY=MO,WE,FR` | `pattern=weekly, days=[1,3,5]` | BYDAY 省略時は start_date の曜日 |
 | `FREQ=WEEKLY;INTERVAL=N;BYDAY=…` | `pattern=weekly, interval=N, days=…` | |
-| `FREQ=MONTHLY;BYMONTHDAY=15` | `pattern=monthly, days=[15]` | `setpos=None` ⇒ days を BYMONTHDAY として保存 |
-| `FREQ=MONTHLY;BYDAY=2TU` | `pattern=monthly, days=[2], setpos=2` | "第 2 火曜" |
-| `FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2` | `pattern=monthly, days=[2], setpos=2` | 同上 |
-| `FREQ=MONTHLY;BYDAY=-1FR` | `pattern=monthly, days=[5], setpos=-1` | "最終金曜" |
-| `UNTIL=YYYYMMDD…` | `end_date` | RRULE 側 UNTIL を recurrence.end_date に反映 |
-| `COUNT=N` | `end_date` に換算 | start_date から N 回展開した最終日を end_date とする |
-| `EXDATE:YYYYMMDD` | `recurrence_exceptions` 1 行 | |
-| `RDATE` | 個別 task として追加 | recurrence と無関係に独立 task |
-| `FREQ=YEARLY` | **未対応** → instances 展開 | §4.2 参照 |
-| `FREQ=WEEKLY;BYWEEKNO=…` | **未対応** → instances 展開 | |
-| `BYMONTH` 併用 / `BYDAY` + `BYMONTHDAY` 同時 等 | **未対応** → instances 展開 | |
+| `FREQ=MONTHLY;BYMONTHDAY=15` | `pattern=monthly, days=[15]` | setpos=None ⇒ days を BYMONTHDAY |
+| `FREQ=MONTHLY;BYDAY=2TU` | `pattern=monthly, days=[2], setpos=2` | 第2火曜。BYDAY 省略時は start_date の日 |
+| `FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2` | 同上 | |
+| `FREQ=MONTHLY;BYDAY=-1FR` | `pattern=monthly, days=[5], setpos=-1` | 最終金曜 |
+| `UNTIL=…` | `end_date` | |
+| `COUNT=N` | `end_date` に換算 | daily/weekly/monthly 別に近似計算 |
+| `FREQ=YEARLY` / `BYWEEKNO` / `BYDAY+BYMONTHDAY 併用` 等 | **Unsupported** → instances 展開（§4.2） | |
 
-### 4.2 未対応 RRULE のフォールバック
+**入力防御**（敵対カレンダー対策、§実装 R3）:
 
-未対応 RRULE のイベントは `events.instances` エンドポイント（`GET /calendars/{calendarId}/events/{eventId}/instances?timeMin=…&timeMax=…`）で当該イベントの instance 群のみを取得し、それぞれを `tasks` に `fixed_start` 付きで挿入する。external_id は instance 単位の `gcal:<calendarId>:<eventId>_<originalStartTime>` を使う（GCal が返す `id` を流用）。
+- `INTERVAL=0` → `Invalid`。`INTERVAL` は u32 でパースし、ytasky の `u8` 範囲（1-255）に
+  収まらない値（256 以上）は `Unsupported`（instances 展開へ）
+- `COUNT=0` → `Invalid`、`COUNT > 10000` → `Invalid`（巨大日付計算の暴走防止）
+- `EXDATE` / `RDATE` のリスト長が 1000 件超 → `Invalid`（DoS 防止）
 
-`events.list?singleEvents=true` を全件再取得する案は、既に取得済みの単発イベントも展開されて重複するため採用しない。
+### 4.2 Unsupported RRULE のフォールバック
+
+`events.instances`（`GET /calendars/{calendarId}/events/{eventId}/instances`）で当該イベントの
+instance 群のみを取得し、各 instance を `tasks` に upsert。external_id は **GCal が返す
+instance の `id`**（`parent_20260518T010000Z` のように originalStartTime を内包しユニーク）を
+そのまま `gcal:<calendarId>:<id>` に使う。`events.list?singleEvents=true` 全件再取得は単発イベントと
+重複するため不採用。
 
 ### 4.3 RRULE パーサ
 
-GCal の RRULE は RFC 5545 のサブセット。クレートを使わず手書き（200 行程度）にする。`KEY=VALUE` を `;` 区切りで分解し、上記マトリクスに該当しない要素が混じったら `Err(Unsupported)` を返してフォールバックさせる。
+クレート非依存の手書き。`KEY=VALUE` を `;` で分解し、マトリクス外の要素が混じれば
+`RruleError::Unsupported`、構文・値が不正なら `RruleError::Invalid` を返す。import 側は
+Unsupported → instances 展開、Invalid → スキップ + summary.errors に記録。
 
-### 4.4 既存 `matches_recurrence_pattern` の改修
+### 4.4 matches_recurrence_pattern
 
-現状 `matches_recurrence_pattern(pattern, pattern_data, target_date)` は `interval` と `setpos` を扱えない。シグネチャを **`Recurrence` 全体を受け取る形** に変更する:
-
-```rust
-pub fn matches_recurrence_pattern(
-    rec: &Recurrence,
-    target_date: NaiveDate,
-) -> Result<bool>;
-```
-
-変更後のロジック（擬似コード）:
-
-```text
-start = parse(rec.start_date)
-interval = rec.pattern_data.interval.unwrap_or(1)
-match rec.pattern:
-  "daily":
-    delta_days = target - start
-    return delta_days >= 0 && delta_days % interval == 0
-
-  "weekly":
-    delta_days = target - start
-    if delta_days < 0: return false
-    delta_weeks = delta_days / 7
-    if delta_weeks % interval != 0: return false
-    return days.contains(target.weekday_1to7())
-
-  "monthly":
-    delta_months = (target.year - start.year) * 12 + (target.month - start.month)
-    if delta_months < 0 || delta_months % interval != 0: return false
-
-    match setpos:
-      None:
-        return days.contains(target.day())           # BYMONTHDAY
-      Some(n):
-        target_weekday = target.weekday_1to7()
-        if !days.contains(target_weekday): return false
-        # target が「月内で n 番目の当該曜日」か判定
-        if n > 0:
-          nth_occurrence = (target.day() - 1) / 7 + 1
-          return nth_occurrence == n
-        else:  # n < 0: 月末から逆算
-          last_day_of_month = days_in_month(target)
-          remaining = last_day_of_month - target.day()
-          nth_from_end = remaining / 7 + 1
-          return nth_from_end == -n
-```
-
-`generate_dates_for_recurrence` は引き続き `from..=to` を 1 日ずつ回す方式で OK（範囲が広くないため）。呼び出し側は `matches_recurrence_pattern(rec, d)` に変更。
+`(rec: &Recurrence, target_date) -> Result<bool>` シグネチャ。start_date からの経過で
+INTERVAL を判定、monthly + setpos で「第N曜日 / 最終曜日（月末から逆算）」を判定。
+`generate_dates_for_recurrence` は `from..=to` を 1 日ずつ走査。
 
 ## 5. OAuth 2.0 Loopback Redirect + PKCE
 
-### 5.1 フロー
+### 5.1 フロー（`gcal/auth.rs`）
 
-1. `~/.config/ytasky/gcal.json` を読込（無ければ同梱 client_id/secret を使用）
-2. 32 byte random で `code_verifier` 生成 → SHA256 → base64url で `code_challenge`
-3. ローカルの空きポートを OS に割り当てさせて tiny_http サーバー起動（127.0.0.1:N）
-4. ブラウザで認可 URL を開く:
-   ```
-   https://accounts.google.com/o/oauth2/v2/auth
-     ?client_id=…
-     &redirect_uri=http://127.0.0.1:N/cb
-     &response_type=code
-     &scope=https://www.googleapis.com/auth/calendar.readonly
-     &code_challenge=…
-     &code_challenge_method=S256
-     &access_type=offline
-     &prompt=consent
-     &state=<32byte random>
-   ```
-5. `http://127.0.0.1:N/cb?code=…&state=…` を受信
-   - **state 検証**: ステップ4で生成した値と完全一致しなければ 400 を返してエラー
-   - **タイムアウト**: 120 秒以内に受信しなければサーバー停止し「タイムアウト」エラー
-6. code を `https://oauth2.googleapis.com/token` に POST
-7. response の `access_token` / `refresh_token` / `expires_in` を保存
+1. credential 取得（§5.4）
+2. 32B random → `code_verifier`、SHA256 → base64url で `code_challenge`（S256）
+3. `tiny_http` で 127.0.0.1 の OS 割当ポートに bind
+4. 認可 URL をブラウザで開く（`webbrowser`）。scope は `calendar.readonly`、`access_type=offline`、
+   `prompt=consent`、32B random の `state`
+5. `/cb?code=…&state=…` を受信。**state を定数時間比較で検証してから**レスポンスを返す
+   （CSRF 検知時はブラウザに「認証完了」を出さない）。120 秒タイムアウト
+6. code を token endpoint に POST → `access_token` / `refresh_token` / `expires_in`
 
-### 5.2 同時実行 / ロック
+### 5.2 同時実行ロック
 
-OAuth フローの並行起動を防ぐため、`~/.config/ytasky/gcal_login.lock` を `fs2::FileExt::try_lock_exclusive` で取得する。取得失敗時は「別の ytasky プロセスが認証中」と表示してフロー中止。`tiny_http` のポートは OS 任せ（ポート競合は発生しない）。
+`~/.config/ytasky/gcal_login.lock` を `fs2::try_lock_exclusive`。取得失敗時は
+「別の ytasky プロセスが認証中」でフロー中止。ポートは OS 任せで競合なし。
 
-token が既に有効ならフロー全体をスキップ（lazy sync の重複ログインを抑制）。
+### 5.3 credential / token の保管とセキュリティ
 
-### 5.3 Credential / Token の保管
-
-`~/.config/ytasky/gcal.json` (rclone 型 — 同梱をデフォルト、ユーザー上書き可):
+`~/.config/ytasky/gcal.json`（任意。あれば同梱より優先）:
 
 ```json
-{
-  "client_id": "...",
-  "client_secret": "...",
-  "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
-  "token_uri": "https://oauth2.googleapis.com/token"
-}
+{ "client_id": "...", "client_secret": "...", "auth_uri": "...", "token_uri": "..." }
 ```
 
-`~/.config/ytasky/gcal_token.json`:
+- Google Cloud Console の `{"installed":{…}}` / `{"web":{…}}` ラッパーにも対応
+- **`auth_uri` / `token_uri` は Google 公式 prefix（`https://accounts.google.com/`,
+  `https://oauth2.googleapis.com/`）必須**。悪意ある gcal.json で token endpoint を攻撃者 URL に
+  差し替える攻撃を `validate_oauth_endpoints` で遮断
 
-```json
-{
-  "access_token": "...",
-  "refresh_token": "...",
-  "expires_at": 1747400000,
-  "scope": "https://www.googleapis.com/auth/calendar.readonly"
-}
-```
+`~/.config/ytasky/gcal_token.json`（access/refresh token, expires_at, scope）:
 
-Unix では `chmod 600` を設定。Windows ではユーザープロファイル配下の ACL に依存する（追加保護なし）。
+- **Unix**: `chmod 600`（失敗時は警告出力）
+- **Windows**: ユーザープロファイル ACL 依存（追加保護なし。README に明記）
+- `Credential` / `Token` / `TokenResponse` は `Debug` を手動実装し secret を `[REDACTED]` に
+  マスク。token endpoint のエラー body は `truncate_for_log`（先頭 200 文字）で切り詰め、
+  200 OK のパース失敗時は body を含めない（token のログ漏洩防止）
 
-### 5.4 同梱 client_id/secret の方針
+### 5.4 同梱 client_id/secret（ビルド時埋め込み）
 
-- Google Cloud Console で「ytasky」プロジェクトを作成し、Desktop app 種別の OAuth client を発行
-- ソースに埋め込む（コンパイル時定数）
-- OSS 公開済みでも Calendar API スコープに限られるため影響は限定的（Google もデスクトップアプリでは secret を機密扱いしていない）
-- ユーザーが `~/.config/ytasky/gcal.json` を置けばそちらが優先
+**設計変更**: 当初「ソースにコンパイル時定数で埋め込む」としたが、secret を git 管理しない形に変更:
+
+- `build.rs` がリポジトリ直下の `gcal_client.json`（Cloud Console の Desktop app credential JSON、
+  **`.gitignore` 済み**）を読み、`YTASKY_GCAL_CLIENT_ID` / `YTASKY_GCAL_CLIENT_SECRET` を
+  `cargo:rustc-env` で設定
+- `auth.rs` は `option_env!("YTASKY_GCAL_CLIENT_ID")` で受ける。ファイルが無ければ `None` となり、
+  `~/.config/ytasky/gcal.json` の配置が必須になる
+- これにより、配布バイナリには credential が埋め込まれる一方、リポジトリには secret が入らない
+  （rclone 型の「同梱 + 上書き可」）
 
 ### 5.5 Refresh
 
-`access_token` の `expires_at` を毎回確認し、過ぎていたら `refresh_token` で更新:
-
-```
-POST https://oauth2.googleapis.com/token
-  client_id, client_secret, refresh_token, grant_type=refresh_token
-```
-
-refresh_token が失効した場合は完全に再ログイン。
+`expires_at`（30 秒スキュー込みの `is_expired`）を確認し、過ぎていれば `refresh_token` で更新。
+refresh レスポンスに refresh_token が無い場合は既存値を維持。API が 401 を返した場合は
+明示メッセージで `ytasky gcal-login` を案内（自動 refresh リトライは未実装、§12）。
 
 ### 5.6 Scope
 
-| Scope | 用途 |
-|---|---|
-| `https://www.googleapis.com/auth/calendar.readonly` | 現フェーズ（import のみ） |
-| `https://www.googleapis.com/auth/calendar.events` | 将来 Export 時に拡張 |
+`https://www.googleapis.com/auth/calendar.readonly` のみ。将来 Export 時に `calendar.events` へ。
 
-## 6. import 実行フロー
-
-```
-ytasky import-gcal --from 2026-05-16 --to 2026-06-16 [--calendar primary] [--category personal]
-```
+## 6. import 実行フロー（`gcal/import.rs`）
 
 ### 6.1 手順
 
-1. token 取得（必要なら refresh、無ければ OAuth フロー起動）
-2. `events.list(calendarId, timeMin=from, timeMax=to+1day, singleEvents=false, maxResults=2500)`
-3. nextPageToken でページネーション完走
-4. イベントごとに振り分け:
-   - `status=cancelled` → スキップ
-   - `start.date` あり（終日） → スキップ（§1 ノンゴール）
-   - `recurrence` あり:
-     - RRULE が `rrule::parse_to_pattern` でサポート範囲内 → `recurrences` を `external_id` で upsert
-     - 範囲外 → `events.instances` で当該イベントの instance 群を取得し、各 instance を `tasks` upsert（§4.2）
-   - `recurrence` 無し → `tasks` を `external_id` で upsert
-5. summary 表示 (`created / updated / skipped` 件数)
+1. `auth::get_valid_token()`（必要なら refresh）
+2. `_meta` から tz を解決、timeMin/timeMax を midnight RFC3339 に
+3. `api::list_events(calendarId, timeMin, timeMax, single_events=false)` を nextPageToken で完走
+   （`MAX_PAGES=200` + 同一 token 検知で暴走防止、429 は Retry-After 尊重で 1 回 retry）
+4. イベントごとに振り分け（`handle_event`）:
+   - `status=cancelled` / 終日 / 親あり instance（`recurring_event_id` あり）→ スキップ
+   - `recurrence` あり: parse 成功 → `recurrences` upsert / Unsupported → instances 展開で `tasks` upsert /
+     Invalid → スキップ + errors 記録
+   - `recurrence` 無し → `tasks` upsert
+5. `ImportSummary { created, updated, skipped, skipped_exdates, skipped_rdates, errors }` を返す
+   （個別イベントのエラーで全体停止せず errors に積む）
 
-### 6.2 Upsert ロジック
+### 6.2 upsert ロジック
 
-ybasey の `Database::upsert(table, key_field, key_value, fields)` を直接利用する:
+`db.upsert(table, "external_id", ext_id, fields)` を利用（WAL ベースで原子的）。
 
-```rust
-let (id, was_inserted) = db.upsert(
-    "tasks",
-    "external_id",
-    &format!("gcal:{}:{}", calendar_id, event_id),
-    fields,
-)?;
-```
+- **tasks**: insert 時のみ `sort_order=0` を渡す（update 時は触らず既存順序維持。表示時に
+  `normalize_fixed_tasks_by_time` で時刻順に整列）。title は `sanitize_text` で制御文字 /
+  ANSI escape / Unicode BIDI override・不可視文字（Cf/Zl/Zp）を除去（TUI 偽装防止）
+- **recurrences**: `upsert` の `inserted` フラグで summary の created/updated を区別。end_date は
+  `None` のとき ybasey の Null sentinel `"_"` を渡して明示クリア（GCal で UNTIL 削除時に追従）
 
-WAL ベースで原子性が保証される。find + insert/update の 2 ステップは使わない。
+ytasky 側で手動編集したいタスクは `external_id` を NULL にして link 解除（detach コマンドは §12）。
 
-ytasky 側で手動編集したい場合は `external_id` を NULL にして link 解除する運用（将来 TUI に「detach from GCal」コマンドを用意）。
+### 6.3 GCal 側削除
 
-### 6.3 GCal 側削除の扱い
-
-- 「`status=cancelled` → スキップ」は **繰り返しイベントの個別 instance キャンセル** に対してのみ有効（その instance を recurrence_exceptions に登録するかは将来検討）
-- **完全削除されたイベント**は `events.list` に出現しないため検知不能。ytasky 側にデータが残り続ける
-- 将来対応案: `events.list?showDeleted=true&updatedMin=…` で差分同期、または「最後の import 日時より古い external_id を持つ task」を孤児として一覧表示する機能を追加
+- cancelled instance はスキップ。完全削除イベントは `events.list` に出ないため検知不可（§12）
 
 ### 6.4 カテゴリ
 
-- `--category <id>` で指定（デフォルト: 設定ファイルの `gcal_default_category`、未設定なら "personal" 相当）
-- GCal の colorId からの自動推定はしない
-- 後でユーザーが TUI でカテゴリ変更する前提
+`--category <id>`（デフォルト `"6"` = 身支度・自由時間 ≒ personal）。colorId 推定はしない。
 
-### 6.5 タイムゾーン処理
+### 6.5 タイムゾーン処理（`gcal/tz.rs`）
 
-GCal は `start.dateTime` を RFC3339 (`2026-05-16T10:00:00+09:00`) で返す。ytasky の `fixed_start` は「分」の整数（0 = 00:00、0..1440 を想定）。
-
-変換手順:
-
-1. `chrono::DateTime::parse_from_rfc3339(&s)` → `DateTime<FixedOffset>` （イベント側 tz）
-2. `_meta.tz` を読み込み（例: `Asia/Tokyo`）。未設定ならシステム TZ（`chrono::Local`）にフォールバック
-3. `chrono_tz::Tz` で解釈し、`DateTime<Tz>` に変換
-4. ローカル日付 (`NaiveDate`) と分 (`hour*60 + minute`) を抽出
-5. ytasky の `tasks.date` と `fixed_start` に投入
-
-`chrono_tz` クレートは依存追加が必要（§8）。`_meta` パースは ybasey API ではなく `~/.local/share/ytasky-ybasey/_meta` を直接読む（既存 `write_meta` と対称）。
-
-複日跨ぎイベント（`start` と `end` の日付が異なる）はノンゴール（§1）。
+`start.dateTime`（RFC3339）→ `DateTime<FixedOffset>` → `_meta.tz`（`chrono_tz::Tz`、未設定/不正は
+UTC フォールバック）→ ローカル `(NaiveDate, hour*60+minute)`。duration は end-start の分。
+timeMin/timeMax 生成（`date_to_rfc3339_at_midnight`）は DST 境界に対応:
+Ambiguous → 早い方、None（gap）→ 1〜4 時間進めて最初の有効時刻。複日跨ぎはノンゴール。
 
 ## 7. 操作インタフェース
 
 ### 7.1 CLI
 
 ```
-ytasky import-gcal [--from YYYY-MM-DD] [--to YYYY-MM-DD]
-                   [--calendar <id>] [--category <id>]
-ytasky gcal-login   # OAuth フローのみ実行（token 取得）
-ytasky gcal-logout  # token 削除
+ytasky import-gcal [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--calendar <id>] [--category <id>]
+ytasky gcal-login    # OAuth フローのみ
+ytasky gcal-logout   # token 削除
 ```
 
-- `--from` 省略時: 今日
-- `--to` 省略時: 今日+30 日
+- `--from` 省略=今日、`--to` 省略=from+30 日
+- **`gcal-login` / `gcal-logout` は DB を必要としない**ため、`main.rs` で `db::open()` を
+  経由せず直接 `auth::login()/logout()` を呼ぶ（未 init 環境でも認証可能）
 
 ### 7.2 MCP
 
-```
-mcp__ytasky__import_gcal
-  from_date: str           (default: today)
-  to_date: str             (default: today + 30d)
-  calendar_id?: str        (default: "primary")
-  category?: str           (default: 設定値)
-
-  → { created: N, updated: N, skipped: N }
-```
+`mcp__ytasky__import_gcal`（from_date / to_date / calendar_id / category）→
+`{ created, updated, skipped, skipped_exdates, skipped_rdates, errors }`。
+`#[tool]` は cfg 外に置き、handler 内で `#[cfg(feature="gcal")]` と `#[cfg(not)]` を分岐
+（rmcp の tool_router が gcal 無効ビルドでも展開できるようにするため）。gcal 無効時は
+`invalid_params` で「機能無効」を返す。
 
 ### 7.3 TUI
 
-- キーバインド: `Shift+G` で「Import from Google Calendar」ダイアログを開く
-- ダイアログ: from / to / calendar / category を入力
-- 実行中はステータスバーに進捗、完了時にトースト「GCal: 12 created, 3 updated, 2 skipped」
+**設計変更**: 当初の「from/to/calendar/category 入力ダイアログ」は簡素化。
+
+- `Shift+G` で確認モーダル（「今日〜+30日 / primary / 既定カテゴリで import」）
+- `Enter` で `kick_gcal_import_background` がバックグラウンドスレッドで import（UI を
+  ブロックしない）。完了は `poll_background_sync` がトースト化
+- 詳細指定（範囲・カレンダー・カテゴリ）は CLU を使う
+- キーバインドは **dispatch テーブル**（`COMMON_BINDINGS` / `TABLE_BINDINGS` /
+  `TIMELINE_BINDINGS`）で一元管理。`handle_normal_key` の処理と `draw_keybindings_bar` の
+  下部バー表示が同じテーブルから生成され、ショートカット追加時の表示漏れが起きない
 
 ### 7.4 起動時 lazy sync
 
-- TUI は `crossterm::event::poll` ベースの同期イベントループ。tokio runtime を新規に作らず **`std::thread::spawn`** で別スレッド起動する
-- スレッド内で **新規 `ybasey::Database::open(...)`** を行う（メインスレッドの DB ハンドルとは独立）
-- HTTP クライアントは `reqwest::blocking::Client` を使う（tokio 不要）
-- token が無い／無効ならスキップ（再ログインを促さない）
-- 期間: 今日 〜 7 日後（デフォルト、設定で変更可）
-- 結果は `mpsc::Sender<SyncResult>` 経由でメインスレッドへ送信し、TUI イベントループの定期 pull でトースト化
-- エラー時もトーストのみ。TUI は止めない
-- 設定: `~/.config/ytasky/config.json` の `gcal_auto_sync: bool` で OFF 可
+- `App::new` で `std::thread::spawn`（token 無し / config OFF ならスキップ。spawn 失敗は警告）
+- スレッド内で新規 `Database::open` + `migrate_schema` + `import_range`（`reqwest::blocking`）
+- 結果は `std::sync::mpsc` でメインへ。`main.rs` の event loop が **500ms poll** ごとに
+  `poll_background_sync` で受信 → `db.refresh()`（別スレッドの書き込みを in-memory に反映）→
+  `refresh_tasks` → トースト表示
+- 期間: 今日〜+`gcal_auto_sync_days`（既定 7）。`~/.config/ytasky/config.json` の
+  `gcal_auto_sync: bool` で OFF 可
 
 #### DB 排他
 
-ybasey が複数 `Database` インスタンスを同時に開いた際の排他は `ybasey/src/storage/lock.rs` の仕組みに従う（ファイルロック）。lazy sync 側でロック取得に失敗したら「次回起動時に再試行」として終了し、メイン側を阻害しない。
+ybasey は `Database::open` 時に exclusive lock を取り初期化後 release、書き込み毎にも
+acquire/release する（`storage/lock.rs`）。別プロセス・別スレッドの複数ハンドル並行で安全。
 
-具体的なロック挙動の挙動確認は M7 着手前に ybasey 側コードを読んで確認する（必要なら ybasey に `try_open()` を追加）。
-
-## 8. 依存追加 / feature flag
+## 8. 依存 / feature flag
 
 ```toml
 [features]
 default = ["gcal"]
 mcp = ["dep:rmcp", "dep:tokio", "dep:schemars"]
-gcal = [
-  "dep:reqwest", "dep:tiny_http", "dep:base64", "dep:sha2",
-  "dep:rand", "dep:url", "dep:webbrowser", "dep:chrono-tz", "dep:fs2",
-]
+gcal = ["dep:reqwest", "dep:tiny_http", "dep:base64", "dep:sha2", "dep:rand",
+        "dep:url", "dep:percent-encoding", "dep:webbrowser", "dep:fs2", "dep:chrono-tz"]
 
-[dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"], optional = true }
-tiny_http = { version = "0.12", optional = true }
-base64 = { version = "0.22", optional = true }
-sha2 = { version = "0.10", optional = true }
-rand = { version = "0.9", optional = true }
-url = { version = "2", optional = true }
-webbrowser = { version = "1", optional = true }
-chrono-tz = { version = "0.10", optional = true }
-fs2 = { version = "0.4", optional = true }
+[build-dependencies]
+serde_json = "1"   # build.rs で gcal_client.json をパース
 ```
 
-**tokio は non-optional に昇格しない**。`reqwest::blocking` + `std::thread::spawn` で全てカバー可能。MCP feature 専用のままにすることで、MCP を使わないユーザーは tokio リンク無しで済む。
+reqwest は `default-features=false` + `rustls-tls` + `blocking` + `json`。
+**tokio は non-optional に昇格せず**（`reqwest::blocking` + `std::thread` でカバー）、mcp feature 限定のまま。
+`gcal` は default に含むが `--no-default-features --features mcp` 等で除外可。
+`src/gcal/` および CLI/MCP/TUI の該当箇所は `#[cfg(feature = "gcal")]` で gate。
 
-`gcal` feature は default に含めるが、`--no-default-features` でビルドする人は完全に外せる。これにより:
+## 9. Google Cloud Console 準備（自前 credential を使う場合）
 
-- 一般ユーザー（バイナリ配布）: gcal 込み、サイズ増を許容
-- 軽量ビルド希望者: `cargo build --no-default-features --features mcp` 等で除外可
+同梱版（`gcal_client.json` をビルドに埋め込んだバイナリ）を使う場合は不要。自前で用意するなら:
 
-`src/gcal/` モジュールは `#[cfg(feature = "gcal")]` で囲み、CLI/MCP/TUI 側も該当コマンド/キー/MCP tool を feature gate する。
+1. プロジェクト作成（MFA 必須化されているアカウントは事前に 2 段階認証を設定）
+2. **Google Calendar API** を有効化
+3. **Google Auth Platform**（旧 OAuth consent screen）を構成: アプリ名 / サポートメール /
+   対象=**External** / 連絡先
+4. **公開モードの選択**:
+   - **Testing**: テストユーザー登録が必要。refresh_token が **7 日で失効**
+   - **本番公開（未審査）**: 「アプリを公開」を押すとテストユーザー登録不要・refresh_token **無期限**。
+     「確認されていません」警告は出るが「詳細→移動」で進める。**個人利用はこちらを推奨**
+5. **Credentials > OAuth client ID > Desktop app** を作成し JSON をダウンロード
+6. 配置先:
+   - 自前ビルドに埋め込む: リポジトリ直下に `gcal_client.json`（gitignore 済み）として置き
+     `cargo build --release` → `build.rs` が埋め込む
+   - 配置で使う: `~/.config/ytasky/gcal.json` に置く
 
-## 9. Google Cloud Console 準備手順（README 反映用）
+## 10. テスト
 
-ytasky 同梱の client_id/secret で使う場合、ユーザー側の準備は不要。自前で用意したい場合のみ:
+実装では各モジュール内の `#[cfg(test)]` unit テストが中心:
 
-1. https://console.cloud.google.com/ でプロジェクトを作成
-2. **APIs & Services > Library** で **Google Calendar API** を有効化
-3. **APIs & Services > OAuth consent screen** で External / Testing を選択
-4. Test users に自分の Google アカウントを追加
-5. **APIs & Services > Credentials** で **Create Credentials > OAuth client ID**
-   - Application type: **Desktop app**
-   - Name: `ytasky`
-6. 表示された JSON をダウンロードし、`~/.config/ytasky/gcal.json` に配置
+- `rrule.rs`: DAILY/WEEKLY/MONTHLY、INTERVAL、BYDAY/BYMONTHDAY/BYSETPOS、UNTIL/COUNT、
+  EXDATE/RDATE、Unsupported 検出、INTERVAL=0/256・COUNT=0/上限・EXDATE 上限の Invalid
+- `recurrence.rs`（tests/recurrence.rs）: interval=2 隔日/隔週/隔月、setpos=2/-1、月末境界、
+  start_date 以前 false
+- `tz.rs`: JST/UTC/日跨ぎ/DST/不正 tz/欠落
+- `types.rs`: events.list / 終日 / cancelled / instance のパース
+- `import.rs`: in-memory ybasey で upsert の insert→update / 冪等性 / sanitize_text
+- `auth.rs`: PKCE 仕様、state 定数時間、URL state redact、token JSON、Debug マスク、
+  installed ラッパー、endpoint 検証
+- `mod.rs`: GcalConfig のデフォルト / 部分 / 空
+- OAuth 実フロー: 手動（HTTP モックは工数に見合わず）
 
-## 10. テスト戦略
+## 11. 実装履歴
 
-- `tests/gcal_rrule.rs`: RRULE → pattern_data 変換の純粋関数テスト。次のパターンを最低限カバー:
-  - `FREQ=DAILY`, `FREQ=DAILY;INTERVAL=3`
-  - `FREQ=WEEKLY;BYDAY=MO,WE,FR`, `FREQ=WEEKLY;INTERVAL=2;BYDAY=TU`
-  - `FREQ=MONTHLY;BYMONTHDAY=15`, `FREQ=MONTHLY;BYDAY=2TU`, `FREQ=MONTHLY;BYDAY=-1FR`, `FREQ=MONTHLY;BYDAY=TU;BYSETPOS=2`
-  - `UNTIL=20261231T000000Z`, `COUNT=10`, `EXDATE`, `RDATE`
-  - 未対応パターンが `Err(Unsupported)` を返すこと（`FREQ=YEARLY`, `BYWEEKNO`, `BYMONTH` 併用）
-- `tests/gcal_recurrence.rs`: 新 `matches_recurrence_pattern(rec, date)` の境界テスト
-  - `interval=2` の隔日/隔週/隔月
-  - `setpos=2`, `setpos=-1`（月末絡み: 31日月と30日月の両方）
-  - start_date より前の date は false
-- `tests/gcal_import.rs`: in-memory ybasey DB に固定 fixture JSON の events.list レスポンスを流し込んで upsert を検証
-  - 新規 insert / 既存 update / cancelled スキップ / 終日スキップ / 未対応 RRULE のフォールバック
-- OAuth フロー: 手動テスト（HTTP server のモック化は工数に見合わない）
-- API クライアント: reqwest を `wiremock` でモック（または手書きの localhost HTTP server）
-
-## 11. マイルストーン
-
-| # | スコープ | 概算 | 依存 |
-|---|---|---|---|
-| **M1** | スキーマ拡張: `external_id` 列、`init.rs` の `apply_schema` 更新、`migrate_schema()` 関数、`db.rs` の `record_to_*` 反映、`main.rs` 起動経路に migration 呼び出し追加、テスト | 1〜2 日 | — |
-| **M2** | recurrence pattern_data 拡張（`interval` / `setpos`）+ `days` を `Vec<i8>` 化 + `matches_recurrence_pattern` のシグネチャ変更 + 既存呼び出し全箇所更新 + UI / CLI / MCP / テスト | 3〜4 日 | M1 |
-| **M3** | OAuth (`gcal/auth.rs`): PKCE + Loopback + token 保管/refresh + state 検証 + タイムアウト + ロックファイル + 同梱 credential 埋め込み | 2〜3 日 | — |
-| **M4** | `gcal/api.rs`: events.list / events.instances / calendarList.list クライアント + `gcal/tz.rs` のタイムゾーン変換 | 2 日 | M3 |
-| **M5** | `gcal/rrule.rs` + `gcal/import.rs`: 変換と upsert | 2〜3 日 | M2, M4 |
-| **M6** | CLI / MCP / TUI 統合 | 1〜2 日 | M5 |
-| **M7** | 起動時 lazy sync（std::thread + 別 DB ハンドル + mpsc + ロック確認） | 1〜2 日 | M6 |
-
-合計 12〜18 日。各 M を 1〜2 コミット粒度で進める。
+| # | 内容 | 状態 |
+|---|---|---|
+| M1 | external_id 列 + migrate_schema | ✅ |
+| M2 | pattern_data の interval/setpos 拡張 + matches_recurrence_pattern + CLI/MCP/TUI | ✅ |
+| M3 | OAuth PKCE + Loopback + token 保管/refresh | ✅ |
+| M4 | events.list / events.instances + tz 変換 | ✅ |
+| M5 | RRULE パーサ + import オーケストレータ | ✅ |
+| M6 | CLI / MCP / TUI 統合 | ✅ |
+| M7 | 起動時 lazy sync | ✅ |
+| R1〜R6 | 2 次にわたる多角レビュー（OAuth/データ整合/API/統合/攻撃者視点）の指摘対応 | ✅ |
+| 追加 | gcal-login の DB 非依存化 / build.rs 埋め込み / keybinding dispatch テーブル化 / 未使用コード削除 | ✅ |
 
 ## 12. 将来拡張
 
-- GCal への Export（書き込み）
-- 完全削除イベントの検知（`updatedMin` 差分同期 or 孤児リスト）
-- 複数カレンダーの並列 import
-- 終日イベントの取り込み（複日跨ぎ分割を含む）
-- `month_days`（BYDAY と BYMONTHDAY 併用 RRULE）対応
-- 編集競合検出（etag ベース）
-- ytasky 側変更を GCal に push back（双方向同期）
-- Outlook / iCloud / CalDAV 連携（同じ抽象を再利用）
+- GCal への Export（書き込み、`calendar.events` scope）
+- 401 自動 refresh リトライ
+- 完全削除イベントの検知（`updatedMin` 差分 or 孤児リスト）
+- 複数カレンダー対応（`list_calendars` の再追加 + 一覧 UI）
+- 終日イベントの取り込み（複日跨ぎ分割）
+- EXDATE / RDATE の反映（`recurrence_exceptions` 登録 / RDATE 個別 task 化）
+- TUI の詳細 import ダイアログ（from/to/calendar/category）
+- ytasky → GCal の detach コマンド（external_id クリア）
+- 編集競合検出（etag）、Outlook / iCloud / CalDAV 連携
