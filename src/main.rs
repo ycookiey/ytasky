@@ -3,6 +3,8 @@ mod cli;
 mod db;
 #[cfg(feature = "gcal")]
 mod gcal;
+#[cfg(feature = "github")]
+mod github;
 mod history;
 mod init;
 #[cfg(feature = "mcp")]
