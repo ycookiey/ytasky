@@ -16,7 +16,20 @@
 use anyhow::Result;
 use serde::Deserialize;
 
+pub mod api;
+pub mod auth;
 pub mod types;
+
+/// 長大なレスポンス本文をエラーメッセージに乗せる際の安全な truncate。
+// TODO(共通化): gcal にも同名の関数がある。M3 の sanitize_text 共通化とあわせて
+//   src/text.rs 等へ統合する。
+pub(crate) fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}... ({} 文字省略)", s.chars().count() - max)
+}
 
 /// `~/.config/ytasky/config.json` の GitHub 関連設定。
 /// GCal 設定（`GcalConfig`）と同じファイルを別構造体で部分デシリアライズする。
