@@ -21,3 +21,6 @@ _merge_tmp/
 
 # Claude
 .claude/
+
+# Google Calendar OAuth client (ビルド埋め込み用。secret を含むのでコミット禁止)
+/gcal_client.json
