@@ -335,6 +335,16 @@ struct ImportGcalParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ImportGithubParams {
+    /// GitHub search queries (e.g. "is:open assignee:@me"). Defaults to config.json github_import_queries.
+    #[serde(default)]
+    queries: Option<Vec<String>>,
+    /// Default ytasky category ID for newly imported issues. Defaults to "3" (work).
+    #[serde(default)]
+    category: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct HistoryParams {
     /// Number of entries to return (default: 20)
     #[serde(default)]
@@ -736,6 +746,53 @@ impl YtaskyMcpServer {
             let _ = params;
             Err(McpError::invalid_params(
                 "gcal feature is not enabled in this build",
+                None,
+            ))
+        }
+    }
+
+    #[tool(
+        description = "Import GitHub issues into ytasky backlog tasks. Open issues matching the search queries become backlog tasks (pull requests are skipped). Idempotent via external_id: existing tasks only update title/deadline, preserving user-set category/duration."
+    )]
+    async fn import_github(
+        &self,
+        Parameters(params): Parameters<ImportGithubParams>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(feature = "github")]
+        {
+            let queries = match params.queries {
+                Some(q) if !q.is_empty() => q,
+                _ => {
+                    crate::github::load_config()
+                        .map_err(db_err)?
+                        .github_import_queries
+                }
+            };
+            if queries.is_empty() {
+                return Err(McpError::invalid_params(
+                    "no queries: specify queries or set github_import_queries in config.json",
+                    None,
+                ));
+            }
+            let opts = crate::github::import::ImportOptions {
+                category_id: params.category.unwrap_or_else(|| "3".into()),
+            };
+            let mut db = self.db.write().await;
+            let summary =
+                crate::github::import::import_queries(&mut db, &queries, &opts).map_err(db_err)?;
+            ok_json(json!({
+                "ok": true,
+                "created": summary.created,
+                "updated": summary.updated,
+                "skipped": summary.skipped,
+                "errors": summary.errors,
+            }))
+        }
+        #[cfg(not(feature = "github"))]
+        {
+            let _ = params;
+            Err(McpError::invalid_params(
+                "github feature is not enabled in this build",
                 None,
             ))
         }
