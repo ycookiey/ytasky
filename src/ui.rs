@@ -124,6 +124,10 @@ fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
         InputMode::GcalConfirm => {
             vec![("Enter", "実行"), ("Esc", "キャンセル")]
         }
+        #[cfg(feature = "github")]
+        InputMode::GithubConfirm => {
+            vec![("Enter", "実行"), ("Esc", "キャンセル")]
+        }
         InputMode::Normal => match app.view_mode {
             ViewMode::ReportView => vec![("q/Esc", "閉じる")],
             ViewMode::TimelineView => {
@@ -954,6 +958,8 @@ fn draw_modal_if_needed(f: &mut Frame, app: &App) {
         InputMode::RecurrenceForm(form) => draw_recurrence_form_modal(f, app, form),
         #[cfg(feature = "gcal")]
         InputMode::GcalConfirm => draw_gcal_confirm_modal(f),
+        #[cfg(feature = "github")]
+        InputMode::GithubConfirm => draw_github_confirm_modal(f),
     }
 }
 
@@ -981,6 +987,31 @@ fn draw_gcal_confirm_modal(f: &mut Frame) {
             "Enter: 実行    Esc: キャンセル",
             muted,
         )),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+#[cfg(feature = "github")]
+fn draw_github_confirm_modal(f: &mut Frame) {
+    let area = centered_rect(60, 28, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" GitHub Issue Import ")
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black).fg(Color::White));
+    f.render_widget(block, area);
+    let inner = area.inner(Margin {
+        vertical: 1,
+        horizontal: 2,
+    });
+    let muted = Style::default().fg(Color::DarkGray);
+    let lines = vec![
+        Line::from("config.json の github_import_queries に一致する open issue を"),
+        Line::from("backlog に import します。"),
+        Line::from(""),
+        Line::from("クエリ指定や別カテゴリは `ytasky import-github --query ...` を使用。"),
+        Line::from(""),
+        Line::from(Span::styled("Enter: 実行    Esc: キャンセル", muted)),
     ];
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }

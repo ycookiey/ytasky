@@ -36,8 +36,6 @@ pub struct GithubConfig {
     #[serde(default)]
     pub github_import_queries: Vec<String>,
     /// TUI 起動時にバックグラウンドで import するか（default: true）。
-    // TODO(github M5): lazy sync 実装で参照する。それまで未使用。
-    #[allow(dead_code)]
     #[serde(default = "default_true")]
     pub github_auto_sync: bool,
 }

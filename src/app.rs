@@ -124,6 +124,8 @@ pub enum InputMode {
     RecurrenceForm(RecurrenceFormState),
     #[cfg(feature = "gcal")]
     GcalConfirm,
+    #[cfg(feature = "github")]
+    GithubConfirm,
 }
 
 enum FormAction {
@@ -154,13 +156,17 @@ pub struct App {
     pub input_mode: InputMode,
     pub status_message: Option<String>,
     undo_manager: UndoManager,
-    #[cfg(feature = "gcal")]
-    gcal_sync_rx: Option<std::sync::mpsc::Receiver<GcalSyncMessage>>,
+    // background sync (gcal / github) の Receiver 群。複数ソースを 1 箇所で扱う。
+    // タプルの &str は表示名 兼 二重起動ガードのキー。
+    #[cfg(any(feature = "gcal", feature = "github"))]
+    sync_rx: Vec<(&'static str, std::sync::mpsc::Receiver<SyncMessage>)>,
 }
 
-#[cfg(feature = "gcal")]
-pub(crate) struct GcalSyncMessage {
-    pub result: anyhow::Result<crate::gcal::import::ImportSummary>,
+/// background sync の完了通知。整形済みの表示本文を運ぶ。
+/// source は進行中判定のため `sync_rx` のタプル側に持たせる。
+#[cfg(any(feature = "gcal", feature = "github"))]
+pub(crate) struct SyncMessage {
+    pub status: anyhow::Result<String>,
 }
 
 impl App {
@@ -223,8 +229,8 @@ impl App {
             input_mode: InputMode::Normal,
             status_message: None,
             undo_manager: UndoManager::new(),
-            #[cfg(feature = "gcal")]
-            gcal_sync_rx: spawn_gcal_lazy_sync(),
+            #[cfg(any(feature = "gcal", feature = "github"))]
+            sync_rx: spawn_lazy_syncs(),
         };
         app.refresh_recurrences()?;
         Ok(app)
@@ -233,35 +239,36 @@ impl App {
     /// lazy sync スレッドからの完了通知を取り込み、status_message に反映する。
     /// メインイベントループから定期的に呼ぶ。
     pub fn poll_background_sync(&mut self) {
-        #[cfg(feature = "gcal")]
+        #[cfg(any(feature = "gcal", feature = "github"))]
         {
-            let Some(rx) = self.gcal_sync_rx.as_ref() else {
-                return;
-            };
-            match rx.try_recv() {
-                Ok(msg) => {
-                    self.status_message = Some(match msg.result {
-                        Ok(s) => format!(
-                            "GCal auto-sync: {} created / {} updated / {} skipped",
-                            s.created, s.updated, s.skipped
-                        ),
-                        Err(e) => format!("GCal auto-sync エラー: {e}"),
-                    });
-                    // 別スレッドが書き込んだ consolidated log を読み直して
-                    // メインスレッドの in-memory 状態を最新化する。
-                    // refresh_tasks が内部で refresh_recurrences も呼ぶので
-                    // ここでは tasks 側だけ更新すれば十分。
-                    if let Err(e) = self.db.refresh() {
-                        eprintln!("ytasky: db refresh after gcal sync failed: {e}");
+            use std::sync::mpsc::TryRecvError;
+            let mut received = false;
+            let mut i = 0;
+            while i < self.sync_rx.len() {
+                let (source, rx) = &self.sync_rx[i];
+                match rx.try_recv() {
+                    Ok(msg) => {
+                        self.status_message = Some(match msg.status {
+                            Ok(s) => format!("{source} auto-sync: {s}"),
+                            Err(e) => format!("{source} auto-sync エラー: {e}"),
+                        });
+                        received = true;
+                        self.sync_rx.swap_remove(i); // 完了した rx を除去 (i は再検査)
                     }
-                    let _ = self.refresh_tasks();
-                    self.gcal_sync_rx = None;
+                    Err(TryRecvError::Empty) => i += 1,
+                    // スレッドが panic 等で終了 → 諦めて除去
+                    Err(TryRecvError::Disconnected) => {
+                        self.sync_rx.swap_remove(i);
+                    }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // スレッドが panic で終了 → 諦め
-                    self.gcal_sync_rx = None;
+            }
+            if received {
+                // 別スレッドが書き込んだ consolidated log を読み直して
+                // メインスレッドの in-memory 状態を最新化する。
+                if let Err(e) = self.db.refresh() {
+                    eprintln!("ytasky: db refresh after background sync failed: {e}");
                 }
+                let _ = self.refresh_tasks();
             }
         }
     }
@@ -576,6 +583,16 @@ impl App {
                 }
                 _ => self.input_mode = InputMode::GcalConfirm,
             },
+            #[cfg(feature = "github")]
+            InputMode::GithubConfirm => match key.code {
+                KeyCode::Esc => {
+                    self.status_message = None;
+                }
+                KeyCode::Enter => {
+                    self.kick_github_import_background();
+                }
+                _ => self.input_mode = InputMode::GithubConfirm,
+            },
             InputMode::Normal => {}
         }
     }
@@ -585,7 +602,7 @@ impl App {
     /// 完了は `poll_background_sync` 経由でトーストとして拾う。
     #[cfg(feature = "gcal")]
     fn kick_gcal_import_background(&mut self, days: u32) {
-        if self.gcal_sync_rx.is_some() {
+        if self.sync_in_progress("GCal") {
             self.status_message =
                 Some("GCal 同期が既に進行中です。完了までお待ちください。".to_string());
             return;
@@ -594,18 +611,48 @@ impl App {
         let spawn = std::thread::Builder::new()
             .name("ytasky-gcal-manual-sync".into())
             .spawn(move || {
-                let result = run_lazy_sync(days);
-                let _ = tx.send(GcalSyncMessage { result });
+                let status = run_gcal_lazy_sync(days).map(|s| format_gcal_summary(&s));
+                let _ = tx.send(SyncMessage { status });
             });
         match spawn {
             Ok(_) => {
-                self.gcal_sync_rx = Some(rx);
-                self.status_message =
-                    Some("Importing from Google Calendar...".to_string());
+                self.sync_rx.push(("GCal", rx));
+                self.status_message = Some("Importing from Google Calendar...".to_string());
             }
             Err(e) => {
-                self.status_message =
-                    Some(format!("GCal import スレッド起動失敗: {e}"));
+                self.status_message = Some(format!("GCal import スレッド起動失敗: {e}"));
+            }
+        }
+    }
+
+    /// 指定 source の background sync が進行中か。
+    #[cfg(any(feature = "gcal", feature = "github"))]
+    fn sync_in_progress(&self, source: &str) -> bool {
+        self.sync_rx.iter().any(|(s, _)| *s == source)
+    }
+
+    /// TUI から手動で発火する GitHub import を別スレッドで起動する。
+    #[cfg(feature = "github")]
+    fn kick_github_import_background(&mut self) {
+        if self.sync_in_progress("GitHub") {
+            self.status_message =
+                Some("GitHub 同期が既に進行中です。完了までお待ちください。".to_string());
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawn = std::thread::Builder::new()
+            .name("ytasky-github-manual-sync".into())
+            .spawn(move || {
+                let status = run_github_lazy_sync().map(|s| format_github_summary(&s));
+                let _ = tx.send(SyncMessage { status });
+            });
+        match spawn {
+            Ok(_) => {
+                self.sync_rx.push(("GitHub", rx));
+                self.status_message = Some("Importing from GitHub...".to_string());
+            }
+            Err(e) => {
+                self.status_message = Some(format!("GitHub import スレッド起動失敗: {e}"));
             }
         }
     }
@@ -2439,8 +2486,31 @@ fn round_up_to_next_15_minutes(minutes: i32) -> i32 {
 /// - `gcal_token.json` が無ければ何もしない (Receiver は None)
 /// - `~/.config/ytasky/config.json` で `gcal_auto_sync: false` なら無効
 /// - 別ハンドルで `Database::open` するため、ybasey の write 排他に従う
+/// 起動時の lazy sync 群を起動し、進行中の Receiver を集めて返す。
+#[cfg(any(feature = "gcal", feature = "github"))]
+fn spawn_lazy_syncs() -> Vec<(&'static str, std::sync::mpsc::Receiver<SyncMessage>)> {
+    let mut rxs = Vec::new();
+    #[cfg(feature = "gcal")]
+    if let Some(rx) = spawn_gcal_lazy_sync() {
+        rxs.push(("GCal", rx));
+    }
+    #[cfg(feature = "github")]
+    if let Some(rx) = spawn_github_lazy_sync() {
+        rxs.push(("GitHub", rx));
+    }
+    rxs
+}
+
 #[cfg(feature = "gcal")]
-fn spawn_gcal_lazy_sync() -> Option<std::sync::mpsc::Receiver<GcalSyncMessage>> {
+fn format_gcal_summary(s: &crate::gcal::import::ImportSummary) -> String {
+    format!(
+        "{} created / {} updated / {} skipped",
+        s.created, s.updated, s.skipped
+    )
+}
+
+#[cfg(feature = "gcal")]
+fn spawn_gcal_lazy_sync() -> Option<std::sync::mpsc::Receiver<SyncMessage>> {
     let cfg = crate::gcal::load_config().unwrap_or_default();
     if !cfg.gcal_auto_sync {
         return None;
@@ -2454,8 +2524,8 @@ fn spawn_gcal_lazy_sync() -> Option<std::sync::mpsc::Receiver<GcalSyncMessage>> 
     match std::thread::Builder::new()
         .name("ytasky-gcal-lazy-sync".into())
         .spawn(move || {
-            let result = run_lazy_sync(days);
-            let _ = tx.send(GcalSyncMessage { result });
+            let status = run_gcal_lazy_sync(days).map(|s| format_gcal_summary(&s));
+            let _ = tx.send(SyncMessage { status });
         }) {
         Ok(_) => Some(rx),
         Err(e) => {
@@ -2466,7 +2536,7 @@ fn spawn_gcal_lazy_sync() -> Option<std::sync::mpsc::Receiver<GcalSyncMessage>> 
 }
 
 #[cfg(feature = "gcal")]
-fn run_lazy_sync(days: u32) -> anyhow::Result<crate::gcal::import::ImportSummary> {
+fn run_gcal_lazy_sync(days: u32) -> anyhow::Result<crate::gcal::import::ImportSummary> {
     let data_dir = crate::db::data_dir()?;
     let mut db = ybasey::Database::open(&data_dir, Some("ytasky-gcal-sync"))?;
     crate::init::migrate_schema(&mut db)?;
@@ -2474,6 +2544,49 @@ fn run_lazy_sync(days: u32) -> anyhow::Result<crate::gcal::import::ImportSummary
     let to = today + chrono::Duration::days(days as i64);
     let opts = crate::gcal::import::ImportOptions::default();
     crate::gcal::import::import_range(&mut db, today, to, &opts)
+}
+
+#[cfg(feature = "github")]
+fn format_github_summary(s: &crate::github::import::ImportSummary) -> String {
+    format!(
+        "{} created / {} updated / {} skipped",
+        s.created, s.updated, s.skipped
+    )
+}
+
+/// `github_auto_sync` が有効で queries が設定されていれば lazy sync を起動する。
+#[cfg(feature = "github")]
+fn spawn_github_lazy_sync() -> Option<std::sync::mpsc::Receiver<SyncMessage>> {
+    let cfg = crate::github::load_config().unwrap_or_default();
+    if !cfg.github_auto_sync || cfg.github_import_queries.is_empty() {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    match std::thread::Builder::new()
+        .name("ytasky-github-lazy-sync".into())
+        .spawn(move || {
+            let status = run_github_lazy_sync().map(|s| format_github_summary(&s));
+            let _ = tx.send(SyncMessage { status });
+        }) {
+        Ok(_) => Some(rx),
+        Err(e) => {
+            eprintln!("ytasky: GitHub lazy sync スレッドの起動に失敗: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(feature = "github")]
+fn run_github_lazy_sync() -> anyhow::Result<crate::github::import::ImportSummary> {
+    let cfg = crate::github::load_config().unwrap_or_default();
+    if cfg.github_import_queries.is_empty() {
+        anyhow::bail!("github_import_queries が config.json に設定されていません");
+    }
+    let data_dir = crate::db::data_dir()?;
+    let mut db = ybasey::Database::open(&data_dir, Some("ytasky-github-sync"))?;
+    crate::init::migrate_schema(&mut db)?;
+    let opts = crate::github::import::ImportOptions::default();
+    crate::github::import::import_queries(&mut db, &cfg.github_import_queries, &opts)
 }
 
 // ---- keymap: キーバインドの single source ------------------------------------
@@ -2562,6 +2675,14 @@ pub(crate) const COMMON_BINDINGS: &[Binding] = &[
         },
         hint: Some(("G", "GCal")),
         action: |a, _| a.input_mode = InputMode::GcalConfirm,
+    },
+    #[cfg(feature = "github")]
+    Binding {
+        matcher: |k| {
+            k.code == KeyCode::Char('H') && k.modifiers.contains(KeyModifiers::SHIFT)
+        },
+        hint: Some(("H", "GitHub")),
+        action: |a, _| a.input_mode = InputMode::GithubConfirm,
     },
 ];
 

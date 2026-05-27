@@ -780,6 +780,7 @@ pub fn insert_backlog_task(
 }
 
 /// external_id で既存タスクの id を引く（import の重複判定用）。
+#[cfg(feature = "github")]
 pub fn find_task_id_by_external_id(db: &Database, external_id: &str) -> Result<Option<i64>> {
     let table = db.table("tasks").context("tasks テーブルが無い")?;
     Ok(table
@@ -790,6 +791,7 @@ pub fn find_task_id_by_external_id(db: &Database, external_id: &str) -> Result<O
 
 /// external_id 付きで backlog タスクを新規追加する（import 用）。
 /// 既存の `insert_backlog_task` に external_id を加えたもの。
+#[cfg(feature = "github")]
 pub fn insert_backlog_task_imported(
     db: &mut Database,
     title: &str,
@@ -819,6 +821,7 @@ pub fn insert_backlog_task_imported(
 /// import で issue 所有列（title, deadline）のみを更新する。
 /// category_id / duration_min / 配置などユーザー所有列は触らない（列所有権分割）。
 /// deadline=None は Null sentinel "_" でクリアする。
+#[cfg(feature = "github")]
 pub fn update_task_imported_fields(
     db: &mut Database,
     id: i64,
