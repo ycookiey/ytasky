@@ -344,20 +344,16 @@ mod tests {
             id: id.into(),
             status: Some("confirmed".into()),
             summary: Some(summary.into()),
-            description: None,
             start: Some(EventDateTime {
                 date_time: Some(start.into()),
                 date: None,
-                time_zone: Some("Asia/Tokyo".into()),
             }),
             end: Some(EventDateTime {
                 date_time: Some(end.into()),
                 date: None,
-                time_zone: Some("Asia/Tokyo".into()),
             }),
             recurrence: None,
             recurring_event_id: None,
-            original_start_time: None,
         }
     }
 

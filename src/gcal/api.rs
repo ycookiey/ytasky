@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use std::time::Duration;
 
-use crate::gcal::types::{CalendarList, Event, EventList};
+use crate::gcal::types::{Event, EventList};
 
 const API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -179,28 +179,6 @@ pub fn list_event_instances(
         }
     }
     Ok(all)
-}
-
-/// `users/me/calendarList` を取得する (`--calendar` 選択肢提示用)。
-pub fn list_calendars(access_token: &str) -> Result<CalendarList> {
-    let client = make_client()?;
-    let url = format!("{API_BASE}/users/me/calendarList");
-    let resp = send_with_retry(|| client.get(&url).bearer_auth(access_token))?;
-    let status = resp.status();
-    let body = resp.text().context("calendarList.list レスポンス読込失敗")?;
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        bail!(
-            "calendarList.list 401 Unauthorized: access_token が失効。`ytasky gcal-login` で再認証してください"
-        );
-    }
-    if !status.is_success() {
-        bail!(
-            "calendarList.list エラー {status}: {}",
-            crate::gcal::truncate_for_log(&body, 200)
-        );
-    }
-    serde_json::from_str::<CalendarList>(&body)
-        .with_context(|| format!("calendarList.list JSON 解析失敗 (status={status})"))
 }
 
 /// path segment 用の percent encoding。

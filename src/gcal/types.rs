@@ -9,8 +9,6 @@ pub struct EventList {
     pub items: Vec<Event>,
     #[serde(default)]
     pub next_page_token: Option<String>,
-    #[serde(default)]
-    pub time_zone: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -22,19 +20,15 @@ pub struct Event {
     pub status: Option<String>,
     #[serde(default)]
     pub summary: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
     pub start: Option<EventDateTime>,
     pub end: Option<EventDateTime>,
     /// RRULE / EXDATE / RDATE の配列 (例: ["RRULE:FREQ=WEEKLY;BYDAY=MO"])
     #[serde(default)]
     pub recurrence: Option<Vec<String>>,
-    /// 親イベント (繰り返し instance の場合)
+    /// 親イベント (繰り返し instance の場合)。単発展開された instance は親側で
+    /// 処理済みのためスキップ判定に使う。
     #[serde(default)]
     pub recurring_event_id: Option<String>,
-    /// instance 元の開始時刻 (recurring_event_id がある場合)
-    #[serde(default)]
-    pub original_start_time: Option<EventDateTime>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,9 +40,6 @@ pub struct EventDateTime {
     /// YYYY-MM-DD (終日イベント)
     #[serde(default)]
     pub date: Option<String>,
-    /// IANA tz 名 (例: "Asia/Tokyo")
-    #[serde(default)]
-    pub time_zone: Option<String>,
 }
 
 impl Event {
@@ -66,27 +57,6 @@ impl Event {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CalendarList {
-    #[serde(default)]
-    pub items: Vec<CalendarListEntry>,
-    #[serde(default)]
-    pub next_page_token: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CalendarListEntry {
-    pub id: String,
-    #[serde(default)]
-    pub summary: Option<String>,
-    #[serde(default)]
-    pub primary: Option<bool>,
-    #[serde(default)]
-    pub time_zone: Option<String>,
-}
-
 // ---- テスト -------------------------------------------------------------------
 
 #[cfg(test)]
@@ -101,8 +71,8 @@ mod tests {
                     "id": "abc",
                     "status": "confirmed",
                     "summary": "Meeting",
-                    "start": {"dateTime": "2026-05-16T10:00:00+09:00", "timeZone": "Asia/Tokyo"},
-                    "end": {"dateTime": "2026-05-16T11:00:00+09:00", "timeZone": "Asia/Tokyo"}
+                    "start": {"dateTime": "2026-05-16T10:00:00+09:00"},
+                    "end": {"dateTime": "2026-05-16T11:00:00+09:00"}
                 }
             ]
         }"#;
@@ -131,6 +101,8 @@ mod tests {
 
     #[test]
     fn parse_recurrence_and_instance() {
+        // 親 (RRULE 付き) と展開済み instance (recurringEventId 付き) を区別できること。
+        // GCal が返す不要フィールド (originalStartTime 等) は無視される。
         let raw = r#"{
             "items": [
                 {
@@ -155,24 +127,7 @@ mod tests {
             list.items[0].recurrence.as_ref().unwrap()[0],
             "RRULE:FREQ=WEEKLY;BYDAY=MO,WE"
         );
-        assert_eq!(
-            list.items[1].recurring_event_id.as_deref(),
-            Some("parent")
-        );
-    }
-
-    #[test]
-    fn parse_calendar_list() {
-        let raw = r#"{
-            "items": [
-                {"id":"primary","summary":"Me","primary":true,"timeZone":"Asia/Tokyo"},
-                {"id":"work@example.com","summary":"Work"}
-            ]
-        }"#;
-        let list: CalendarList = serde_json::from_str(raw).unwrap();
-        assert_eq!(list.items.len(), 2);
-        assert_eq!(list.items[0].primary, Some(true));
-        assert_eq!(list.items[1].time_zone, None);
+        assert_eq!(list.items[1].recurring_event_id.as_deref(), Some("parent"));
     }
 
     #[test]
