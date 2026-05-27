@@ -8,16 +8,12 @@
 //! - [`external_id`]: `github:{owner}/{repo}#{number}` 形式の external_id を生成
 //! - `types`: Search API レスポンスの serde 型
 
-// TODO(github M2): auth.rs（gh token 取得）, api.rs（search_events + Link pagination）を追加。
-// TODO(github M3): import.rs（列所有権 upsert）, CLI import-github を追加。
-//   それまで GithubConfig / load_config / external_id は bin から未使用のため警告を抑制する。
-#![allow(dead_code)]
-
 use anyhow::Result;
 use serde::Deserialize;
 
 pub mod api;
 pub mod auth;
+pub mod import;
 pub mod types;
 
 /// 長大なレスポンス本文をエラーメッセージに乗せる際の安全な truncate。
@@ -40,6 +36,8 @@ pub struct GithubConfig {
     #[serde(default)]
     pub github_import_queries: Vec<String>,
     /// TUI 起動時にバックグラウンドで import するか（default: true）。
+    // TODO(github M5): lazy sync 実装で参照する。それまで未使用。
+    #[allow(dead_code)]
     #[serde(default = "default_true")]
     pub github_auto_sync: bool,
 }

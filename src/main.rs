@@ -11,6 +11,8 @@ mod init;
 mod mcp;
 mod model;
 mod recurrence;
+#[cfg(any(feature = "gcal", feature = "github"))]
+mod text;
 mod ui;
 mod update;
 

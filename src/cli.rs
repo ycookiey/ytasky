@@ -238,6 +238,16 @@ pub enum Commands {
         #[arg(long)]
         category: Option<String>,
     },
+    /// GitHub issue を backlog タスクとして import
+    #[cfg(feature = "github")]
+    ImportGithub {
+        /// 検索クエリ (複数指定可。省略時は config.json の github_import_queries)
+        #[arg(long)]
+        query: Vec<String>,
+        /// 既定カテゴリ ID (デフォルト: 3 = 開発・仕事)
+        #[arg(long)]
+        category: Option<String>,
+    },
     /// Google Calendar への OAuth ログインを実行
     #[cfg(feature = "gcal")]
     GcalLogin,
@@ -612,6 +622,30 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
                 "skipped": summary.skipped,
                 "skipped_exdates": summary.skipped_exdates,
                 "skipped_rdates": summary.skipped_rdates,
+                "errors": summary.errors,
+            }));
+        }
+        #[cfg(feature = "github")]
+        Commands::ImportGithub { query, category } => {
+            let queries = if query.is_empty() {
+                crate::github::load_config()?.github_import_queries
+            } else {
+                query
+            };
+            if queries.is_empty() {
+                bail!(
+                    "検索クエリがありません。--query で指定するか config.json の github_import_queries を設定してください"
+                );
+            }
+            let opts = crate::github::import::ImportOptions {
+                category_id: category.unwrap_or_else(|| "3".into()),
+            };
+            let summary = crate::github::import::import_queries(db, &queries, &opts)?;
+            print_json(&serde_json::json!({
+                "ok": true,
+                "created": summary.created,
+                "updated": summary.updated,
+                "skipped": summary.skipped,
                 "errors": summary.errors,
             }));
         }

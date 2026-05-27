@@ -6,9 +6,6 @@
 //! - `advanced_search` は 2025-09-04 以降デフォルト有効のためパラメータ指定は不要
 //!   （クエリ内のスペースは AND として解釈される）
 
-// TODO(github M3): import から search_issues を使い始めたら除去する。
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use std::time::Duration;
@@ -118,6 +115,10 @@ pub fn search_issues(token: &GithubToken, query: &str) -> Result<Vec<Issue>> {
                 "warning: クエリのマッチ数 {} 件が API 上限 1000 件を超えています。一部しか取得できません。クエリを分割してください",
                 parsed.total_count
             );
+        }
+        // GitHub 側がタイムアウトで結果を打ち切った場合。
+        if parsed.incomplete_results {
+            eprintln!("warning: 検索結果が不完全です (GitHub 側のタイムアウト)。再実行を検討してください");
         }
 
         all.extend(parsed.items);

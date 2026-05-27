@@ -9,3 +9,5 @@ pub mod init;
 pub mod mcp;
 pub mod model;
 pub mod recurrence;
+#[cfg(any(feature = "gcal", feature = "github"))]
+pub mod text;

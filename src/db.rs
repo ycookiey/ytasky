@@ -779,6 +779,63 @@ pub fn insert_backlog_task(
     Ok(id as i64)
 }
 
+/// external_id で既存タスクの id を引く（import の重複判定用）。
+pub fn find_task_id_by_external_id(db: &Database, external_id: &str) -> Result<Option<i64>> {
+    let table = db.table("tasks").context("tasks テーブルが無い")?;
+    Ok(table
+        .find_by_field("external_id", external_id)
+        .first()
+        .map(|r| r.id as i64))
+}
+
+/// external_id 付きで backlog タスクを新規追加する（import 用）。
+/// 既存の `insert_backlog_task` に external_id を加えたもの。
+pub fn insert_backlog_task_imported(
+    db: &mut Database,
+    title: &str,
+    category_id: &str,
+    duration_min: i32,
+    deadline: Option<&str>,
+    external_id: &str,
+) -> Result<i64> {
+    let sort_order = next_sort_order_for_backlog(db)?;
+    let mut fields = vec![
+        ("date".into(), BACKLOG_DATE.into()),
+        ("title".into(), title.into()),
+        ("category_id".into(), category_id.into()),
+        ("duration_min".into(), duration_min.to_string()),
+        ("status".into(), "todo".into()),
+        ("sort_order".into(), sort_order.to_string()),
+        ("is_backlog".into(), "1".into()),
+        ("external_id".into(), external_id.into()),
+    ];
+    if let Some(dl) = deadline {
+        fields.push(("deadline".into(), dl.into()));
+    }
+    let id = db.insert("tasks", NewRecord::from(fields))?;
+    Ok(id as i64)
+}
+
+/// import で issue 所有列（title, deadline）のみを更新する。
+/// category_id / duration_min / 配置などユーザー所有列は触らない（列所有権分割）。
+/// deadline=None は Null sentinel "_" でクリアする。
+pub fn update_task_imported_fields(
+    db: &mut Database,
+    id: i64,
+    title: &str,
+    deadline: Option<&str>,
+) -> Result<()> {
+    let fields = vec![
+        ("title".into(), title.into()),
+        (
+            "deadline".into(),
+            deadline.map(|d| d.to_string()).unwrap_or_else(|| "_".into()),
+        ),
+    ];
+    db.update("tasks", id as u64, fields)?;
+    Ok(())
+}
+
 /// タスクをバックログ化/解除
 pub fn set_backlog_flag(db: &mut Database, task_id: i64, is_backlog: bool) -> Result<()> {
     if is_backlog {

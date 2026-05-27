@@ -2,10 +2,6 @@
 //!
 //! 必要なフィールドのみ定義する。未知フィールドは無視される。
 
-// TODO(github M3): import 実装でこれらの型を消費し始めたら除去する。
-//   それまでは bin から未使用のため dead_code 警告を抑制する。
-#![allow(dead_code)]
-
 use serde::Deserialize;
 
 /// `GET /search/issues` のレスポンス本体。

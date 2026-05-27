@@ -1,8 +1,5 @@
 //! 認証: `gh` CLI のトークンを流用する。ytasky 自身はトークンを保管しない。
 
-// TODO(github M3): import から get_token を使い始めたら除去する。
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, bail};
 use std::process::Command;
 
