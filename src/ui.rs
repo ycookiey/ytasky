@@ -137,15 +137,31 @@ fn draw_keybindings_bar(f: &mut Frame, area: Rect, app: &App) {
                 PanelFocus::Table => {
                     collect_hints(crate::app::TABLE_BINDINGS, crate::app::COMMON_BINDINGS)
                 }
-                PanelFocus::Backlog => vec![
-                    ("j/k", "移動"),
-                    ("Enter", "挿入"),
-                    ("a", "追加"),
-                    ("e", "編集"),
-                    ("d", "削除"),
-                    ("Tab", "Table"),
-                    ("q", "終了"),
-                ],
+                PanelFocus::Backlog => {
+                    if app.backlog_header_focused {
+                        let enter_label = if app.backlog_github_expanded {
+                            "折りたたむ"
+                        } else {
+                            "展開"
+                        };
+                        vec![
+                            ("j/k", "移動"),
+                            ("Enter", enter_label),
+                            ("Tab", "Table"),
+                            ("q", "終了"),
+                        ]
+                    } else {
+                        vec![
+                            ("j/k", "移動"),
+                            ("Enter", "挿入"),
+                            ("a", "追加"),
+                            ("e", "編集"),
+                            ("d", "削除"),
+                            ("Tab", "Table"),
+                            ("q", "終了"),
+                        ]
+                    }
+                }
             },
         },
     };
@@ -386,6 +402,15 @@ fn draw_backlog_panel(f: &mut Frame, area: Rect, app: &App) {
             let today = Local::now().format("%Y-%m-%d").to_string();
             let mut rows: Vec<Row> = Vec::new();
 
+            let manual_count = app.backlog_manual_count();
+            let github_count = app.backlog_github_count();
+            let has_gh = github_count > 0;
+            // BacklogSelect モード中は展開して全 task を選択候補にする
+            let expanded_for_render = app.backlog_github_expanded || select_cursor.is_some();
+            // BacklogSelect モードでは header にフォーカスを乗せない
+            let header_focused = app.backlog_header_focused && select_cursor.is_none();
+            let sel_bg = Style::default().bg(Color::Rgb(50, 50, 80)).fg(Color::White);
+
             if app.backlog_tasks.is_empty() {
                 rows.push(
                     Row::new(vec![
@@ -395,11 +420,12 @@ fn draw_backlog_panel(f: &mut Frame, area: Rect, app: &App) {
                     .style(Style::default().fg(Color::DarkGray)),
                 );
             } else {
-                for (idx, task) in app.backlog_tasks.iter().enumerate() {
+                // Manual セクション
+                for (idx, task) in app.backlog_tasks.iter().take(manual_count).enumerate() {
                     let (deadline_text, deadline_color) =
                         backlog_deadline_style(task.deadline.as_deref(), &today);
-                    let row_style = if idx == cursor {
-                        Style::default().bg(Color::Rgb(50, 50, 80)).fg(Color::White)
+                    let row_style = if !header_focused && idx == cursor {
+                        sel_bg
                     } else {
                         Style::default()
                     };
@@ -410,6 +436,44 @@ fn draw_backlog_panel(f: &mut Frame, area: Rect, app: &App) {
                         ])
                         .style(row_style),
                     );
+                }
+
+                // GitHub セクション: ヘッダ + 展開時のみタスク一覧
+                if has_gh {
+                    let arrow = if expanded_for_render { "▼" } else { "▶" };
+                    let header_text = format!("[GitHub ({github_count}) {arrow}]");
+                    let header_style = if header_focused {
+                        sel_bg
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    rows.push(
+                        Row::new(vec![Cell::from(header_text), Cell::from("")])
+                            .style(header_style),
+                    );
+
+                    if expanded_for_render {
+                        for (offset, task) in
+                            app.backlog_tasks.iter().skip(manual_count).enumerate()
+                        {
+                            let task_idx = manual_count + offset;
+                            let (deadline_text, deadline_color) =
+                                backlog_deadline_style(task.deadline.as_deref(), &today);
+                            let row_style = if !header_focused && task_idx == cursor {
+                                sel_bg
+                            } else {
+                                Style::default()
+                            };
+                            rows.push(
+                                Row::new(vec![
+                                    Cell::from(task.title.clone()),
+                                    Cell::from(deadline_text)
+                                        .style(Style::default().fg(deadline_color)),
+                                ])
+                                .style(row_style),
+                            );
+                        }
+                    }
                 }
             }
 

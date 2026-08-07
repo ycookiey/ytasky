@@ -24,14 +24,18 @@ fn keep_char(c: char) -> bool {
         return false;
     }
     // Unicode format / line separator / paragraph separator を除去
-    matches!(c as u32,
-        0..=0x1F | 0x7F..=0x9F |
-        0x200B..=0x200F | 0x202A..=0x202E |
-        0x2060..=0x206F |
-        0x2028 | 0x2029 |
-        0xFFF9..=0xFFFB |
-        0xE0000..=0xE007F
-    ).then(|| false).unwrap_or(true)
+    !matches!(c as u32,
+        0x180E |                        // Mongolian Vowel Separator (Cf)
+        0x200B..=0x200F |               // ZWSP, ZWNJ, ZWJ, LRM, RLM
+        0x202A..=0x202E |               // BIDI override
+        0x2028 | 0x2029 |               // Line/Paragraph Separator
+        0x2060..=0x206F |               // WJ, invisible operators, deprecated Cf
+        0xFE00..=0xFE0F |               // Variation Selectors 1-16
+        0xFEFF |                        // BOM / ZWNBSP
+        0xFFF9..=0xFFFB |               // Interlinear annotation
+        0xE0000..=0xE007F |             // Language tags
+        0xE0100..=0xE01EF               // Variation Selectors 17-256
+    )
 }
 
 #[cfg(test)]
@@ -58,5 +62,17 @@ mod tests {
     #[test]
     fn keeps_tab() {
         assert_eq!(sanitize_text("a\tb"), "a\tb");
+    }
+
+    #[test]
+    fn removes_bom_and_variation_selectors() {
+        // U+FEFF (BOM)
+        assert_eq!(sanitize_text("\u{FEFF}Hello"), "Hello");
+        // U+180E (Mongolian Vowel Separator)
+        assert_eq!(sanitize_text("a\u{180E}b"), "ab");
+        // U+FE0F (Variation Selector-16)
+        assert_eq!(sanitize_text("a\u{FE0F}b"), "ab");
+        // U+E0100 (Variation Selector-17)
+        assert_eq!(sanitize_text("a\u{E0100}b"), "ab");
     }
 }

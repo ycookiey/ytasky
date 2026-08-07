@@ -148,6 +148,12 @@ pub struct App {
     pub row_cursor: usize,
     pub preferred_row: usize,
     pub backlog_cursor: usize,
+    /// GitHub セクション（backlog_tasks 末尾の GitHub import 分）が展開表示中か。
+    /// default false（折りたたみ）。起動毎リセット、DB に保存しない。
+    pub backlog_github_expanded: bool,
+    /// GitHub セクションのヘッダ行にフォーカスが乗っているか。
+    /// true の間は `selected_backlog_task()` は `None` を返す。
+    pub backlog_header_focused: bool,
     pub recurrence_cursor: usize,
     pub focus: PanelFocus,
     pub backlog_tab: BacklogTab,
@@ -221,6 +227,8 @@ impl App {
             row_cursor: 0,
             preferred_row: 0,
             backlog_cursor: 0,
+            backlog_github_expanded: false,
+            backlog_header_focused: false,
             recurrence_cursor: 0,
             focus: PanelFocus::Table,
             backlog_tab: BacklogTab::Backlog,
@@ -232,6 +240,11 @@ impl App {
             #[cfg(any(feature = "gcal", feature = "github"))]
             sync_rx: spawn_lazy_syncs(),
         };
+        app.partition_backlog_manual_first();
+        // clamp_cursors は section 整合 (backlog_cursor が manual_count 以上かつ
+        // 折りたたみ中なら header へ退避) を含むため、起動時 (manual_count=0 & github_count>0
+        // で cursor=0 が非表示 GitHub row を指すケース等) も必ず呼ぶ。
+        app.clamp_cursors();
         app.refresh_recurrences()?;
         Ok(app)
     }
@@ -248,9 +261,15 @@ impl App {
                 let (source, rx) = &self.sync_rx[i];
                 match rx.try_recv() {
                     Ok(msg) => {
-                        self.status_message = Some(match msg.status {
+                        let new_msg = match msg.status {
                             Ok(s) => format!("{source} auto-sync: {s}"),
                             Err(e) => format!("{source} auto-sync エラー: {e}"),
+                        };
+                        // 同一 poll で複数 rx が完了した場合、後の文言が先の文言を
+                        // 破棄しないよう " | " で連結する（GCal と GitHub が同時完了時等）。
+                        self.status_message = Some(match self.status_message.take() {
+                            Some(prev) => format!("{prev} | {new_msg}"),
+                            None => new_msg,
                         });
                         received = true;
                         self.sync_rx.swap_remove(i); // 完了した rx を除去 (i は再検査)
@@ -266,7 +285,12 @@ impl App {
                 // 別スレッドが書き込んだ consolidated log を読み直して
                 // メインスレッドの in-memory 状態を最新化する。
                 if let Err(e) = self.db.refresh() {
-                    eprintln!("ytasky: db refresh after background sync failed: {e}");
+                    // alt-screen TUI 中に eprintln すると画面が乱れるため status_message に載せる。
+                    let msg = format!("db refresh after background sync failed: {e}");
+                    self.status_message = Some(match self.status_message.take() {
+                        Some(prev) => format!("{prev} | {msg}"),
+                        None => msg,
+                    });
                 }
                 let _ = self.refresh_tasks();
             }
@@ -353,6 +377,8 @@ impl App {
 
     fn handle_backlog_panel_key(&mut self, key: KeyEvent) {
         if matches!(key.code, KeyCode::Char('T') | KeyCode::BackTab) {
+            // Recurrences タブへ切替時はヘッダ選択状態を落とす
+            self.backlog_header_focused = false;
             self.backlog_tab = match self.backlog_tab {
                 BacklogTab::Backlog => BacklogTab::Recurrences,
                 BacklogTab::Recurrences => BacklogTab::Backlog,
@@ -365,35 +391,83 @@ impl App {
             return;
         }
 
+        let manual_count = self.backlog_manual_count();
+        let has_gh = self.has_backlog_github_section();
+
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if !self.backlog_tasks.is_empty()
-                    && self.backlog_cursor < self.backlog_tasks.len() - 1
-                {
-                    self.backlog_cursor += 1;
-                }
+                self.backlog_cursor_move_down(manual_count, has_gh);
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.backlog_cursor > 0 {
-                    self.backlog_cursor -= 1;
-                }
+                self.backlog_cursor_move_up(manual_count);
             }
             KeyCode::Enter => {
-                if let Err(err) = self.insert_backlog_to_schedule_end() {
+                if self.backlog_header_focused {
+                    self.backlog_github_expanded = !self.backlog_github_expanded;
+                } else if let Err(err) = self.insert_backlog_to_schedule_end() {
                     self.status_message = Some(err.to_string());
                 }
             }
             KeyCode::Char('d') => {
+                if self.backlog_header_focused {
+                    return;
+                }
                 if let Err(err) = self.delete_selected_backlog() {
                     self.status_message = Some(err.to_string());
                 }
             }
-            KeyCode::Char('e') => self.open_edit_task_form(FormTarget::Backlog),
+            KeyCode::Char('e') => {
+                if self.backlog_header_focused {
+                    return;
+                }
+                self.open_edit_task_form(FormTarget::Backlog);
+            }
             KeyCode::Char('a') => self.open_add_task_form(FormTarget::Backlog),
             KeyCode::Tab => {
                 self.focus = PanelFocus::Table;
             }
             _ => {}
+        }
+    }
+
+    /// backlog panel の j/Down 移動。ヘッダ (has_gh 時) を経由してセクションを跨ぐ。
+    /// 折りたたみ中は GitHub タスクへは進めない（ヘッダで止まる）。
+    fn backlog_cursor_move_down(&mut self, manual_count: usize, has_gh: bool) {
+        if self.backlog_header_focused {
+            // ヘッダから下: 展開時は最初の GitHub タスクへ、折りたたみ時は動かない
+            if self.backlog_github_expanded && manual_count < self.backlog_tasks.len() {
+                self.backlog_header_focused = false;
+                self.backlog_cursor = manual_count;
+            }
+            return;
+        }
+        let next = self.backlog_cursor + 1;
+        if next < manual_count {
+            self.backlog_cursor = next;
+        } else if next == manual_count && has_gh {
+            // Manual 最後 → ヘッダ
+            self.backlog_header_focused = true;
+        } else if self.backlog_github_expanded && next < self.backlog_tasks.len() {
+            self.backlog_cursor = next;
+        }
+    }
+
+    /// backlog panel の k/Up 移動。ヘッダを経由して Manual 側へ戻る。
+    fn backlog_cursor_move_up(&mut self, manual_count: usize) {
+        if self.backlog_header_focused {
+            if manual_count > 0 {
+                self.backlog_header_focused = false;
+                self.backlog_cursor = manual_count - 1;
+            }
+            return;
+        }
+        if self.backlog_cursor == manual_count
+            && manual_count < self.backlog_tasks.len()
+        {
+            // GitHub 先頭 → ヘッダ
+            self.backlog_header_focused = true;
+        } else if self.backlog_cursor > 0 {
+            self.backlog_cursor -= 1;
         }
     }
 
@@ -529,6 +603,9 @@ impl App {
             InputMode::BacklogSelect { mut cursor } => match key.code {
                 KeyCode::Esc => {
                     self.status_message = None;
+                    // BacklogSelect 中に backlog_cursor が任意の index (折りたたみ済み
+                    // GitHub 部分含む) を指すため、Normal 復帰時に section 整合を戻す。
+                    self.clamp_cursors();
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
                     if !self.backlog_tasks.is_empty() && cursor < self.backlog_tasks.len() - 1 {
@@ -1248,8 +1325,13 @@ impl App {
                     deadline.clone(),
                 );
                 self.run_command(Box::new(command))?;
-                if !self.backlog_tasks.is_empty() {
-                    self.backlog_cursor = self.backlog_tasks.len() - 1;
+                // partition 後は Manual タスクが先頭にまとまるので、新規追加された Manual は
+                // manual_count-1 位置。末尾 (backlog_tasks.len()-1) を指すと折りたたみ済み
+                // GitHub 行を選ぶことになる。
+                let manual_count = self.backlog_manual_count();
+                if manual_count > 0 {
+                    self.backlog_cursor = manual_count - 1;
+                    self.backlog_header_focused = false;
                 }
             }
             (FormTarget::Backlog, FormMode::Edit) => {
@@ -1679,7 +1761,31 @@ impl App {
     }
 
     fn selected_backlog_task(&self) -> Option<&Task> {
+        if self.backlog_header_focused {
+            return None;
+        }
         self.backlog_tasks.get(self.backlog_cursor)
+    }
+
+    /// backlog_tasks を「Manual first, GitHub last」に並べ替える。
+    /// 各セクション内の元順序 (deadline 昇順) は stable partition で保たれる。
+    pub(crate) fn partition_backlog_manual_first(&mut self) {
+        partition_manual_first(&mut self.backlog_tasks);
+    }
+
+    pub fn backlog_manual_count(&self) -> usize {
+        self.backlog_tasks
+            .iter()
+            .filter(|t| !is_github_task(t))
+            .count()
+    }
+
+    pub fn backlog_github_count(&self) -> usize {
+        self.backlog_tasks.iter().filter(|t| is_github_task(t)).count()
+    }
+
+    pub fn has_backlog_github_section(&self) -> bool {
+        self.backlog_github_count() > 0
     }
 
     fn move_selected_task_to_backlog(&mut self) -> anyhow::Result<()> {
@@ -1796,6 +1902,7 @@ impl App {
             self.day_tasks.push((date, tasks));
         }
         self.backlog_tasks = crate::db::load_backlog_tasks(&self.db)?;
+        self.partition_backlog_manual_first();
         self.refresh_recurrences()?;
         self.clamp_cursors();
         self.refresh_reports()?;
@@ -1888,8 +1995,28 @@ impl App {
 
         if self.backlog_tasks.is_empty() {
             self.backlog_cursor = 0;
+            self.backlog_header_focused = false;
         } else if self.backlog_cursor >= self.backlog_tasks.len() {
             self.backlog_cursor = self.backlog_tasks.len() - 1;
+        }
+        // セクション整合性: 折りたたみ中に GitHub タスク位置に居たら退避
+        let manual_count = self.backlog_manual_count();
+        if !self.backlog_github_expanded
+            && !self.backlog_header_focused
+            && self.backlog_cursor >= manual_count
+            && self.backlog_tasks.len() > manual_count
+        {
+            if manual_count > 0 {
+                self.backlog_cursor = manual_count - 1;
+            } else {
+                self.backlog_header_focused = true;
+                self.backlog_cursor = 0;
+            }
+        }
+        // GitHub セクションが無くなったのにヘッダ選択中 → Manual 末尾へ戻す
+        if self.backlog_header_focused && !self.has_backlog_github_section() {
+            self.backlog_header_focused = false;
+            self.backlog_cursor = manual_count.saturating_sub(1);
         }
 
         if self.recurrences.is_empty() {
@@ -2546,18 +2673,57 @@ fn run_gcal_lazy_sync(days: u32) -> anyhow::Result<crate::gcal::import::ImportSu
     crate::gcal::import::import_range(&mut db, today, to, &opts)
 }
 
+/// task が GitHub import 由来（external_id が "github:" prefix）か判定する。
+fn is_github_task(t: &Task) -> bool {
+    t.external_id
+        .as_deref()
+        .map(|e| e.starts_with("github:"))
+        .unwrap_or(false)
+}
+
+/// Vec<Task> を「Manual first, GitHub last」に stable partition する。
+/// 各セクション内の元順序は保存される。
+fn partition_manual_first(tasks: &mut Vec<Task>) {
+    let mut manual = Vec::with_capacity(tasks.len());
+    let mut github = Vec::new();
+    for t in tasks.drain(..) {
+        if is_github_task(&t) {
+            github.push(t);
+        } else {
+            manual.push(t);
+        }
+    }
+    tasks.extend(manual);
+    tasks.extend(github);
+}
+
 #[cfg(feature = "github")]
 fn format_github_summary(s: &crate::github::import::ImportSummary) -> String {
-    format!(
-        "{} created / {} updated / {} skipped",
-        s.created, s.updated, s.skipped
-    )
+    let mut out = format!(
+        "{} created / {} updated / {} skipped / {} closed",
+        s.created, s.updated, s.skipped, s.closed_done
+    );
+    if !s.errors.is_empty() {
+        out.push_str(&format!(" ({} errors)", s.errors.len()));
+    }
+    out
 }
 
 /// `github_auto_sync` が有効で queries が設定されていれば lazy sync を起動する。
 #[cfg(feature = "github")]
 fn spawn_github_lazy_sync() -> Option<std::sync::mpsc::Receiver<SyncMessage>> {
-    let cfg = crate::github::load_config().unwrap_or_default();
+    // config load 失敗 (JSON パース error 等) は起動時に TUI へ通知する。
+    // 旧実装は unwrap_or_default で握り潰していた。
+    let cfg = match crate::github::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = tx.send(SyncMessage {
+                status: Err(anyhow::anyhow!("config load 失敗: {e}")),
+            });
+            return Some(rx);
+        }
+    };
     if !cfg.github_auto_sync || cfg.github_import_queries.is_empty() {
         return None;
     }
@@ -2578,7 +2744,7 @@ fn spawn_github_lazy_sync() -> Option<std::sync::mpsc::Receiver<SyncMessage>> {
 
 #[cfg(feature = "github")]
 fn run_github_lazy_sync() -> anyhow::Result<crate::github::import::ImportSummary> {
-    let cfg = crate::github::load_config().unwrap_or_default();
+    let cfg = crate::github::load_config()?;
     if cfg.github_import_queries.is_empty() {
         anyhow::bail!("github_import_queries が config.json に設定されていません");
     }
@@ -2864,4 +3030,68 @@ fn cycle_setpos(current: Option<i8>, direction: i32) -> Option<i8> {
     let n = SEQ.len() as i32;
     let next_idx = ((idx as i32 + direction).rem_euclid(n)) as usize;
     SEQ[next_idx]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(id: i64, external_id: Option<&str>) -> Task {
+        Task {
+            id,
+            date: "_".into(),
+            sort_order: id as i32,
+            title: format!("t{id}"),
+            category_id: "3".into(),
+            duration_min: 30,
+            fixed_start: None,
+            actual_start: None,
+            actual_end: None,
+            recurrence_id: None,
+            is_backlog: true,
+            deadline: None,
+            external_id: external_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn is_github_task_variants() {
+        assert!(is_github_task(&task(1, Some("github:o/r#1"))));
+        assert!(!is_github_task(&task(2, Some("gcal:x:y"))));
+        assert!(!is_github_task(&task(3, None)));
+        // prefix 部分一致は不十分（":" まで必要）
+        assert!(!is_github_task(&task(4, Some("githubfoo"))));
+    }
+
+    #[test]
+    fn partition_manual_first_reorders() {
+        let mut v = vec![
+            task(1, Some("github:o/r#1")),
+            task(2, None),
+            task(3, Some("github:o/r#3")),
+            task(4, Some("gcal:c:e")),
+        ];
+        partition_manual_first(&mut v);
+        // Manual (2, 4) が先、GitHub (1, 3) が後。各セクション内は元順序。
+        let ids: Vec<i64> = v.iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![2, 4, 1, 3]);
+    }
+
+    #[test]
+    fn partition_manual_first_empty_and_single_section() {
+        let mut empty: Vec<Task> = vec![];
+        partition_manual_first(&mut empty);
+        assert!(empty.is_empty());
+
+        let mut all_manual = vec![task(1, None), task(2, None)];
+        partition_manual_first(&mut all_manual);
+        assert_eq!(all_manual.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 2]);
+
+        let mut all_github = vec![
+            task(1, Some("github:o/r#1")),
+            task(2, Some("github:o/r#2")),
+        ];
+        partition_manual_first(&mut all_github);
+        assert_eq!(all_github.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1, 2]);
+    }
 }

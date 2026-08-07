@@ -15,7 +15,8 @@ path = "src/main.rs"
 default = ["gcal", "github"]
 mcp = ["dep:rmcp", "dep:tokio", "dep:schemars"]
 # GitHub issue import。reqwest を gcal と共有する（認証は gh CLI 流用のため OAuth 系 dep は不要）。
-github = ["dep:reqwest"]
+# chrono-tz は milestone due_on を local date へ変換するために必要 (gcal と共有)。
+github = ["dep:reqwest", "dep:chrono-tz"]
 gcal = [
     "dep:reqwest",
     "dep:tiny_http",

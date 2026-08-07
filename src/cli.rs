@@ -238,7 +238,7 @@ pub enum Commands {
         #[arg(long)]
         category: Option<String>,
     },
-    /// GitHub issue を backlog タスクとして import
+    /// GitHub issue を backlog タスクとして import (upstream で closed 化した既存 backlog タスクは status=done へ)
     #[cfg(feature = "github")]
     ImportGithub {
         /// 検索クエリ (複数指定可。省略時は config.json の github_import_queries)
@@ -646,6 +646,7 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
                 "created": summary.created,
                 "updated": summary.updated,
                 "skipped": summary.skipped,
+                "closed_done": summary.closed_done,
                 "errors": summary.errors,
             }));
         }

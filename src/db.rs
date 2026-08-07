@@ -507,11 +507,13 @@ pub fn load_tasks(db: &mut Database, date: &str) -> Result<Vec<crate::model::Tas
 }
 
 /// バックログタスクを期限順で取得（期限なしは末尾）
+/// `status="done"` のものは除外する（GitHub 側で closed 化されたタスク等、完了済みは非表示）。
 pub fn load_backlog_tasks(db: &Database) -> Result<Vec<crate::model::Task>> {
     let table = db.table("tasks")?;
     let mut tasks: Vec<crate::model::Task> = table
         .list()
         .iter()
+        .filter(|r| get_str(r, "status") != "done")
         .map(|r| record_to_task(r))
         .filter(|t| t.is_backlog)
         .collect();
@@ -818,9 +820,11 @@ pub fn insert_backlog_task_imported(
     Ok(id as i64)
 }
 
-/// import で issue 所有列（title, deadline）のみを更新する。
+/// import で issue 所有列（title, deadline, status）を更新する。
 /// category_id / duration_min / 配置などユーザー所有列は触らない（列所有権分割）。
 /// deadline=None は Null sentinel "_" でクリアする。
+/// status は "todo" にリセットする（upstream で reopen された issue が
+/// 前回 detect_closed で "done" にされていても backlog に復帰するため）。
 #[cfg(feature = "github")]
 pub fn update_task_imported_fields(
     db: &mut Database,
@@ -834,9 +838,47 @@ pub fn update_task_imported_fields(
             "deadline".into(),
             deadline.map(|d| d.to_string()).unwrap_or_else(|| "_".into()),
         ),
+        ("status".into(), "todo".into()),
     ];
     db.update("tasks", id as u64, fields)?;
     Ok(())
+}
+
+/// タスクの `status` を `"done"` にセットする（列 1 個の部分更新）。
+/// 既存 `done_task` 系（`actual_start`/`actual_end` に時刻をセット）とは別の完了マーク用途。
+/// backlog タスクに対して使うことを想定しており、レポート統計には影響しない
+/// （actual_end が未設定のままなので実施時間として集計されない）。
+/// GitHub issue が upstream で closed 化した際の反映に使う。
+#[cfg(feature = "github")]
+pub fn set_task_status_done(db: &mut Database, id: i64) -> Result<()> {
+    db.update("tasks", id as u64, vec![("status".into(), "done".into())])?;
+    Ok(())
+}
+
+/// backlog にある GitHub import タスクの (id, external_id) 一覧。
+/// closed → done 検出のために「今 backlog にあり、未 done のもの」だけを対象にする。
+/// 既に status="done" にした task を除外することで、closed 検出の再走時に REST を
+/// 無駄叩きしたり `summary.closed_done` を再インフレさせない。
+#[cfg(feature = "github")]
+pub fn list_backlog_github_external_ids(db: &Database) -> Result<Vec<(i64, String)>> {
+    let table = db.table("tasks").context("tasks テーブルが無い")?;
+    let mut out = Vec::new();
+    for r in table.list().iter() {
+        if get_str(r, "status") == "done" {
+            continue;
+        }
+        let t = record_to_task(r);
+        if !t.is_backlog {
+            continue;
+        }
+        let Some(ext) = t.external_id else {
+            continue;
+        };
+        if ext.starts_with("github:") {
+            out.push((t.id, ext));
+        }
+    }
+    Ok(out)
 }
 
 /// タスクをバックログ化/解除

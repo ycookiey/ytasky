@@ -54,13 +54,18 @@ impl Default for GithubConfig {
 }
 
 /// `~/.config/ytasky/config.json` から GitHub 設定を読む。無ければデフォルト。
+/// JSON パース失敗は `Err` を返す（unwrap_or_default で握り潰すと typo が
+/// 「queries が空」に degrade してデバッグ不能になるため）。
 pub fn load_config() -> Result<GithubConfig> {
+    use anyhow::Context;
     let path = crate::recurrence::config_dir()?.join("config.json");
     if !path.exists() {
         return Ok(GithubConfig::default());
     }
-    let raw = std::fs::read_to_string(&path)?;
-    let cfg: GithubConfig = serde_json::from_str(&raw).unwrap_or_default();
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("config.json 読込失敗: {}", path.display()))?;
+    let cfg: GithubConfig = serde_json::from_str(&raw)
+        .with_context(|| format!("config.json パース失敗: {}", path.display()))?;
     Ok(cfg)
 }
 

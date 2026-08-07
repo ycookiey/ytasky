@@ -37,10 +37,13 @@ pub struct ImportSummary {
     pub created: usize,
     pub updated: usize,
     pub skipped: usize,
+    /// upstream で closed 化を検出して `status="done"` にした件数。
+    pub closed_done: usize,
     pub errors: Vec<String>,
 }
 
-/// 検索クエリ群に一致する open issue を import する。
+/// 検索クエリ群に一致する open issue を import し、
+/// 併せて既存の backlog GitHub タスクのうち upstream で closed 化したものを検出して done 化する。
 pub fn import_queries(
     db: &mut Database,
     queries: &[String],
@@ -50,16 +53,49 @@ pub fn import_queries(
     let mut summary = ImportSummary::default();
     let mut seen: HashSet<String> = HashSet::new();
 
+    // milestone.due_on の local date 変換用 tz (data_dir/_meta の tz: 行を参照)
+    let tz = crate::db::data_dir()
+        .ok()
+        .map(|d| read_meta_tz(&d))
+        .unwrap_or(chrono_tz::UTC);
+
     for query in queries {
-        let issues = api::search_issues(&token, query)?;
-        for issue in issues {
-            if let Err(e) = handle_issue(db, &issue, opts, &mut seen, &mut summary) {
+        // 単一 query の失敗が全体を止めないよう ? ではなく errors に集約する。
+        // 前 query で挿入済みの task はそのまま残り、detect_closed も後段で走る。
+        match api::search_issues(&token, query) {
+            Ok(outcome) => {
+                // 1000 件超過・incomplete_results 等の non-fatal warning を errors に集約
+                // (旧実装は eprintln で alt-screen TUI を破壊していた)。
+                summary.errors.extend(outcome.warnings);
+                for issue in outcome.issues {
+                    if let Err(e) = handle_issue(db, &issue, opts, tz, &mut seen, &mut summary) {
+                        summary
+                            .errors
+                            .push(format!("issue #{} の取り込み失敗: {e}", issue.number));
+                    }
+                }
+            }
+            Err(e) => {
                 summary
                     .errors
-                    .push(format!("issue #{} の取り込み失敗: {e}", issue.number));
+                    .push(format!("query \"{query}\" 失敗: {e}"));
             }
         }
     }
+
+    // seen に含まれなかった backlog GitHub タスクは upstream で閉じられた可能性がある。
+    // 個別 API で state 確認し、closed なもののみ status="done" にする。
+    let detection = detect_closed(db, &token, &seen)?;
+    for (task_id, ext) in &detection.closed {
+        match crate::db::set_task_status_done(db, *task_id) {
+            Ok(()) => summary.closed_done += 1,
+            Err(e) => summary
+                .errors
+                .push(format!("done 遷移失敗 {ext}: {e}")),
+        }
+    }
+    summary.errors.extend(detection.errors);
+
     Ok(summary)
 }
 
@@ -67,6 +103,7 @@ fn handle_issue(
     db: &mut Database,
     issue: &Issue,
     opts: &ImportOptions,
+    tz: chrono_tz::Tz,
     seen: &mut HashSet<String>,
     summary: &mut ImportSummary,
 ) -> Result<()> {
@@ -90,7 +127,7 @@ fn handle_issue(
         .milestone
         .as_ref()
         .and_then(|m| m.due_on.as_deref())
-        .and_then(due_on_to_date);
+        .and_then(|d| due_on_to_date(d, tz));
 
     match crate::db::find_task_id_by_external_id(db, &ext)? {
         Some(id) => {
@@ -113,27 +150,85 @@ fn handle_issue(
     Ok(())
 }
 
-/// milestone.due_on (ISO8601 例 `2026-06-15T07:00:00Z`) を `YYYY-MM-DD` にする。
-/// milestone は日粒度のため日付部分のみ採る（時刻は切り捨て）。
-fn due_on_to_date(due_on: &str) -> Option<String> {
-    let date = due_on.split('T').next()?;
-    let b = date.as_bytes();
-    // YYYY-MM-DD 形式の簡易検証
-    if b.len() == 10
-        && b[4] == b'-'
-        && b[7] == b'-'
-        && date.chars().enumerate().all(|(i, c)| {
-            if i == 4 || i == 7 {
-                c == '-'
-            } else {
-                c.is_ascii_digit()
-            }
-        })
-    {
-        Some(date.to_string())
-    } else {
-        None
+/// `github:owner/repo#123` 形式の external_id を `(owner, repo, number)` に分解する。
+/// 不正形式は `None`。
+pub fn parse_external_id(ext: &str) -> Option<(String, String, u64)> {
+    let rest = ext.strip_prefix("github:")?;
+    let (repo_part, num_part) = rest.rsplit_once('#')?;
+    let (owner, repo) = repo_part.split_once('/')?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
     }
+    let number: u64 = num_part.parse().ok()?;
+    Some((owner.to_string(), repo.to_string(), number))
+}
+
+/// closed 検出の結果。closed リストと非致命エラーを分けて返す。
+#[derive(Debug, Default, Clone)]
+pub struct ClosedDetection {
+    /// closed と判定できた (task_id, external_id) のリスト。
+    pub closed: Vec<(i64, String)>,
+    /// 個別 fetch のエラー（次回再試行で解消し得るので致命ではない）。
+    pub errors: Vec<String>,
+}
+
+/// backlog の GitHub import タスクのうち、直近 search 結果 `seen` に含まれなかったものについて
+/// `GET /repos/:owner/:repo/issues/:number` で state を確認し closed のみ列挙する。
+/// - 404 (repo 削除・権限喪失等) は勝手に done 化しない
+/// - open だった（クエリを狭めた等の理由）は無視
+/// - HTTP エラーは `errors` に積んで次回リトライに回す
+pub fn detect_closed(
+    db: &Database,
+    token: &auth::GithubToken,
+    seen: &HashSet<String>,
+) -> Result<ClosedDetection> {
+    let backlog_github = crate::db::list_backlog_github_external_ids(db)?;
+    let mut result = ClosedDetection::default();
+    for (id, ext) in backlog_github {
+        if seen.contains(&ext) {
+            continue;
+        }
+        let Some((owner, repo, number)) = parse_external_id(&ext) else {
+            result
+                .errors
+                .push(format!("external_id パース失敗 (skip): {ext}"));
+            continue;
+        };
+        match api::fetch_issue_state(token, &owner, &repo, number) {
+            Ok(Some(api::IssueState::Closed)) => result.closed.push((id, ext)),
+            Ok(Some(api::IssueState::Open)) => {}
+            Ok(None) => {}
+            Err(e) => result
+                .errors
+                .push(format!("issue #{number} の state 取得失敗: {e}")),
+        }
+    }
+    Ok(result)
+}
+
+/// milestone.due_on (RFC3339 例 `2026-06-15T20:00:00Z`) を local tz の `YYYY-MM-DD` にする。
+/// milestone は日粒度だが GitHub は UTC で保持するため、UTC 深夜だと JST では翌日にずれる。
+/// `_meta` の `tz:` を参照して local date を求める（gcal と同じパターン）。
+fn due_on_to_date(due_on: &str, tz: chrono_tz::Tz) -> Option<String> {
+    let dt = chrono::DateTime::parse_from_rfc3339(due_on).ok()?;
+    let local = dt.with_timezone(&tz);
+    Some(local.date_naive().format("%Y-%m-%d").to_string())
+}
+
+/// `_meta` の `tz:` 行から chrono_tz::Tz を得る。無ければ UTC。
+/// gcal::tz::read_meta_tz と同等のロジック（gcal feature 非依存で使うため複製）。
+fn read_meta_tz(data_dir: &std::path::Path) -> chrono_tz::Tz {
+    let path = data_dir.join("_meta");
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        for line in raw.lines() {
+            if let Some(rest) = line.trim().strip_prefix("tz:") {
+                if let Ok(tz) = rest.trim().parse::<chrono_tz::Tz>() {
+                    return tz;
+                }
+            }
+        }
+    }
+    chrono_tz::UTC
 }
 
 #[cfg(test)]
@@ -164,12 +259,27 @@ mod tests {
 
     #[test]
     fn due_on_conversion() {
+        // UTC 07:00 は UTC 上でも同日
         assert_eq!(
-            due_on_to_date("2026-06-15T07:00:00Z").as_deref(),
+            due_on_to_date("2026-06-15T07:00:00Z", chrono_tz::UTC).as_deref(),
             Some("2026-06-15")
         );
-        assert_eq!(due_on_to_date("not-a-date"), None);
-        assert_eq!(due_on_to_date(""), None);
+        assert_eq!(due_on_to_date("not-a-date", chrono_tz::UTC), None);
+        assert_eq!(due_on_to_date("", chrono_tz::UTC), None);
+    }
+
+    #[test]
+    fn due_on_shifts_to_local_tz() {
+        // UTC 20:00 → JST 翌日 05:00 → 翌日日付
+        assert_eq!(
+            due_on_to_date("2026-06-15T20:00:00Z", chrono_tz::Asia::Tokyo).as_deref(),
+            Some("2026-06-16")
+        );
+        // UTC 00:00 → JST 09:00 → 同日
+        assert_eq!(
+            due_on_to_date("2026-06-15T00:00:00Z", chrono_tz::Asia::Tokyo).as_deref(),
+            Some("2026-06-15")
+        );
     }
 
     #[test]
@@ -179,7 +289,7 @@ mod tests {
         let mut seen = HashSet::new();
         let mut summary = ImportSummary::default();
 
-        handle_issue(&mut db, &issue(12, "バグ修正", Some("2026-06-15T00:00:00Z")), &opts, &mut seen, &mut summary).unwrap();
+        handle_issue(&mut db, &issue(12, "バグ修正", Some("2026-06-15T00:00:00Z")), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
         assert_eq!(summary.created, 1);
         assert_eq!(summary.updated, 0);
 
@@ -203,7 +313,7 @@ mod tests {
 
         // 初回 insert
         let mut seen = HashSet::new();
-        handle_issue(&mut db, &issue(12, "旧タイトル", None), &opts, &mut seen, &mut summary).unwrap();
+        handle_issue(&mut db, &issue(12, "旧タイトル", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
         let id = crate::db::load_backlog_tasks(&mut db).unwrap()[0].id;
 
         // ユーザーが category/duration を手で変更したと仮定
@@ -212,7 +322,7 @@ mod tests {
         // 2回目 import: title が変わった
         let mut seen2 = HashSet::new();
         let mut summary2 = ImportSummary::default();
-        handle_issue(&mut db, &issue(12, "新タイトル", None), &opts, &mut seen2, &mut summary2).unwrap();
+        handle_issue(&mut db, &issue(12, "新タイトル", None), &opts, chrono_tz::UTC, &mut seen2, &mut summary2).unwrap();
         assert_eq!(summary2.created, 0);
         assert_eq!(summary2.updated, 1);
 
@@ -226,6 +336,31 @@ mod tests {
     }
 
     #[test]
+    fn reopened_issue_resets_status_to_todo() {
+        let (_t, mut db) = setup_db();
+        let opts = ImportOptions::default();
+        let mut summary = ImportSummary::default();
+
+        let mut seen = HashSet::new();
+        handle_issue(&mut db, &issue(30, "reopen対象", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
+        let id = crate::db::load_backlog_tasks(&mut db).unwrap()[0].id;
+
+        // detect_closed 相当: closed 検出で status="done" にする
+        crate::db::set_task_status_done(&mut db, id).unwrap();
+        // load_backlog_tasks は done を除外する → 見えなくなる
+        assert!(crate::db::load_backlog_tasks(&mut db).unwrap().is_empty());
+
+        // upstream で reopen → 再度 import
+        let mut seen2 = HashSet::new();
+        let mut summary2 = ImportSummary::default();
+        handle_issue(&mut db, &issue(30, "reopen対象", None), &opts, chrono_tz::UTC, &mut seen2, &mut summary2).unwrap();
+        assert_eq!(summary2.updated, 1);
+        let tasks = crate::db::load_backlog_tasks(&mut db).unwrap();
+        assert_eq!(tasks.len(), 1, "reopen された issue が backlog に復帰する");
+        assert_eq!(tasks[0].id, id);
+    }
+
+    #[test]
     fn pull_request_is_skipped() {
         let (_t, mut db) = setup_db();
         let opts = ImportOptions::default();
@@ -234,7 +369,7 @@ mod tests {
 
         let mut pr: Issue = issue(99, "PR", None);
         pr.pull_request = Some(serde_json::from_str("{}").unwrap());
-        handle_issue(&mut db, &pr, &opts, &mut seen, &mut summary).unwrap();
+        handle_issue(&mut db, &pr, &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.created, 0);
         assert!(crate::db::load_backlog_tasks(&mut db).unwrap().is_empty());
@@ -247,9 +382,77 @@ mod tests {
         let mut seen = HashSet::new();
         let mut summary = ImportSummary::default();
 
-        handle_issue(&mut db, &issue(12, "x", None), &opts, &mut seen, &mut summary).unwrap();
-        handle_issue(&mut db, &issue(12, "x", None), &opts, &mut seen, &mut summary).unwrap();
+        handle_issue(&mut db, &issue(12, "x", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
+        handle_issue(&mut db, &issue(12, "x", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
         assert_eq!(summary.created, 1);
         assert_eq!(crate::db::load_backlog_tasks(&mut db).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn parse_external_id_ok() {
+        assert_eq!(
+            parse_external_id("github:ycookiey/ytasky#123"),
+            Some(("ycookiey".into(), "ytasky".into(), 123))
+        );
+        // repo に - や . を含んでも OK
+        assert_eq!(
+            parse_external_id("github:foo/bar-baz.rs#7"),
+            Some(("foo".into(), "bar-baz.rs".into(), 7))
+        );
+    }
+
+    #[test]
+    fn parse_external_id_invalid() {
+        assert!(parse_external_id("gcal:x").is_none()); // 別 prefix
+        assert!(parse_external_id("github:foo#1").is_none()); // repo なし
+        assert!(parse_external_id("github:foo/bar").is_none()); // #number なし
+        assert!(parse_external_id("github:foo/bar#abc").is_none()); // number 非数値
+        assert!(parse_external_id("github:/bar#1").is_none()); // owner 空
+        assert!(parse_external_id("github:foo/#1").is_none()); // repo 空
+        assert!(parse_external_id("").is_none());
+    }
+
+    #[test]
+    fn list_backlog_github_only_github_backlog() {
+        let (_t, mut db) = setup_db();
+        let opts = ImportOptions::default();
+        let mut seen = HashSet::new();
+        let mut summary = ImportSummary::default();
+
+        // GitHub backlog: 2件
+        handle_issue(&mut db, &issue(10, "a", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
+        handle_issue(&mut db, &issue(11, "b", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
+        // 手動 backlog: 1件（external_id なし → 対象外）
+        crate::db::insert_backlog_task(&mut db, "手動", "3", 30, None).unwrap();
+
+        let mut exts: Vec<String> = crate::db::list_backlog_github_external_ids(&db)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect();
+        exts.sort();
+        assert_eq!(
+            exts,
+            vec![
+                "github:ycookiey/ytasky#10".to_string(),
+                "github:ycookiey/ytasky#11".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_backlog_github_excludes_scheduled() {
+        let (_t, mut db) = setup_db();
+        let opts = ImportOptions::default();
+        let mut seen = HashSet::new();
+        let mut summary = ImportSummary::default();
+
+        handle_issue(&mut db, &issue(20, "y", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
+        // schedule 済み (is_backlog=false) に移動 → 対象外
+        let id = crate::db::load_backlog_tasks(&mut db).unwrap()[0].id;
+        crate::db::set_backlog_flag(&mut db, id, false).unwrap();
+
+        let list = crate::db::list_backlog_github_external_ids(&db).unwrap();
+        assert!(list.is_empty(), "backlog を外れた task は対象外");
     }
 }

@@ -752,7 +752,7 @@ impl YtaskyMcpServer {
     }
 
     #[tool(
-        description = "Import GitHub issues into ytasky backlog tasks. Open issues matching the search queries become backlog tasks (pull requests are skipped). Idempotent via external_id: existing tasks only update title/deadline, preserving user-set category/duration."
+        description = "Import GitHub issues into ytasky backlog tasks. Open issues matching the search queries become backlog tasks (pull requests are skipped). Idempotent via external_id: existing tasks only update title/deadline, preserving user-set category/duration. Also detects upstream-closed issues among existing backlog GitHub tasks and marks them status=done (closed_done count in response)."
     )]
     async fn import_github(
         &self,
@@ -785,6 +785,7 @@ impl YtaskyMcpServer {
                 "created": summary.created,
                 "updated": summary.updated,
                 "skipped": summary.skipped,
+                "closed_done": summary.closed_done,
                 "errors": summary.errors,
             }))
         }
