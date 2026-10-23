@@ -1,4 +1,4 @@
-//! Google Calendar API v3 のレスポンス型 (必要なフィールドのみ)。
+//! Google Calendar API v3 response types, limited to the fields the import reads.
 
 use serde::Deserialize;
 
@@ -22,11 +22,11 @@ pub struct Event {
     pub summary: Option<String>,
     pub start: Option<EventDateTime>,
     pub end: Option<EventDateTime>,
-    /// RRULE / EXDATE / RDATE の配列 (例: ["RRULE:FREQ=WEEKLY;BYDAY=MO"])
+    /// RRULE / EXDATE / RDATE lines, e.g. ["RRULE:FREQ=WEEKLY;BYDAY=MO"]
     #[serde(default)]
     pub recurrence: Option<Vec<String>>,
-    /// 親イベント (繰り返し instance の場合)。単発展開された instance は親側で
-    /// 処理済みのためスキップ判定に使う。
+    /// Set on an instance of a recurring event. Such instances are skipped because
+    /// the parent event already covers them.
     #[serde(default)]
     pub recurring_event_id: Option<String>,
 }
@@ -34,16 +34,15 @@ pub struct Event {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventDateTime {
-    /// RFC3339 形式 (時刻指定イベント)
+    /// RFC 3339, for timed events
     #[serde(default)]
     pub date_time: Option<String>,
-    /// YYYY-MM-DD (終日イベント)
+    /// YYYY-MM-DD, for all-day events
     #[serde(default)]
     pub date: Option<String>,
 }
 
 impl Event {
-    /// 終日イベントか
     pub fn is_all_day(&self) -> bool {
         self.start
             .as_ref()
@@ -51,13 +50,12 @@ impl Event {
             .is_some()
     }
 
-    /// cancelled
     pub fn is_cancelled(&self) -> bool {
         self.status.as_deref() == Some("cancelled")
     }
 }
 
-// ---- テスト -------------------------------------------------------------------
+// ---- tests -------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -101,8 +99,8 @@ mod tests {
 
     #[test]
     fn parse_recurrence_and_instance() {
-        // 親 (RRULE 付き) と展開済み instance (recurringEventId 付き) を区別できること。
-        // GCal が返す不要フィールド (originalStartTime 等) は無視される。
+        // The parent (with RRULE) and an expanded instance (with recurringEventId) must be
+        // distinguishable; unknown fields such as originalStartTime are ignored.
         let raw = r#"{
             "items": [
                 {

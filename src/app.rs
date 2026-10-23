@@ -67,11 +67,11 @@ pub struct RecurrenceFormState {
     pub pattern_idx: usize,
     pub weekly_days: Vec<u8>,
     pub monthly_days: Vec<u8>,
-    /// INTERVAL 入力（空文字で未指定=1）
+    /// Empty means unset, which is an interval of 1.
     pub interval_input: String,
-    /// BYSETPOS (monthly のみ)。None / 1..=5 / -1 をサイクル
+    /// BYSETPOS, monthly only. Cycles through None / 1..=5 / -1.
     pub setpos: Option<i8>,
-    /// monthly + setpos のとき選ぶ曜日 (1..=7)。setpos=None なら無視
+    /// Weekday (1..=7) picked for monthly + setpos. Ignored when setpos is None.
     pub monthly_weekday: u8,
     pub end_date: Option<String>,
     pub end_date_input: String,
@@ -148,11 +148,10 @@ pub struct App {
     pub row_cursor: usize,
     pub preferred_row: usize,
     pub backlog_cursor: usize,
-    /// GitHub セクション（backlog_tasks 末尾の GitHub import 分）が展開表示中か。
-    /// default false（折りたたみ）。起動毎リセット、DB に保存しない。
+    /// Whether the GitHub section (the imported tasks at the end of backlog_tasks) is expanded.
+    /// Starts collapsed on every launch and is not stored in the DB.
     pub backlog_github_expanded: bool,
-    /// GitHub セクションのヘッダ行にフォーカスが乗っているか。
-    /// true の間は `selected_backlog_task()` は `None` を返す。
+    /// While the GitHub section header has focus, `selected_backlog_task()` returns `None`.
     pub backlog_header_focused: bool,
     pub recurrence_cursor: usize,
     pub focus: PanelFocus,
@@ -162,14 +161,14 @@ pub struct App {
     pub input_mode: InputMode,
     pub status_message: Option<String>,
     undo_manager: UndoManager,
-    // background sync (gcal / github) の Receiver 群。複数ソースを 1 箇所で扱う。
-    // タプルの &str は表示名 兼 二重起動ガードのキー。
+    // Receivers of the background syncs. The &str is both the display name and the key
+    // that prevents starting the same source twice.
     #[cfg(any(feature = "gcal", feature = "github"))]
     sync_rx: Vec<(&'static str, std::sync::mpsc::Receiver<SyncMessage>)>,
 }
 
-/// background sync の完了通知。整形済みの表示本文を運ぶ。
-/// source は進行中判定のため `sync_rx` のタプル側に持たせる。
+/// Completion notice of a background sync, carrying the formatted status text.
+/// The source lives in the `sync_rx` tuple so that in-progress checks can use it.
 #[cfg(any(feature = "gcal", feature = "github"))]
 pub(crate) struct SyncMessage {
     pub status: anyhow::Result<String>,
@@ -241,16 +240,15 @@ impl App {
             sync_rx: spawn_lazy_syncs(),
         };
         app.partition_backlog_manual_first();
-        // clamp_cursors は section 整合 (backlog_cursor が manual_count 以上かつ
-        // 折りたたみ中なら header へ退避) を含むため、起動時 (manual_count=0 & github_count>0
-        // で cursor=0 が非表示 GitHub row を指すケース等) も必ず呼ぶ。
+        // clamp_cursors also fixes the section state (moves backlog_cursor to the header
+        // when it points into the collapsed GitHub section), so call it at startup too:
+        // with manual_count=0 and github_count>0, cursor=0 points at a hidden GitHub row.
         app.clamp_cursors();
         app.refresh_recurrences()?;
         Ok(app)
     }
 
-    /// lazy sync スレッドからの完了通知を取り込み、status_message に反映する。
-    /// メインイベントループから定期的に呼ぶ。
+    /// Called from the main event loop.
     pub fn poll_background_sync(&mut self) {
         #[cfg(any(feature = "gcal", feature = "github"))]
         {
@@ -265,27 +263,27 @@ impl App {
                             Ok(s) => format!("{source} auto-sync: {s}"),
                             Err(e) => format!("{source} auto-sync エラー: {e}"),
                         };
-                        // 同一 poll で複数 rx が完了した場合、後の文言が先の文言を
-                        // 破棄しないよう " | " で連結する（GCal と GitHub が同時完了時等）。
+                        // When several receivers finish in the same poll, join the messages
+                        // with " | " so a later one does not overwrite an earlier one.
                         self.status_message = Some(match self.status_message.take() {
                             Some(prev) => format!("{prev} | {new_msg}"),
                             None => new_msg,
                         });
                         received = true;
-                        self.sync_rx.swap_remove(i); // 完了した rx を除去 (i は再検査)
+                        self.sync_rx.swap_remove(i); // i is checked again after the swap
                     }
                     Err(TryRecvError::Empty) => i += 1,
-                    // スレッドが panic 等で終了 → 諦めて除去
+                    // The thread ended without sending (e.g. it panicked).
                     Err(TryRecvError::Disconnected) => {
                         self.sync_rx.swap_remove(i);
                     }
                 }
             }
             if received {
-                // 別スレッドが書き込んだ consolidated log を読み直して
-                // メインスレッドの in-memory 状態を最新化する。
+                // Reload the log written by the other thread so the in-memory state
+                // of the main thread is current.
                 if let Err(e) = self.db.refresh() {
-                    // alt-screen TUI 中に eprintln すると画面が乱れるため status_message に載せる。
+                    // eprintln would corrupt the alt-screen TUI, so show the error in the status line.
                     let msg = format!("db refresh after background sync failed: {e}");
                     self.status_message = Some(match self.status_message.take() {
                         Some(prev) => format!("{prev} | {msg}"),
@@ -313,8 +311,8 @@ impl App {
             return;
         }
 
-        // 共通キー (view 横断)。ハンドラと下部バー表示は keymap の単一テーブルから
-        // 生成されるため、ここに 1 行足せば両方に反映される。
+        // The handlers and the key binding bar are both built from the keymap tables,
+        // so adding one entry there updates both.
         if dispatch_binding(self, &key, COMMON_BINDINGS) {
             return;
         }
@@ -333,7 +331,6 @@ impl App {
         }
     }
 
-    // ---- keymap action から呼ぶ薄い helper -------------------------------------
 
     fn select_row_down(&mut self) {
         let max_row = self.cursor_tasks().len().saturating_sub(1);
@@ -350,7 +347,6 @@ impl App {
         self.preferred_row = self.row_cursor;
     }
 
-    /// Result を返す操作の結果を status_message に反映する共通処理。
     fn report_err(&mut self, result: anyhow::Result<()>) {
         if let Err(err) = result {
             self.status_message = Some(err.to_string());
@@ -377,7 +373,7 @@ impl App {
 
     fn handle_backlog_panel_key(&mut self, key: KeyEvent) {
         if matches!(key.code, KeyCode::Char('T') | KeyCode::BackTab) {
-            // Recurrences タブへ切替時はヘッダ選択状態を落とす
+            // Leaving the Backlog tab drops the header focus.
             self.backlog_header_focused = false;
             self.backlog_tab = match self.backlog_tab {
                 BacklogTab::Backlog => BacklogTab::Recurrences,
@@ -430,11 +426,11 @@ impl App {
         }
     }
 
-    /// backlog panel の j/Down 移動。ヘッダ (has_gh 時) を経由してセクションを跨ぐ。
-    /// 折りたたみ中は GitHub タスクへは進めない（ヘッダで止まる）。
+    /// Moves down through the header (when there is a GitHub section) into the next section.
+    /// While collapsed, the cursor stops at the header.
     fn backlog_cursor_move_down(&mut self, manual_count: usize, has_gh: bool) {
         if self.backlog_header_focused {
-            // ヘッダから下: 展開時は最初の GitHub タスクへ、折りたたみ時は動かない
+            // From the header: to the first GitHub task when expanded, otherwise stay.
             if self.backlog_github_expanded && manual_count < self.backlog_tasks.len() {
                 self.backlog_header_focused = false;
                 self.backlog_cursor = manual_count;
@@ -445,14 +441,14 @@ impl App {
         if next < manual_count {
             self.backlog_cursor = next;
         } else if next == manual_count && has_gh {
-            // Manual 最後 → ヘッダ
+            // From the last manual task to the header.
             self.backlog_header_focused = true;
         } else if self.backlog_github_expanded && next < self.backlog_tasks.len() {
             self.backlog_cursor = next;
         }
     }
 
-    /// backlog panel の k/Up 移動。ヘッダを経由して Manual 側へ戻る。
+    /// Moves up through the header back into the manual section.
     fn backlog_cursor_move_up(&mut self, manual_count: usize) {
         if self.backlog_header_focused {
             if manual_count > 0 {
@@ -464,7 +460,7 @@ impl App {
         if self.backlog_cursor == manual_count
             && manual_count < self.backlog_tasks.len()
         {
-            // GitHub 先頭 → ヘッダ
+            // From the first GitHub task to the header.
             self.backlog_header_focused = true;
         } else if self.backlog_cursor > 0 {
             self.backlog_cursor -= 1;
@@ -603,8 +599,8 @@ impl App {
             InputMode::BacklogSelect { mut cursor } => match key.code {
                 KeyCode::Esc => {
                     self.status_message = None;
-                    // BacklogSelect 中に backlog_cursor が任意の index (折りたたみ済み
-                    // GitHub 部分含む) を指すため、Normal 復帰時に section 整合を戻す。
+                    // In BacklogSelect, backlog_cursor can point at any index, including the
+                    // collapsed GitHub part, so restore the section state on return to Normal.
                     self.clamp_cursors();
                 }
                 KeyCode::Char('j') | KeyCode::Down => {
@@ -674,9 +670,8 @@ impl App {
         }
     }
 
-    /// TUI から手動で発火する GCal import を別スレッドで起動する。
-    /// メインスレッドは status_message に "Importing..." を出し、HTTP の
-    /// 完了は `poll_background_sync` 経由でトーストとして拾う。
+    /// Runs a GCal import started from the TUI on a separate thread. The main thread shows
+    /// "Importing..." and picks up the result as a toast through `poll_background_sync`.
     #[cfg(feature = "gcal")]
     fn kick_gcal_import_background(&mut self, days: u32) {
         if self.sync_in_progress("GCal") {
@@ -702,13 +697,12 @@ impl App {
         }
     }
 
-    /// 指定 source の background sync が進行中か。
     #[cfg(any(feature = "gcal", feature = "github"))]
     fn sync_in_progress(&self, source: &str) -> bool {
         self.sync_rx.iter().any(|(s, _)| *s == source)
     }
 
-    /// TUI から手動で発火する GitHub import を別スレッドで起動する。
+    /// Runs a GitHub import started from the TUI on a separate thread.
     #[cfg(feature = "github")]
     fn kick_github_import_background(&mut self) {
         if self.sync_in_progress("GitHub") {
@@ -1006,7 +1000,7 @@ impl App {
                 }
                 FormAction::KeepOpen
             }
-            // Pattern zone: j/k でパターン行移動
+            // Pattern zone: j/k moves between pattern rows
             KeyCode::Up | KeyCode::Char('k') if form.field == RecurrenceFormField::Pattern => {
                 let idx = if form.pattern_idx == 0 {
                     PATTERNS.len() - 1
@@ -1021,7 +1015,7 @@ impl App {
                 self.set_recurrence_pattern(form, idx);
                 FormAction::KeepOpen
             }
-            // Pattern zone (weekly): h/l で曜日カーソル移動
+            // Pattern zone (weekly): h/l moves the weekday cursor
             KeyCode::Left | KeyCode::Char('h')
                 if form.field == RecurrenceFormField::Pattern && form.pattern == "weekly" =>
             {
@@ -1038,7 +1032,7 @@ impl App {
                 }
                 FormAction::KeepOpen
             }
-            // Pattern zone (weekly): space で曜日トグル
+            // Pattern zone (weekly): space toggles the weekday
             KeyCode::Char(' ')
                 if form.field == RecurrenceFormField::Pattern && form.pattern == "weekly" =>
             {
@@ -1073,7 +1067,7 @@ impl App {
                 self.shift_recurrence_end_date(form, 7);
                 FormAction::KeepOpen
             }
-            // Setpos zone: h/l でサイクル (None → 1 → 2 → 3 → 4 → 5 → -1 → None)
+            // Setpos zone: h/l cycles None -> 1 -> 2 -> 3 -> 4 -> 5 -> -1 -> None
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k')
                 if form.field == RecurrenceFormField::Setpos =>
             {
@@ -1086,7 +1080,7 @@ impl App {
                 form.setpos = cycle_setpos(form.setpos, 1);
                 FormAction::KeepOpen
             }
-            // Setpos zone (monthly): 1-7 で曜日選択
+            // Setpos zone (monthly): 1-7 picks the weekday
             KeyCode::Char(c)
                 if form.field == RecurrenceFormField::Setpos
                     && form.setpos.is_some()
@@ -1098,7 +1092,7 @@ impl App {
             KeyCode::Char(c) => {
                 match form.field {
                     RecurrenceFormField::Pattern if form.pattern == "weekly" => {
-                        // 1-7 で曜日直接トグル
+                        // 1-7 toggles a weekday directly
                         if ('1'..='7').contains(&c) {
                             let day = (c as u8) - b'0';
                             if let Some(pos) = form.weekly_days.iter().position(|d| *d == day) {
@@ -1110,7 +1104,7 @@ impl App {
                         }
                     }
                     RecurrenceFormField::Pattern if form.pattern == "monthly" => {
-                        // 数字で日付入力 (setpos なしのとき)
+                        // Digits type a day of the month (without setpos)
                         if form.setpos.is_none() && c.is_ascii_digit() {
                             let digit = (c as u8 - b'0') as i32;
                             let current = form.monthly_days.first().copied().unwrap_or(0) as i32;
@@ -1129,7 +1123,7 @@ impl App {
                     }
                     RecurrenceFormField::Interval => {
                         if c.is_ascii_digit() && form.interval_input.len() < 3 {
-                            // 先頭 0 を防ぐ
+                            // No leading zero
                             if !(form.interval_input.is_empty() && c == '0') {
                                 form.interval_input.push(c);
                             }
@@ -1325,9 +1319,9 @@ impl App {
                     deadline.clone(),
                 );
                 self.run_command(Box::new(command))?;
-                // partition 後は Manual タスクが先頭にまとまるので、新規追加された Manual は
-                // manual_count-1 位置。末尾 (backlog_tasks.len()-1) を指すと折りたたみ済み
-                // GitHub 行を選ぶことになる。
+                // After partitioning, manual tasks come first, so a new manual task is at
+                // manual_count-1. The last index (backlog_tasks.len()-1) could be a
+                // collapsed GitHub row.
                 let manual_count = self.backlog_manual_count();
                 if manual_count > 0 {
                     self.backlog_cursor = manual_count - 1;
@@ -1465,7 +1459,7 @@ impl App {
         let task_date = task.date.clone();
 
         if let Some(recurrence_id) = task.recurrence_id {
-            // 編集モード: 既存ルールをプリフィル
+            // Edit mode: prefill from the existing rule
             let Some(rec) = self.recurrences.iter().find(|r| r.id == recurrence_id).cloned()
             else {
                 self.status_message = Some("繰り返しルールが見つかりません".to_string());
@@ -1489,7 +1483,7 @@ impl App {
                 .filter(|n| *n != 1)
                 .map(|n| n.to_string())
                 .unwrap_or_default();
-            // monthly + setpos のとき days は曜日番号1つ。setpos なしなら従来通り日付列
+            // With monthly + setpos, days holds one weekday number. Without setpos it holds days of the month.
             let (weekly_days, monthly_days, monthly_weekday) = match rec.pattern.as_str() {
                 "weekly" => (days, Vec::new(), 1),
                 "monthly" if setpos.is_some() => {
@@ -1521,7 +1515,7 @@ impl App {
                 day_cursor,
             });
         } else {
-            // 新規作成モード（weekly/monthly切替時にスマートデフォルト発動）
+            // New rule. Switching to weekly/monthly fills in defaults.
             self.input_mode = InputMode::RecurrenceForm(RecurrenceFormState {
                 task_id,
                 task_date,
@@ -1767,8 +1761,7 @@ impl App {
         self.backlog_tasks.get(self.backlog_cursor)
     }
 
-    /// backlog_tasks を「Manual first, GitHub last」に並べ替える。
-    /// 各セクション内の元順序 (deadline 昇順) は stable partition で保たれる。
+    /// Stable partition, so each section keeps its deadline order.
     pub(crate) fn partition_backlog_manual_first(&mut self) {
         partition_manual_first(&mut self.backlog_tasks);
     }
@@ -1874,9 +1867,9 @@ impl App {
             self.refresh_tasks()?;
             return Ok(());
         }
-        // TODO: ybasey session undo fallback (opt-in)
-        // app 層 undo stack が空。ybasey session undo は粒度が異なるため現時点では無効。
-        // 将来的に設定で有効化する。
+        // TODO: optionally fall back to the database's session undo when the app's
+        // undo stack is empty. Disabled for now because its granularity differs from
+        // the app's undo commands.
         // let result = self.db.undo(UndoOptions::default())?;
         // if result.undone_ops > 0 { self.refresh_tasks()?; }
         self.status_message = Some("戻す操作がありません".into());
@@ -1999,7 +1992,7 @@ impl App {
         } else if self.backlog_cursor >= self.backlog_tasks.len() {
             self.backlog_cursor = self.backlog_tasks.len() - 1;
         }
-        // セクション整合性: 折りたたみ中に GitHub タスク位置に居たら退避
+        // While collapsed, move the cursor off a GitHub task.
         let manual_count = self.backlog_manual_count();
         if !self.backlog_github_expanded
             && !self.backlog_header_focused
@@ -2013,7 +2006,7 @@ impl App {
                 self.backlog_cursor = 0;
             }
         }
-        // GitHub セクションが無くなったのにヘッダ選択中 → Manual 末尾へ戻す
+        // The GitHub section is gone but the header has focus: move to the last manual task.
         if self.backlog_header_focused && !self.has_backlog_github_section() {
             self.backlog_header_focused = false;
             self.backlog_cursor = manual_count.saturating_sub(1);
@@ -2035,7 +2028,6 @@ impl App {
         };
     }
 
-    /// 現在カーソルがある日付を返す
     pub fn cursor_date(&self) -> &str {
         self.day_tasks
             .get(self.col_cursor)
@@ -2043,7 +2035,6 @@ impl App {
             .unwrap_or(self.view_start_date.as_str())
     }
 
-    /// 現在カーソルがあるカラムのタスク一覧を返す
     pub fn cursor_tasks(&self) -> &[Task] {
         self.day_tasks
             .get(self.col_cursor)
@@ -2051,7 +2042,7 @@ impl App {
             .unwrap_or(&[])
     }
 
-    /// 残り時間（分）を計算
+    /// Minutes left in the day after all tasks of the cursor column.
     pub fn remaining_minutes(&self) -> i32 {
         let used_minutes: i64 = self
             .cursor_tasks()
@@ -2609,11 +2600,9 @@ fn round_up_to_next_15_minutes(minutes: i32) -> i32 {
     }
 }
 
-/// 起動時 lazy sync を std::thread::spawn で起動する。
-/// - `gcal_token.json` が無ければ何もしない (Receiver は None)
-/// - `~/.config/ytasky/config.json` で `gcal_auto_sync: false` なら無効
-/// - 別ハンドルで `Database::open` するため、ybasey の write 排他に従う
-/// 起動時の lazy sync 群を起動し、進行中の Receiver を集めて返す。
+/// Starts the startup syncs and returns the receivers of those in progress.
+/// GCal sync is skipped without `gcal_token.json` or when `gcal_auto_sync` is false.
+/// Each sync opens its own `Database` handle and relies on the database's write lock.
 #[cfg(any(feature = "gcal", feature = "github"))]
 fn spawn_lazy_syncs() -> Vec<(&'static str, std::sync::mpsc::Receiver<SyncMessage>)> {
     let mut rxs = Vec::new();
@@ -2673,7 +2662,6 @@ fn run_gcal_lazy_sync(days: u32) -> anyhow::Result<crate::gcal::import::ImportSu
     crate::gcal::import::import_range(&mut db, today, to, &opts)
 }
 
-/// task が GitHub import 由来（external_id が "github:" prefix）か判定する。
 fn is_github_task(t: &Task) -> bool {
     t.external_id
         .as_deref()
@@ -2681,8 +2669,7 @@ fn is_github_task(t: &Task) -> bool {
         .unwrap_or(false)
 }
 
-/// Vec<Task> を「Manual first, GitHub last」に stable partition する。
-/// 各セクション内の元順序は保存される。
+/// Stable partition: manual tasks first, GitHub tasks last, each keeping its order.
 fn partition_manual_first(tasks: &mut Vec<Task>) {
     let mut manual = Vec::with_capacity(tasks.len());
     let mut github = Vec::new();
@@ -2709,11 +2696,11 @@ fn format_github_summary(s: &crate::github::import::ImportSummary) -> String {
     out
 }
 
-/// `github_auto_sync` が有効で queries が設定されていれば lazy sync を起動する。
+/// Starts a sync when `github_auto_sync` is on and queries are set.
 #[cfg(feature = "github")]
 fn spawn_github_lazy_sync() -> Option<std::sync::mpsc::Receiver<SyncMessage>> {
-    // config load 失敗 (JSON パース error 等) は起動時に TUI へ通知する。
-    // 旧実装は unwrap_or_default で握り潰していた。
+    // Report a config load error (such as invalid JSON) in the TUI instead of
+    // silently using defaults, which would hide a typo as "no queries".
     let cfg = match crate::github::load_config() {
         Ok(c) => c,
         Err(e) => {
@@ -2755,25 +2742,23 @@ fn run_github_lazy_sync() -> anyhow::Result<crate::github::import::ImportSummary
     crate::github::import::import_queries(&mut db, &cfg.github_import_queries, &opts)
 }
 
-// ---- keymap: キーバインドの single source ------------------------------------
+// ---- keymap: the single source of key bindings -------------------------------
 //
-// 1 つの Binding にキー判定 (matcher)・下部バー表示 (hint)・処理 (action) を
-// まとめ、handle_normal_key の dispatch と draw_keybindings_bar の表示生成が
-// 同じテーブルを参照する。新しいショートカットはテーブルに 1 行足すだけで
-// ハンドラと下部バー表示の両方に反映され、表示漏れが構造的に起きない。
+// Each Binding holds the key test (matcher), the bar entry (hint) and the action.
+// handle_normal_key and draw_keybindings_bar read the same tables, so a new
+// shortcut is one entry and cannot be missing from the bar.
 //
-// 対象は Normal モードの共通キー / TableView / TimelineView。Backlog パネルや
-// Form/Modal 系はテキスト入力や tab 分岐を含むため従来の match を維持する。
+// Covers the common keys in Normal mode, TableView and TimelineView. The backlog
+// panel and the forms/modals keep their own match because of text input and tabs.
 
 pub(crate) struct Binding {
     pub matcher: fn(&KeyEvent) -> bool,
-    /// 下部バー表示 (キー表記, 説明)。None なら表示しない (内部キー)。
+    /// (key label, description) for the bar. None hides internal keys.
     pub hint: Option<(&'static str, &'static str)>,
     pub action: fn(&mut App, &KeyEvent),
 }
 
-/// table 内の最初にマッチした Binding の action を実行し、true を返す。
-/// マッチしなければ false。
+/// Runs the action of the first matching Binding. Returns false if none matches.
 fn dispatch_binding(app: &mut App, key: &KeyEvent, table: &[Binding]) -> bool {
     for b in table {
         if (b.matcher)(key) {
@@ -2784,7 +2769,7 @@ fn dispatch_binding(app: &mut App, key: &KeyEvent, table: &[Binding]) -> bool {
     false
 }
 
-/// 共通キー (view 横断、ReportView を除く Normal モード)。
+/// Keys shared by all views in Normal mode, except ReportView.
 pub(crate) const COMMON_BINDINGS: &[Binding] = &[
     Binding {
         matcher: |k| k.code == KeyCode::Char('q'),
@@ -2852,7 +2837,7 @@ pub(crate) const COMMON_BINDINGS: &[Binding] = &[
     },
 ];
 
-/// TableView (Table focus) 専用キー。
+/// TableView (table focus) keys.
 pub(crate) const TABLE_BINDINGS: &[Binding] = &[
     Binding {
         matcher: |k| matches!(k.code, KeyCode::Char('j') | KeyCode::Down),
@@ -2949,7 +2934,7 @@ pub(crate) const TABLE_BINDINGS: &[Binding] = &[
     },
 ];
 
-/// TimelineView 専用キー。
+/// TimelineView keys.
 pub(crate) const TIMELINE_BINDINGS: &[Binding] = &[
     Binding {
         matcher: |k| matches!(k.code, KeyCode::Char('j') | KeyCode::Down),
@@ -3023,7 +3008,7 @@ pub(crate) const TIMELINE_BINDINGS: &[Binding] = &[
     },
 ];
 
-/// BYSETPOS のサイクル: None → 1 → 2 → 3 → 4 → 5 → -1 → None
+/// BYSETPOS cycle: None -> 1 -> 2 -> 3 -> 4 -> 5 -> -1 -> None
 fn cycle_setpos(current: Option<i8>, direction: i32) -> Option<i8> {
     const SEQ: [Option<i8>; 7] = [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(-1)];
     let idx = SEQ.iter().position(|v| *v == current).unwrap_or(0);
@@ -3059,7 +3044,7 @@ mod tests {
         assert!(is_github_task(&task(1, Some("github:o/r#1"))));
         assert!(!is_github_task(&task(2, Some("gcal:x:y"))));
         assert!(!is_github_task(&task(3, None)));
-        // prefix 部分一致は不十分（":" まで必要）
+        // The prefix must include ":"
         assert!(!is_github_task(&task(4, Some("githubfoo"))));
     }
 
@@ -3072,7 +3057,7 @@ mod tests {
             task(4, Some("gcal:c:e")),
         ];
         partition_manual_first(&mut v);
-        // Manual (2, 4) が先、GitHub (1, 3) が後。各セクション内は元順序。
+        // Manual (2, 4) first, then GitHub (1, 3), each in the original order.
         let ids: Vec<i64> = v.iter().map(|t| t.id).collect();
         assert_eq!(ids, vec![2, 4, 1, 3]);
     }

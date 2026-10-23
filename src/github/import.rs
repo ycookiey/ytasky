@@ -1,9 +1,9 @@
-//! GitHub issue → ytasky backlog タスクの import オーケストレータ。
+//! Imports GitHub issues as ytasky backlog tasks.
 //!
-//! - 検索クエリごとに search/issues を呼び、open issue を backlog タスクへ取り込む
-//! - PR は skip。複数クエリで重複した issue は external_id で排除
-//! - 列所有権分割: 新規は全列 insert、既存は title/deadline のみ update
-//!   （category/duration/配置などユーザー設定列は保持）
+//! - Runs search/issues per query and imports the open issues as backlog tasks
+//! - Skips PRs; an issue found by several queries is deduplicated by external_id
+//! - Column ownership: a new task gets every column; an existing task gets only title/deadline
+//!   updated, so the columns the user sets (category, duration, placement) are kept
 
 use std::collections::HashSet;
 
@@ -15,19 +15,19 @@ use crate::github::types::Issue;
 use crate::github::{api, external_id};
 use crate::text::sanitize_text;
 
-/// issue から取れない duration のデフォルト（分）。
+/// Default duration in minutes, since an issue has none.
 const DEFAULT_DURATION_MIN: i32 = 30;
 
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
-    /// 初回 insert 時のデフォルトカテゴリ（既存タスクには適用しない）。
+    /// Default category for newly inserted tasks (not applied to existing tasks).
     pub category_id: String,
 }
 
 impl Default for ImportOptions {
     fn default() -> Self {
         Self {
-            category_id: "3".into(), // 3 = 開発・仕事
+            category_id: "3".into(), // 3 = the seeded work category
         }
     }
 }
@@ -37,13 +37,13 @@ pub struct ImportSummary {
     pub created: usize,
     pub updated: usize,
     pub skipped: usize,
-    /// upstream で closed 化を検出して `status="done"` にした件数。
+    /// Number of tasks set to `status="done"` because their issue was closed upstream.
     pub closed_done: usize,
     pub errors: Vec<String>,
 }
 
-/// 検索クエリ群に一致する open issue を import し、
-/// 併せて既存の backlog GitHub タスクのうち upstream で closed 化したものを検出して done 化する。
+/// Imports the open issues matching the queries, and marks existing backlog GitHub tasks
+/// done when their issue was closed upstream.
 pub fn import_queries(
     db: &mut Database,
     queries: &[String],
@@ -53,19 +53,19 @@ pub fn import_queries(
     let mut summary = ImportSummary::default();
     let mut seen: HashSet<String> = HashSet::new();
 
-    // milestone.due_on の local date 変換用 tz (data_dir/_meta の tz: 行を参照)
+    // tz for converting milestone.due_on to a local date (the tz: line of data_dir/_meta)
     let tz = crate::db::data_dir()
         .ok()
         .map(|d| read_meta_tz(&d))
         .unwrap_or(chrono_tz::UTC);
 
     for query in queries {
-        // 単一 query の失敗が全体を止めないよう ? ではなく errors に集約する。
-        // 前 query で挿入済みの task はそのまま残り、detect_closed も後段で走る。
+        // Collect a failing query into errors instead of `?`, so it does not stop the rest:
+        // tasks inserted by earlier queries stay, and detect_closed still runs.
         match api::search_issues(&token, query) {
             Ok(outcome) => {
-                // 1000 件超過・incomplete_results 等の non-fatal warning を errors に集約
-                // (旧実装は eprintln で alt-screen TUI を破壊していた)。
+                // Collect non-fatal warnings (over 1000 results, incomplete_results) into errors,
+                // since eprintln would corrupt the TUI's alternate screen.
                 summary.errors.extend(outcome.warnings);
                 for issue in outcome.issues {
                     if let Err(e) = handle_issue(db, &issue, opts, tz, &mut seen, &mut summary) {
@@ -83,8 +83,8 @@ pub fn import_queries(
         }
     }
 
-    // seen に含まれなかった backlog GitHub タスクは upstream で閉じられた可能性がある。
-    // 個別 API で state 確認し、closed なもののみ status="done" にする。
+    // Backlog GitHub tasks missing from `seen` may have been closed upstream.
+    // Check each one with the issue API and mark only the closed ones done.
     let detection = detect_closed(db, &token, &seen)?;
     for (task_id, ext) in &detection.closed {
         match crate::db::set_task_status_done(db, *task_id) {
@@ -107,7 +107,6 @@ fn handle_issue(
     seen: &mut HashSet<String>,
     summary: &mut ImportSummary,
 ) -> Result<()> {
-    // PR は対象外
     if issue.is_pull_request() {
         summary.skipped += 1;
         return Ok(());
@@ -117,7 +116,7 @@ fn handle_issue(
         return Ok(());
     };
     let ext = external_id(owner, repo, issue.number);
-    // 複数クエリで重複ヒットした issue は最初の1件のみ処理
+    // An issue hit by several queries is handled only once
     if !seen.insert(ext.clone()) {
         return Ok(());
     }
@@ -131,7 +130,7 @@ fn handle_issue(
 
     match crate::db::find_task_id_by_external_id(db, &ext)? {
         Some(id) => {
-            // 既存: issue 所有列のみ更新（列所有権分割）
+            // Existing task: update only the issue-owned columns
             crate::db::update_task_imported_fields(db, id, &title, deadline.as_deref())?;
             summary.updated += 1;
         }
@@ -150,8 +149,8 @@ fn handle_issue(
     Ok(())
 }
 
-/// `github:owner/repo#123` 形式の external_id を `(owner, repo, number)` に分解する。
-/// 不正形式は `None`。
+/// Splits an external_id `github:owner/repo#123` into `(owner, repo, number)`.
+/// `None` for a malformed id.
 pub fn parse_external_id(ext: &str) -> Option<(String, String, u64)> {
     let rest = ext.strip_prefix("github:")?;
     let (repo_part, num_part) = rest.rsplit_once('#')?;
@@ -163,20 +162,20 @@ pub fn parse_external_id(ext: &str) -> Option<(String, String, u64)> {
     Some((owner.to_string(), repo.to_string(), number))
 }
 
-/// closed 検出の結果。closed リストと非致命エラーを分けて返す。
+/// Result of closed detection, with closed tasks and non-fatal errors kept apart.
 #[derive(Debug, Default, Clone)]
 pub struct ClosedDetection {
-    /// closed と判定できた (task_id, external_id) のリスト。
+    /// (task_id, external_id) of the tasks found closed.
     pub closed: Vec<(i64, String)>,
-    /// 個別 fetch のエラー（次回再試行で解消し得るので致命ではない）。
+    /// Errors of single fetches; not fatal, since the next run retries them.
     pub errors: Vec<String>,
 }
 
-/// backlog の GitHub import タスクのうち、直近 search 結果 `seen` に含まれなかったものについて
-/// `GET /repos/:owner/:repo/issues/:number` で state を確認し closed のみ列挙する。
-/// - 404 (repo 削除・権限喪失等) は勝手に done 化しない
-/// - open だった（クエリを狭めた等の理由）は無視
-/// - HTTP エラーは `errors` に積んで次回リトライに回す
+/// For backlog GitHub tasks missing from the latest search results `seen`, checks the state
+/// with `GET /repos/:owner/:repo/issues/:number` and lists only the closed ones.
+/// - 404 (repo deleted, access lost) does not mark the task done
+/// - A still open issue (e.g. the query was narrowed) is ignored
+/// - HTTP errors go into `errors` and are retried on the next run
 pub fn detect_closed(
     db: &Database,
     token: &auth::GithubToken,
@@ -206,17 +205,17 @@ pub fn detect_closed(
     Ok(result)
 }
 
-/// milestone.due_on (RFC3339 例 `2026-06-15T20:00:00Z`) を local tz の `YYYY-MM-DD` にする。
-/// milestone は日粒度だが GitHub は UTC で保持するため、UTC 深夜だと JST では翌日にずれる。
-/// `_meta` の `tz:` を参照して local date を求める（gcal と同じパターン）。
+/// Converts milestone.due_on (RFC 3339, e.g. `2026-06-15T20:00:00Z`) to `YYYY-MM-DD` in the local tz.
+/// Milestones are day-granular, but GitHub stores them in UTC, so a late UTC time is the next day in zones east of UTC.
+/// The local tz is the `tz:` line of `_meta`, as in the gcal import.
 fn due_on_to_date(due_on: &str, tz: chrono_tz::Tz) -> Option<String> {
     let dt = chrono::DateTime::parse_from_rfc3339(due_on).ok()?;
     let local = dt.with_timezone(&tz);
     Some(local.date_naive().format("%Y-%m-%d").to_string())
 }
 
-/// `_meta` の `tz:` 行から chrono_tz::Tz を得る。無ければ UTC。
-/// gcal::tz::read_meta_tz と同等のロジック（gcal feature 非依存で使うため複製）。
+/// Reads the `tz:` line of `_meta` as chrono_tz::Tz; UTC when missing.
+/// Duplicates gcal::tz::read_meta_tz so that this module works without the gcal feature.
 fn read_meta_tz(data_dir: &std::path::Path) -> chrono_tz::Tz {
     let path = data_dir.join("_meta");
     if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -259,7 +258,7 @@ mod tests {
 
     #[test]
     fn due_on_conversion() {
-        // UTC 07:00 は UTC 上でも同日
+        // 07:00 UTC stays on the same date
         assert_eq!(
             due_on_to_date("2026-06-15T07:00:00Z", chrono_tz::UTC).as_deref(),
             Some("2026-06-15")
@@ -270,12 +269,12 @@ mod tests {
 
     #[test]
     fn due_on_shifts_to_local_tz() {
-        // UTC 20:00 → JST 翌日 05:00 → 翌日日付
+        // 20:00 UTC -> 05:00 next day in JST -> next date
         assert_eq!(
             due_on_to_date("2026-06-15T20:00:00Z", chrono_tz::Asia::Tokyo).as_deref(),
             Some("2026-06-16")
         );
-        // UTC 00:00 → JST 09:00 → 同日
+        // 00:00 UTC -> 09:00 JST -> same date
         assert_eq!(
             due_on_to_date("2026-06-15T00:00:00Z", chrono_tz::Asia::Tokyo).as_deref(),
             Some("2026-06-15")
@@ -311,15 +310,15 @@ mod tests {
         let opts = ImportOptions::default();
         let mut summary = ImportSummary::default();
 
-        // 初回 insert
+        // First insert
         let mut seen = HashSet::new();
         handle_issue(&mut db, &issue(12, "旧タイトル", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
         let id = crate::db::load_backlog_tasks(&mut db).unwrap()[0].id;
 
-        // ユーザーが category/duration を手で変更したと仮定
+        // Simulate the user changing category/duration by hand
         crate::db::update_task_with_deadline(&mut db, id, "旧タイトル", "5", 90, None, None).unwrap();
 
-        // 2回目 import: title が変わった
+        // Second import: the title changed
         let mut seen2 = HashSet::new();
         let mut summary2 = ImportSummary::default();
         handle_issue(&mut db, &issue(12, "新タイトル", None), &opts, chrono_tz::UTC, &mut seen2, &mut summary2).unwrap();
@@ -328,9 +327,9 @@ mod tests {
 
         let tasks = crate::db::load_backlog_tasks(&mut db).unwrap();
         assert_eq!(tasks.len(), 1, "重複 insert されていない");
-        // issue 所有列 (title) は更新される
+        // The issue-owned column (title) is updated
         assert_eq!(tasks[0].title, "#12 新タイトル");
-        // ユーザー所有列 (category/duration) は保持される
+        // The user-owned columns (category/duration) are kept
         assert_eq!(tasks[0].category_id, "5");
         assert_eq!(tasks[0].duration_min, 90);
     }
@@ -345,12 +344,12 @@ mod tests {
         handle_issue(&mut db, &issue(30, "reopen対象", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
         let id = crate::db::load_backlog_tasks(&mut db).unwrap()[0].id;
 
-        // detect_closed 相当: closed 検出で status="done" にする
+        // As detect_closed does: mark the closed issue done
         crate::db::set_task_status_done(&mut db, id).unwrap();
-        // load_backlog_tasks は done を除外する → 見えなくなる
+        // load_backlog_tasks excludes done tasks, so it disappears
         assert!(crate::db::load_backlog_tasks(&mut db).unwrap().is_empty());
 
-        // upstream で reopen → 再度 import
+        // Reopened upstream: import again
         let mut seen2 = HashSet::new();
         let mut summary2 = ImportSummary::default();
         handle_issue(&mut db, &issue(30, "reopen対象", None), &opts, chrono_tz::UTC, &mut seen2, &mut summary2).unwrap();
@@ -394,7 +393,7 @@ mod tests {
             parse_external_id("github:ycookiey/ytasky#123"),
             Some(("ycookiey".into(), "ytasky".into(), 123))
         );
-        // repo に - や . を含んでも OK
+        // A repo name may contain - and .
         assert_eq!(
             parse_external_id("github:foo/bar-baz.rs#7"),
             Some(("foo".into(), "bar-baz.rs".into(), 7))
@@ -403,12 +402,12 @@ mod tests {
 
     #[test]
     fn parse_external_id_invalid() {
-        assert!(parse_external_id("gcal:x").is_none()); // 別 prefix
-        assert!(parse_external_id("github:foo#1").is_none()); // repo なし
-        assert!(parse_external_id("github:foo/bar").is_none()); // #number なし
-        assert!(parse_external_id("github:foo/bar#abc").is_none()); // number 非数値
-        assert!(parse_external_id("github:/bar#1").is_none()); // owner 空
-        assert!(parse_external_id("github:foo/#1").is_none()); // repo 空
+        assert!(parse_external_id("gcal:x").is_none()); // other prefix
+        assert!(parse_external_id("github:foo#1").is_none()); // no repo
+        assert!(parse_external_id("github:foo/bar").is_none()); // no #number
+        assert!(parse_external_id("github:foo/bar#abc").is_none()); // non-numeric number
+        assert!(parse_external_id("github:/bar#1").is_none()); // empty owner
+        assert!(parse_external_id("github:foo/#1").is_none()); // empty repo
         assert!(parse_external_id("").is_none());
     }
 
@@ -419,10 +418,10 @@ mod tests {
         let mut seen = HashSet::new();
         let mut summary = ImportSummary::default();
 
-        // GitHub backlog: 2件
+        // GitHub backlog: 2 tasks
         handle_issue(&mut db, &issue(10, "a", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
         handle_issue(&mut db, &issue(11, "b", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
-        // 手動 backlog: 1件（external_id なし → 対象外）
+        // Manual backlog: 1 task (no external_id, so not a target)
         crate::db::insert_backlog_task(&mut db, "手動", "3", 30, None).unwrap();
 
         let mut exts: Vec<String> = crate::db::list_backlog_github_external_ids(&db)
@@ -448,7 +447,7 @@ mod tests {
         let mut summary = ImportSummary::default();
 
         handle_issue(&mut db, &issue(20, "y", None), &opts, chrono_tz::UTC, &mut seen, &mut summary).unwrap();
-        // schedule 済み (is_backlog=false) に移動 → 対象外
+        // Moved to the schedule (is_backlog=false), so not a target
         let id = crate::db::load_backlog_tasks(&mut db).unwrap()[0].id;
         crate::db::set_backlog_flag(&mut db, id, false).unwrap();
 

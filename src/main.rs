@@ -40,10 +40,10 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
         Some(cli::Commands::Init { force, yes }) => init::run_init(force, yes),
-        // update は ytasky.exe を置換するため DB を開かない (ロックを掴まない)。
+        // update replaces ytasky.exe, so it must not open the DB and hold its lock.
         Some(cli::Commands::Update) => update::run(),
-        // gcal-login / gcal-logout は OAuth token のみ扱い DB を必要としない。
-        // 未 init 環境でも認証できるよう db::open() を経由しない。
+        // gcal-login / gcal-logout only touch the OAuth token. Skipping db::open()
+        // lets users sign in before running init.
         #[cfg(feature = "gcal")]
         Some(cli::Commands::GcalLogin) => {
             gcal::auth::login()?;
@@ -68,9 +68,9 @@ fn run_mcp() -> Result<()> {
     use rmcp::ServiceExt;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        // 親 (MCP クライアント = Claude Code 等) の消滅を監視し、消えたら自律終了する。
-        // 通常はクライアント切断で stdin が EOF になり waiting() が返るが、親が
-        // 異常終了して stdin が閉じられないと孤児として残るため、その保険。
+        // Exit when the parent (the MCP client) goes away. Normally the client closes
+        // stdin and waiting() returns, but a parent that crashes without closing
+        // stdin would leave this server running as an orphan.
         spawn_parent_watchdog();
 
         let db = db::open()?;
@@ -87,8 +87,8 @@ fn run_mcp() -> Result<()> {
     })
 }
 
-/// 起動時の親 PID を取得し、15 秒間隔で生存を監視する tokio タスクを起動する。
-/// 親が消滅したらプロセスを終了する (孤児 MCP サーバーの蓄積を防ぐ)。
+/// Checks every 15 seconds whether the parent process is alive and exits when it
+/// is gone, so orphaned MCP servers do not pile up.
 #[cfg(feature = "mcp")]
 fn spawn_parent_watchdog() {
     use sysinfo::{ProcessesToUpdate, System, get_current_pid};
@@ -119,7 +119,7 @@ fn spawn_parent_watchdog() {
 }
 
 fn run_tui() -> Result<()> {
-    // panic hook: raw mode terminal を確実に復旧
+    // Restore the terminal from raw mode even when the app panics.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         ratatui::restore();
@@ -129,14 +129,12 @@ fn run_tui() -> Result<()> {
     let db = db::open()?;
     let mut app = app::App::new(db)?;
 
-    // Terminal setup
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Event loop
     loop {
         terminal.draw(|f| ui::draw(f, &app))?;
 
@@ -146,7 +144,6 @@ fn run_tui() -> Result<()> {
         {
             app.handle_key(key);
         }
-        // バックグラウンド (gcal lazy sync 等) からの結果を取り込む
         app.poll_background_sync();
 
         if app.should_quit {
@@ -154,7 +151,6 @@ fn run_tui() -> Result<()> {
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;

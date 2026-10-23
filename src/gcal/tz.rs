@@ -1,15 +1,13 @@
-//! タイムゾーン変換: Google Calendar の RFC3339 dateTime → ytasky の (date, fixed_start_min)。
-//!
-//! ytasky では `_meta` ファイルにユーザーの基準 tz が書かれており (例: `Asia/Tokyo`)、
-//! それを使って GCal が返す DateTime をローカル日付・分に落とす。
+//! Converts Google Calendar RFC 3339 date-times to a local (date, minute of day).
+//! The reference time zone is the `tz:` line of the data dir's `_meta` file.
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, LocalResult, NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
 use std::path::Path;
 
-/// ytasky data dir 直下の `_meta` から `tz: <name>` を読む。
-/// 見つからない / パース失敗時はシステム TZ を返す (ベストエフォート)。
+/// Reads `tz: <name>` from `_meta` in the data dir.
+/// Falls back to UTC when the line is missing or the name does not parse.
 pub fn read_meta_tz(data_dir: &Path) -> Tz {
     let path = data_dir.join("_meta");
     if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -23,11 +21,10 @@ pub fn read_meta_tz(data_dir: &Path) -> Tz {
             }
         }
     }
-    // fallback: iana_time_zone から取得 → 失敗時は UTC
     chrono_tz::UTC
 }
 
-/// RFC3339 形式の文字列を指定 tz で解釈し、(NaiveDate, 分: 0..=1439) を返す。
+/// Parses an RFC 3339 string in `tz` and returns (date, minute 0..=1439).
 pub fn rfc3339_to_local_minute(s: &str, tz: Tz) -> Result<(NaiveDate, i32)> {
     let dt: DateTime<chrono::FixedOffset> = DateTime::parse_from_rfc3339(s)
         .with_context(|| format!("RFC3339 解析失敗: {s}"))?;
@@ -37,8 +34,8 @@ pub fn rfc3339_to_local_minute(s: &str, tz: Tz) -> Result<(NaiveDate, i32)> {
     Ok((date, minute))
 }
 
-/// 2 つの RFC3339 から duration (分) を計算する。
-/// 同一日想定だが、日跨ぎでも単純差分を返す (呼び出し側で扱う)。
+/// Minutes between two RFC 3339 times. Crossing midnight is not special-cased;
+/// callers handle it.
 pub fn duration_minutes(start_rfc3339: &str, end_rfc3339: &str) -> Result<i32> {
     let start: DateTime<chrono::FixedOffset> = DateTime::parse_from_rfc3339(start_rfc3339)
         .with_context(|| format!("start RFC3339 解析失敗: {start_rfc3339}"))?;
@@ -52,23 +49,22 @@ pub fn duration_minutes(start_rfc3339: &str, end_rfc3339: &str) -> Result<i32> {
     Ok(minutes as i32)
 }
 
-/// NaiveDate を YYYY-MM-DD に整形 (DB 保存用)。
 pub fn date_to_string(d: NaiveDate) -> String {
     format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day())
 }
 
-/// `tz` で「その日の 00:00」を RFC3339 にする (events.list の timeMin/timeMax 用)。
+/// Midnight of `date` in `tz` as RFC 3339, for timeMin/timeMax of events.list.
 ///
-/// DST 境界:
-/// - **Ambiguous** (深夜 0:00 が「秋の戻し」と重なって 2 候補ある): 早い方を採用
-/// - **None** (春の進めで存在しない時刻): 1 時間ずつ進めて最初の有効時刻を採用
+/// DST transitions:
+/// - ambiguous midnight (clocks set back): take the earlier time
+/// - nonexistent midnight (clocks set forward): step forward an hour at a time
 pub fn date_to_rfc3339_at_midnight(date: NaiveDate, tz: Tz) -> Result<String> {
     let naive = date.and_hms_opt(0, 0, 0).context("日付が不正")?;
     match tz.from_local_datetime(&naive) {
         LocalResult::Single(dt) => Ok(dt.to_rfc3339()),
         LocalResult::Ambiguous(earlier, _later) => Ok(earlier.to_rfc3339()),
         LocalResult::None => {
-            // DST gap. 最大 4 時間進めて有効時刻を探す
+            // DST gap: search up to 4 hours forward for a valid time.
             for hours in 1..=4 {
                 let advanced = naive + chrono::Duration::hours(hours);
                 if let Some(dt) = tz.from_local_datetime(&advanced).earliest() {
@@ -80,7 +76,7 @@ pub fn date_to_rfc3339_at_midnight(date: NaiveDate, tz: Tz) -> Result<String> {
     }
 }
 
-// ---- テスト -------------------------------------------------------------------
+// ---- tests -------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -88,7 +84,7 @@ mod tests {
 
     #[test]
     fn rfc3339_jst_local_minute() {
-        // 2026-05-16T10:00:00+09:00 を Asia/Tokyo で解釈 → 5/16 600分
+        // 2026-05-16T10:00:00+09:00 in Asia/Tokyo -> 5/16, minute 600
         let tz: Tz = "Asia/Tokyo".parse().unwrap();
         let (date, min) = rfc3339_to_local_minute("2026-05-16T10:00:00+09:00", tz).unwrap();
         assert_eq!(date, NaiveDate::from_ymd_opt(2026, 5, 16).unwrap());
@@ -97,7 +93,7 @@ mod tests {
 
     #[test]
     fn rfc3339_utc_to_jst_crosses_day() {
-        // 2026-05-15T23:00:00Z は JST で 2026-05-16T08:00:00+09:00 → 5/16 480分
+        // 2026-05-15T23:00:00Z is 2026-05-16T08:00:00+09:00 in JST -> 5/16, minute 480
         let tz: Tz = "Asia/Tokyo".parse().unwrap();
         let (date, min) = rfc3339_to_local_minute("2026-05-15T23:00:00Z", tz).unwrap();
         assert_eq!(date, NaiveDate::from_ymd_opt(2026, 5, 16).unwrap());
@@ -106,7 +102,7 @@ mod tests {
 
     #[test]
     fn rfc3339_with_offset_other_than_jst() {
-        // 2026-05-16T20:00:00-05:00 は UTC で 2026-05-17T01:00:00Z → JST で 2026-05-17T10:00:00+09:00
+        // 2026-05-16T20:00:00-05:00 is 2026-05-17T01:00:00Z -> 2026-05-17T10:00:00+09:00 in JST
         let tz: Tz = "Asia/Tokyo".parse().unwrap();
         let (date, min) = rfc3339_to_local_minute("2026-05-16T20:00:00-05:00", tz).unwrap();
         assert_eq!(date, NaiveDate::from_ymd_opt(2026, 5, 17).unwrap());
@@ -125,7 +121,7 @@ mod tests {
 
     #[test]
     fn duration_across_tz_normalized() {
-        // 1 時間差を異なる表記でも一致
+        // The same one-hour gap written with different offsets
         let m = duration_minutes(
             "2026-05-16T10:00:00+09:00",
             "2026-05-16T02:00:00Z",
@@ -154,7 +150,7 @@ mod tests {
     #[test]
     fn meta_tz_missing_falls_back_to_utc() {
         let tmp = tempfile::tempdir().unwrap();
-        // _meta なし
+        // no _meta
         assert_eq!(read_meta_tz(tmp.path()), chrono_tz::UTC);
     }
 
@@ -176,13 +172,10 @@ mod tests {
 
     #[test]
     fn midnight_rfc3339_dst_spring_forward_gap() {
-        // ブラジル São Paulo は 2018 年 11/4 0:00 が DST 切替で深夜が存在しなかった年もある。
-        // chrono_tz の DST 過去データを使い、gap を持つ日付で None フォールバックが動作することを確認。
-        // 確実な gap として、北米の春の DST 開始日 (2026 年は 3 月 8 日 02:00→03:00、つまり 0:00 は通常時刻) を避け、
-        // チリの 2026/9/6 (例) のような南半球を使うのは難しいので、ここでは関数が panic せず
-        // 何らかの Ok を返すことだけ確認する。
+        // A zone with a midnight DST gap is hard to pin down reliably in tz data, so this test
+        // only checks that the function returns Ok without panicking.
         let tz: Tz = "Asia/Tokyo".parse().unwrap();
-        // Asia/Tokyo は DST なしなので必ず Single
+        // Asia/Tokyo has no DST, so the result is always Single.
         let s = date_to_rfc3339_at_midnight(NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(), tz)
             .unwrap();
         assert!(s.contains("2026-03-08"));

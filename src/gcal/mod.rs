@@ -1,13 +1,4 @@
-//! Google Calendar 連携モジュール。
-//!
-//! 公開 API:
-//! - `auth::get_valid_token`: 必要なら refresh して有効な access token を返す
-//! - `auth::login`: OAuth フローを実行して token を取得する
-//! - `auth::logout`: 保存済み token を削除する
-//! - `api`: Calendar API v3 (events.list / events.instances / calendarList.list)
-//! - `tz`: RFC3339 ↔ (NaiveDate, fixed_start_min)
-//! - `types`: API レスポンスの serde 型
-//! - [`load_config`]: `~/.config/ytasky/config.json` から設定を読む
+//! Google Calendar import.
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -19,8 +10,7 @@ pub mod rrule;
 pub mod types;
 pub mod tz;
 
-/// 長大なレスポンス本文をエラーメッセージに乗せる際の安全な truncate。
-/// auth / api 両方で OAuth レスポンスや API エラー body の表示に使う。
+/// Truncates a long response body before it goes into an error message.
 pub(crate) fn truncate_for_log(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -31,10 +21,10 @@ pub(crate) fn truncate_for_log(s: &str, max: usize) -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GcalConfig {
-    /// TUI 起動時にバックグラウンドで GCal を同期するか (default: true)
+    /// Import in the background when the TUI starts.
     #[serde(default = "default_true")]
     pub gcal_auto_sync: bool,
-    /// auto sync の対象期間 (今日からの日数, default: 7)
+    /// Number of days from today that the startup import covers.
     #[serde(default = "default_auto_days")]
     pub gcal_auto_sync_days: u32,
 }
@@ -56,7 +46,7 @@ impl Default for GcalConfig {
     }
 }
 
-/// `~/.config/ytasky/config.json` から設定を読む。無ければデフォルト。
+/// Reads the Google Calendar keys of `config.json` in the config dir; defaults when the file is missing.
 pub fn load_config() -> Result<GcalConfig> {
     let path = crate::recurrence::config_dir()?.join("config.json");
     if !path.exists() {

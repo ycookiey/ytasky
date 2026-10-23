@@ -1,19 +1,15 @@
-//! ytasky database layer — wraps ybasey::Database
-//!
-//! Sub-task 1: skeleton (all functions are todo!() stubs).
-//! Sub-task 2+: stubs will be replaced one by one.
+//! Database layer over `ybasey::Database`.
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use std::path::PathBuf;
 use ybasey::{Database, NewRecord, Op};
 
-/// backlog タスクの sentinel date (date 型非互換の "__backlog__" の代替)
+/// Date stored for backlog tasks. A `date` field rejects a non-date marker such as "__backlog__".
 const BACKLOG_DATE: &str = "9999-12-31";
 
-// ---- 型変換 helper (Value → primitive) ----------------------------------------
+// ---- Value -> primitive helpers -------------------------------------------------
 
-/// Value::Int(i64) を取り出す。なければ 0。
 fn get_int(r: &ybasey::engine::Record, field: &str) -> i64 {
     match r.get(field) {
         Some(ybasey::schema::Value::Int(v)) => *v,
@@ -21,7 +17,6 @@ fn get_int(r: &ybasey::engine::Record, field: &str) -> i64 {
     }
 }
 
-/// Value::Str(s) を取り出す。なければ "".
 fn get_str(r: &ybasey::engine::Record, field: &str) -> String {
     match r.get(field) {
         Some(ybasey::schema::Value::Str(s)) => s.clone(),
@@ -29,7 +24,6 @@ fn get_str(r: &ybasey::engine::Record, field: &str) -> String {
     }
 }
 
-/// nullable int field。Null または未定義 → None。
 fn get_opt_int(r: &ybasey::engine::Record, field: &str) -> Option<i64> {
     match r.get(field) {
         Some(ybasey::schema::Value::Int(v)) => Some(*v),
@@ -37,7 +31,6 @@ fn get_opt_int(r: &ybasey::engine::Record, field: &str) -> Option<i64> {
     }
 }
 
-/// nullable str field。Null または未定義 → None。
 fn get_opt_str(r: &ybasey::engine::Record, field: &str) -> Option<String> {
     match r.get(field) {
         Some(ybasey::schema::Value::Str(s)) => Some(s.clone()),
@@ -45,7 +38,7 @@ fn get_opt_str(r: &ybasey::engine::Record, field: &str) -> Option<String> {
     }
 }
 
-/// Ref 型 field を u64 id → String に変換。Value::Int で格納されている。
+/// Ref fields hold the id as `Value::Int`; returns it as a String, or "" when absent.
 fn get_ref_id_str(r: &ybasey::engine::Record, field: &str) -> String {
     match r.get(field) {
         Some(ybasey::schema::Value::Int(v)) => v.to_string(),
@@ -53,7 +46,6 @@ fn get_ref_id_str(r: &ybasey::engine::Record, field: &str) -> String {
     }
 }
 
-/// nullable Ref 型 field。Value::Int → Some(id), Null → None。
 fn get_opt_ref_id(r: &ybasey::engine::Record, field: &str) -> Option<i64> {
     match r.get(field) {
         Some(ybasey::schema::Value::Int(v)) => Some(*v),
@@ -61,7 +53,7 @@ fn get_opt_ref_id(r: &ybasey::engine::Record, field: &str) -> Option<i64> {
     }
 }
 
-// ---- Record → model struct 変換 ------------------------------------------------
+// ---- Record -> model structs ----------------------------------------------------
 
 pub(crate) fn record_to_task(r: &ybasey::engine::Record) -> crate::model::Task {
     crate::model::Task {
@@ -105,19 +97,16 @@ fn record_to_recurrence(r: &ybasey::engine::Record) -> crate::model::Recurrence 
     }
 }
 
-// ---- 固定タスク再配置ヘルパー ---------------------------------------------------
+// ---- Placing fixed-time tasks ---------------------------------------------------
 
-/// 新規/移動タスクの fixed_start に応じた挿入 sort_order を計算する。
-/// exclude_id を指定するとそのタスクを除外して計算する (edit 時の自分自身)。
+/// Computes the sort_order at which to insert a task, given its fixed_start.
+/// `exclude_id` leaves out the task itself when editing.
 ///
-/// ルール:
-/// - fixed_start = None → 末尾 (3-d)
-/// - fixed_start = Some, 既存固定タスクなし → 末尾 (3-d)
-/// - fixed_start = Some, 既存固定タスクあり →
-///   時刻順に並べた既存固定タスクから直前/直後を求め、
-///   直前固定の effective_end と直後固定の fixed_start のうち、
-///   新規 fixed_start に近い方の隣に挿入。等距離は前優先 (1-a)。
-///   全既存より早い → 先頭固定の直前 (2-a)、遅い → 最終固定の直後 (3-a)。
+/// - No fixed_start, or no other fixed tasks on the day: append at the end.
+/// - Otherwise, among the day's fixed tasks sorted by time, take the one before and
+///   the one after the new fixed_start, and insert next to whichever is closer
+///   (the end of the previous one or the start of the next one). Ties go before.
+///   Earlier than all: just before the first fixed task. Later than all: just after the last.
 fn compute_insert_sort_order(
     db: &Database,
     date: &str,
@@ -175,7 +164,7 @@ fn compute_insert_sort_order(
     Ok(target)
 }
 
-/// `sort_order >= threshold` のタスクを +1 シフトする。exclude_id は対象外。
+/// Shifts tasks with `sort_order >= threshold` by +1, skipping `exclude_id`.
 fn shift_sort_orders_at_or_after(
     db: &mut Database,
     date: &str,
@@ -211,8 +200,8 @@ fn shift_sort_orders_at_or_after(
     Ok(())
 }
 
-/// 同日の固定タスクが時刻順 sort_order で並んでいない場合に、固定タスクの位置だけ
-/// 時刻順に再配置する。未定タスクの sort_order スロットは保持する。
+/// When a day's fixed tasks are not in time order, moves only the fixed tasks into
+/// time order. Tasks without a fixed time keep their sort_order slots.
 fn normalize_fixed_tasks_by_time(db: &mut Database, date: &str) -> Result<()> {
     let table = db.table("tasks")?;
     let mut tasks: Vec<crate::model::Task> = table
@@ -226,14 +215,14 @@ fn normalize_fixed_tasks_by_time(db: &mut Database, date: &str) -> Result<()> {
     }
     tasks.sort_by_key(|t| t.sort_order);
 
-    // 現状 sort_order 順に並んだ固定タスク
+    // Fixed tasks in their current sort_order
     let fixed_by_sort: Vec<&crate::model::Task> =
         tasks.iter().filter(|t| t.fixed_start.is_some()).collect();
     if fixed_by_sort.len() < 2 {
         return Ok(());
     }
 
-    // 時刻順
+    // The same tasks in time order
     let mut fixed_by_time = fixed_by_sort.clone();
     fixed_by_time.sort_by_key(|t| t.fixed_start.unwrap());
 
@@ -245,7 +234,7 @@ fn normalize_fixed_tasks_by_time(db: &mut Database, date: &str) -> Result<()> {
         return Ok(());
     }
 
-    // 固定タスクが入っているスロット (現状 sort_order 順での位置) を取得
+    // Slots (positions in the current order) held by fixed tasks
     let fixed_slots: Vec<usize> = tasks
         .iter()
         .enumerate()
@@ -253,7 +242,7 @@ fn normalize_fixed_tasks_by_time(db: &mut Database, date: &str) -> Result<()> {
         .map(|(i, _)| i)
         .collect();
 
-    // 各スロットに時刻順の固定タスクを割り当て、各タスクの新 sort_order を構築
+    // Assign the time-ordered fixed tasks to those slots and build each task's new sort_order
     let mut slot_owner: Vec<i64> = tasks.iter().map(|t| t.id).collect();
     for (slot_idx, fx) in fixed_slots.iter().zip(fixed_by_time.iter()) {
         slot_owner[*slot_idx] = fx.id;
@@ -284,8 +273,8 @@ fn normalize_fixed_tasks_by_time(db: &mut Database, date: &str) -> Result<()> {
     Ok(())
 }
 
-/// 編集対象タスクを再配置する: gap fill → 新挿入位置算出 → shift。
-/// 戻り値は新しい sort_order。
+/// Relocates the edited task: closes the gap it leaves, computes the new insert
+/// position, and shifts the others. Returns the new sort_order.
 fn relocate_task_for_fixed_change(
     db: &mut Database,
     task_id: i64,
@@ -296,7 +285,7 @@ fn relocate_task_for_fixed_change(
         .context("relocate 対象タスクが見つかりません")?
         .sort_order;
 
-    // gap fill: 自分以外で sort > current の人を -1
+    // Close the gap: move the other tasks after the current position up by one
     let to_decrement: Vec<(u64, i32)> = {
         let table = db.table("tasks")?;
         table
@@ -320,14 +309,14 @@ fn relocate_task_for_fixed_change(
         db.batch("tasks", ops)?;
     }
 
-    // 自分を除外した状態で新挿入位置を計算
+    // Compute the new position without the task itself
     let new_target = compute_insert_sort_order(db, date, fixed_start, Some(task_id))?;
-    // 新位置 >= の他タスクを +1 (自分除く)
+    // Shift the other tasks at or after the new position by +1
     shift_sort_orders_at_or_after(db, date, new_target, Some(task_id))?;
     Ok(new_target)
 }
 
-/// 同日の (id, sort_order) スナップショットを取得 (undo 用)
+/// Snapshot of the day's (id, sort_order) pairs, for undo.
 pub fn snapshot_sort_orders(db: &Database, date: &str) -> Result<Vec<(i64, i32)>> {
     let table = db.table("tasks")?;
     let pairs: Vec<(i64, i32)> = table
@@ -340,7 +329,7 @@ pub fn snapshot_sort_orders(db: &Database, date: &str) -> Result<Vec<(i64, i32)>
     Ok(pairs)
 }
 
-/// スナップショットされた (id, sort_order) を一括反映する (undo 用)
+/// Writes back a snapshot of (id, sort_order) pairs, for undo.
 pub fn apply_sort_orders(db: &mut Database, pairs: &[(i64, i32)]) -> Result<()> {
     if pairs.is_empty() {
         return Ok(());
@@ -356,7 +345,8 @@ pub fn apply_sort_orders(db: &mut Database, pairs: &[(i64, i32)]) -> Result<()> 
     Ok(())
 }
 
-/// 編集前後の固定タスク time-rank が同じかどうか。両者 Some の場合のみ true 可能。
+/// Whether the task keeps the same rank among the day's fixed tasks after the edit.
+/// Can be true only when both values are Some.
 fn fixed_position_unchanged(
     db: &Database,
     task_id: i64,
@@ -395,7 +385,7 @@ fn next_sort_order_for_backlog(db: &Database) -> Result<i32> {
     Ok(max + 1)
 }
 
-// ---- normalize helpers ---------------------------------------------------------
+// ---- Normalize helpers ----------------------------------------------------------
 
 fn normalize_sort_order(db: &mut Database, date: &str) -> Result<()> {
     let table = db.table("tasks")?;
@@ -453,9 +443,9 @@ fn normalize_backlog_sort_order(db: &mut Database) -> Result<()> {
     Ok(())
 }
 
-// ---- データディレクトリ解決 -------------------------------------------------------
+// ---- Data directory -------------------------------------------------------------
 
-/// ybasey data dir を返す (init.rs と同一ロジック)
+/// Must stay in sync with `init::resolve_data_dir`.
 pub fn data_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("YTASKY_DATA_DIR") {
         return Ok(PathBuf::from(dir));
@@ -464,7 +454,6 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(base.join("ytasky-ybasey"))
 }
 
-/// ybasey Database を開く
 pub fn open() -> Result<Database> {
     let dir = data_dir()?;
     warn_legacy_sqlite_files();
@@ -488,12 +477,12 @@ fn warn_legacy_sqlite_files() {
     }
 }
 
-// ---- Read 系 -------------------------------------------------------------------
+// ---- Reads ----------------------------------------------------------------------
 
-/// 指定日のタスクを取得 (繰り返し生成も実行)
+/// Tasks of a date. Generates the date's recurring tasks first.
 pub fn load_tasks(db: &mut Database, date: &str) -> Result<Vec<crate::model::Task>> {
     generate_recurring_tasks(db, date)?;
-    // 既存データの自動修正: 固定タスクが時刻順 sort_order でなければ整える
+    // Repair existing data: put fixed tasks back in time order when needed
     normalize_fixed_tasks_by_time(db, date)?;
     let table = db.table("tasks")?;
     let mut tasks: Vec<crate::model::Task> = table
@@ -506,8 +495,8 @@ pub fn load_tasks(db: &mut Database, date: &str) -> Result<Vec<crate::model::Tas
     Ok(tasks)
 }
 
-/// バックログタスクを期限順で取得（期限なしは末尾）
-/// `status="done"` のものは除外する（GitHub 側で closed 化されたタスク等、完了済みは非表示）。
+/// Backlog tasks ordered by deadline, tasks without a deadline last.
+/// Tasks with `status="done"` (for example, issues closed upstream) are hidden.
 pub fn load_backlog_tasks(db: &Database) -> Result<Vec<crate::model::Task>> {
     let table = db.table("tasks")?;
     let mut tasks: Vec<crate::model::Task> = table
@@ -520,7 +509,7 @@ pub fn load_backlog_tasks(db: &Database) -> Result<Vec<crate::model::Task>> {
     tasks.sort_by(|a, b| {
         let a_has = a.deadline.is_some();
         let b_has = b.deadline.is_some();
-        // deadline あり → 先 (降順比較で Some=true > None=false)
+        // Tasks with a deadline first (reversed comparison: Some=true > None=false)
         b_has
             .cmp(&a_has)
             .then_with(|| a.deadline.cmp(&b.deadline))
@@ -530,13 +519,11 @@ pub fn load_backlog_tasks(db: &Database) -> Result<Vec<crate::model::Task>> {
     Ok(tasks)
 }
 
-/// 全カテゴリ取得
 pub fn load_categories(db: &Database) -> Result<Vec<crate::model::Category>> {
     let table = db.table("categories")?;
     Ok(table.list().iter().map(|r| record_to_category(r)).collect())
 }
 
-/// 全繰り返しルール取得
 pub fn load_recurrences(db: &Database) -> Result<Vec<crate::model::Recurrence>> {
     let table = db.table("recurrences")?;
     let mut recs: Vec<_> = table.list().iter().map(|r| record_to_recurrence(r)).collect();
@@ -544,13 +531,12 @@ pub fn load_recurrences(db: &Database) -> Result<Vec<crate::model::Recurrence>> 
     Ok(recs)
 }
 
-/// ID 指定でタスク1件取得
 pub fn load_task_by_id(db: &Database, id: i64) -> Result<Option<crate::model::Task>> {
     let table = db.table("tasks")?;
     Ok(table.list().into_iter().find(|r| r.id == id as u64).map(record_to_task))
 }
 
-/// タスクの位置情報 (date, sort_order, is_backlog) を取得
+/// Position of a task: (date, sort_order, is_backlog).
 pub fn load_task_position(db: &Database, id: i64) -> Result<Option<(String, i32, bool)>> {
     let table = db.table("tasks")?;
     Ok(table
@@ -563,9 +549,8 @@ pub fn load_task_position(db: &Database, id: i64) -> Result<Option<(String, i32,
         }))
 }
 
-// ---- Write 系 (task) -----------------------------------------------------------
+// ---- Writes (tasks) -------------------------------------------------------------
 
-/// タスク挿入
 pub fn insert_task(
     db: &mut Database,
     date: &str,
@@ -577,7 +562,6 @@ pub fn insert_task(
     insert_task_with_deadline(db, date, title, category_id, duration_min, fixed_start, None)
 }
 
-/// 期限付きタスク挿入
 pub fn insert_task_with_deadline(
     db: &mut Database,
     date: &str,
@@ -587,7 +571,7 @@ pub fn insert_task_with_deadline(
     fixed_start: Option<i32>,
     deadline: Option<&str>,
 ) -> Result<i64> {
-    // 固定タスクが既存で時刻順に乱れている場合は先に整える
+    // Put existing fixed tasks back in time order before computing the position
     normalize_fixed_tasks_by_time(db, date)?;
 
     let target_sort = compute_insert_sort_order(db, date, fixed_start, None)?;
@@ -613,7 +597,7 @@ pub fn insert_task_with_deadline(
     Ok(id as i64)
 }
 
-/// タスク更新 (deadline は現在値を維持)
+/// Updates a task, keeping its current deadline.
 pub fn update_task(
     db: &mut Database,
     id: i64,
@@ -637,7 +621,6 @@ pub fn update_task(
     )
 }
 
-/// 期限付きタスク更新
 pub fn update_task_with_deadline(
     db: &mut Database,
     id: i64,
@@ -668,7 +651,7 @@ pub fn update_task_with_deadline(
 
     let mut should_relocate = false;
     if fixed_changed && !before.is_backlog {
-        // 8-a: 固定タスク同士で time-rank が同じなら sort_order を変えない
+        // If the task keeps its rank among the fixed tasks, keep its sort_order
         let unchanged =
             fixed_position_unchanged(db, id, &date, before.fixed_start, fixed_start)?;
         if !unchanged {
@@ -688,7 +671,7 @@ pub fn update_task_with_deadline(
     Ok(())
 }
 
-/// undo/redo 用: フィールド書き換えのみ。再配置は一切行わない。
+/// For undo/redo: rewrites the fields only, without relocating any task.
 pub fn update_task_fields_only(
     db: &mut Database,
     id: i64,
@@ -715,7 +698,6 @@ pub fn update_task_fields_only(
     Ok(())
 }
 
-/// タスク削除
 pub fn delete_task(db: &mut Database, id: i64) -> Result<()> {
     let pos = load_task_position(db, id)?;
     db.delete("tasks", id as u64)?;
@@ -729,7 +711,6 @@ pub fn delete_task(db: &mut Database, id: i64) -> Result<()> {
     Ok(())
 }
 
-/// 実績時刻更新
 pub fn update_actual(
     db: &mut Database,
     id: i64,
@@ -754,9 +735,8 @@ pub fn update_actual(
     Ok(())
 }
 
-// ---- Write 系 (backlog 操作) ---------------------------------------------------
+// ---- Writes (backlog) -----------------------------------------------------------
 
-/// バックログに新規追加
 pub fn insert_backlog_task(
     db: &mut Database,
     title: &str,
@@ -781,7 +761,7 @@ pub fn insert_backlog_task(
     Ok(id as i64)
 }
 
-/// external_id で既存タスクの id を引く（import の重複判定用）。
+/// Id of the task with the given external_id, used by imports to find duplicates.
 #[cfg(feature = "github")]
 pub fn find_task_id_by_external_id(db: &Database, external_id: &str) -> Result<Option<i64>> {
     let table = db.table("tasks").context("tasks テーブルが無い")?;
@@ -791,8 +771,7 @@ pub fn find_task_id_by_external_id(db: &Database, external_id: &str) -> Result<O
         .map(|r| r.id as i64))
 }
 
-/// external_id 付きで backlog タスクを新規追加する（import 用）。
-/// 既存の `insert_backlog_task` に external_id を加えたもの。
+/// Adds a backlog task with an external_id, for imports.
 #[cfg(feature = "github")]
 pub fn insert_backlog_task_imported(
     db: &mut Database,
@@ -820,11 +799,11 @@ pub fn insert_backlog_task_imported(
     Ok(id as i64)
 }
 
-/// import で issue 所有列（title, deadline, status）を更新する。
-/// category_id / duration_min / 配置などユーザー所有列は触らない（列所有権分割）。
-/// deadline=None は Null sentinel "_" でクリアする。
-/// status は "todo" にリセットする（upstream で reopen された issue が
-/// 前回 detect_closed で "done" にされていても backlog に復帰するため）。
+/// Updates the columns an import owns (title, deadline, status). Columns the user
+/// owns, such as category_id, duration_min and placement, stay untouched.
+/// deadline=None clears the field with the Null sentinel "_".
+/// status goes back to "todo" so that an issue reopened upstream returns to the
+/// backlog after an earlier closed-issue check marked it "done".
 #[cfg(feature = "github")]
 pub fn update_task_imported_fields(
     db: &mut Database,
@@ -844,21 +823,18 @@ pub fn update_task_imported_fields(
     Ok(())
 }
 
-/// タスクの `status` を `"done"` にセットする（列 1 個の部分更新）。
-/// 既存 `done_task` 系（`actual_start`/`actual_end` に時刻をセット）とは別の完了マーク用途。
-/// backlog タスクに対して使うことを想定しており、レポート統計には影響しない
-/// （actual_end が未設定のままなので実施時間として集計されない）。
-/// GitHub issue が upstream で closed 化した際の反映に使う。
+/// Sets only `status` to "done". Unlike `done_task`, it records no actual times,
+/// so the task does not count toward report totals. Used for backlog tasks whose
+/// GitHub issue was closed upstream.
 #[cfg(feature = "github")]
 pub fn set_task_status_done(db: &mut Database, id: i64) -> Result<()> {
     db.update("tasks", id as u64, vec![("status".into(), "done".into())])?;
     Ok(())
 }
 
-/// backlog にある GitHub import タスクの (id, external_id) 一覧。
-/// closed → done 検出のために「今 backlog にあり、未 done のもの」だけを対象にする。
-/// 既に status="done" にした task を除外することで、closed 検出の再走時に REST を
-/// 無駄叩きしたり `summary.closed_done` を再インフレさせない。
+/// (id, external_id) of GitHub-imported tasks that are in the backlog and not done.
+/// Skipping tasks already marked done keeps a rerun of the closed-issue check from
+/// calling the REST API for them again or counting them again in `closed_done`.
 #[cfg(feature = "github")]
 pub fn list_backlog_github_external_ids(db: &Database) -> Result<Vec<(i64, String)>> {
     let table = db.table("tasks").context("tasks テーブルが無い")?;
@@ -881,7 +857,7 @@ pub fn list_backlog_github_external_ids(db: &Database) -> Result<Vec<(i64, Strin
     Ok(out)
 }
 
-/// タスクをバックログ化/解除
+/// Moves a task to or from the backlog.
 pub fn set_backlog_flag(db: &mut Database, task_id: i64, is_backlog: bool) -> Result<()> {
     if is_backlog {
         let current_date = match load_task_position(db, task_id)? {
@@ -915,14 +891,14 @@ pub fn set_backlog_flag(db: &mut Database, task_id: i64, is_backlog: bool) -> Re
     Ok(())
 }
 
-/// バックログタスクを指定日の指定位置に挿入
+/// Inserts a backlog task into a date at the given position.
 pub fn insert_backlog_task_at(
     db: &mut Database,
     task_id: i64,
     date: &str,
     index: usize,
 ) -> Result<()> {
-    // 指定日の非 backlog タスク数を取得
+    // Number of scheduled (non-backlog) tasks on the date
     let count = {
         let table = db.table("tasks")?;
         table
@@ -934,7 +910,7 @@ pub fn insert_backlog_task_at(
     };
     let target = (index as i32).clamp(0, count as i32);
 
-    // target 以降の sort_order を +1 shift
+    // Shift sort_order at or after the target by +1
     let to_shift: Vec<u64> = {
         let table = db.table("tasks")?;
         table
@@ -946,7 +922,6 @@ pub fn insert_backlog_task_at(
             .collect()
     };
     if !to_shift.is_empty() {
-        // 各タスクの現在の sort_order を取得して +1
         let ops: Vec<Op> = to_shift
             .iter()
             .filter_map(|&id| {
@@ -964,7 +939,6 @@ pub fn insert_backlog_task_at(
         }
     }
 
-    // task を schedule に移動
     db.update(
         "tasks",
         task_id as u64,
@@ -982,7 +956,7 @@ pub fn insert_backlog_task_at(
     Ok(())
 }
 
-/// バックログタスクを末尾に挿入
+/// Appends a backlog task to the end of a date.
 pub fn append_backlog_task(db: &mut Database, task_id: i64, date: &str) -> Result<()> {
     let count = {
         let table = db.table("tasks")?;
@@ -996,7 +970,6 @@ pub fn append_backlog_task(db: &mut Database, task_id: i64, date: &str) -> Resul
     insert_backlog_task_at(db, task_id, date, count)
 }
 
-/// sort_order 入れ替え
 pub fn swap_sort_order(db: &mut Database, id1: i64, id2: i64) -> Result<()> {
     if id1 == id2 {
         return Ok(());
@@ -1025,18 +998,18 @@ pub fn swap_sort_order(db: &mut Database, id1: i64, id2: i64) -> Result<()> {
             },
         ],
     )?;
-    // swap 後も連続性は維持されるため normalize は不要
+    // A swap keeps sort_order contiguous, so no normalize is needed
     Ok(())
 }
 
-/// タスクをスケジュール側へ戻す (Undo 用)
+/// Moves a task back into the schedule (for undo).
 pub fn restore_task_to_schedule(
     db: &mut Database,
     task_id: i64,
     date: &str,
     sort_order: i32,
 ) -> Result<()> {
-    // sort_order 以降を shift
+    // Shift sort_order at and after its position
     let to_shift: Vec<(u64, i32)> = {
         let table = db.table("tasks")?;
         table
@@ -1071,9 +1044,9 @@ pub fn restore_task_to_schedule(
     Ok(())
 }
 
-/// タスクをバックログ側へ戻す (Undo 用)
+/// Moves a task back into the backlog (for undo).
 pub fn restore_task_to_backlog(db: &mut Database, task_id: i64, sort_order: i32) -> Result<()> {
-    // backlog の sort_order 以降を shift
+    // Shift the backlog's sort_order at and after its position
     let to_shift: Vec<(u64, i32)> = {
         let table = db.table("tasks")?;
         table
@@ -1109,9 +1082,8 @@ pub fn restore_task_to_backlog(db: &mut Database, task_id: i64, sort_order: i32)
     Ok(())
 }
 
-// ---- Write 系 (recurrence) -----------------------------------------------------
+// ---- Writes (recurrences) -------------------------------------------------------
 
-/// 繰り返しルール登録
 #[allow(clippy::too_many_arguments)]
 pub fn insert_recurrence(
     db: &mut Database,
@@ -1144,7 +1116,6 @@ pub fn insert_recurrence(
     Ok(id as i64)
 }
 
-/// 繰り返しルール更新
 #[allow(clippy::too_many_arguments)]
 pub fn update_recurrence(
     db: &mut Database,
@@ -1181,13 +1152,14 @@ pub fn update_recurrence(
     Ok(())
 }
 
-/// 繰り返しルール削除 (cascade で exceptions + tasks.recurrence_id=null 自動)
+/// Deletes a recurrence. The schema cascades: its exceptions are deleted and
+/// tasks.recurrence_id is set to null.
 pub fn delete_recurrence(db: &mut Database, id: i64) -> Result<()> {
     db.delete("recurrences", id as u64)?;
     Ok(())
 }
 
-/// 既存タスクを繰り返しルールに変換
+/// Turns an existing task into a recurrence.
 pub fn create_recurrence_from_task(
     db: &mut Database,
     task_id: i64,
@@ -1215,13 +1187,12 @@ pub fn create_recurrence_from_task(
     Ok(recurrence_id)
 }
 
-/// 繰り返し例外日を登録
 pub fn add_recurrence_exception(
     db: &mut Database,
     recurrence_id: i64,
     date: &str,
 ) -> Result<()> {
-    // 重複チェック: find_by_field で recurrence_id + date が一致するものを探す
+    // Skip when an exception with the same recurrence_id and date exists
     let already_exists = {
         let table = db.table("recurrence_exceptions")?;
         let rec_id_str = recurrence_id.to_string();
@@ -1241,14 +1212,13 @@ pub fn add_recurrence_exception(
     Ok(())
 }
 
-// ---- 繰り返しタスク生成 ----------------------------------------------------------
+// ---- Generating recurring tasks -------------------------------------------------
 
-/// 指定日に該当する繰り返しタスクを遅延生成
+/// Generates the recurring tasks of a date when the date is first loaded.
 pub fn generate_recurring_tasks(db: &mut Database, date: &str) -> Result<()> {
     let target_date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .with_context(|| format!("日付形式が不正です: {date}"))?;
 
-    // 対象の繰り返しルールを取得
     let recurrences: Vec<crate::model::Recurrence> = {
         let table = db.table("recurrences")?;
         table
@@ -1271,7 +1241,7 @@ pub fn generate_recurring_tasks(db: &mut Database, date: &str) -> Result<()> {
             continue;
         }
 
-        // 例外日チェック
+        // Skip exception dates
         let is_exception = {
             let table = db.table("recurrence_exceptions")?;
             let rec_id_str = rec.id.to_string();
@@ -1284,7 +1254,7 @@ pub fn generate_recurring_tasks(db: &mut Database, date: &str) -> Result<()> {
             continue;
         }
 
-        // 既存チェック (同日 + 同 recurrence_id + 非 backlog)
+        // Skip when already generated (same date, same recurrence_id, not in the backlog)
         let exists = {
             let table = db.table("tasks")?;
             let rec_id_str = rec.id.to_string();
@@ -1300,7 +1270,7 @@ pub fn generate_recurring_tasks(db: &mut Database, date: &str) -> Result<()> {
             continue;
         }
 
-        // 固定タスクの並びを保つため毎回 compute → shift → insert を通す
+        // Go through compute -> shift -> insert each time to keep fixed tasks in time order
         let target_sort = compute_insert_sort_order(db, date, rec.fixed_start, None)?;
         shift_sort_orders_at_or_after(db, date, target_sort, None)?;
 
@@ -1324,9 +1294,9 @@ pub fn generate_recurring_tasks(db: &mut Database, date: &str) -> Result<()> {
     Ok(())
 }
 
-// ---- History 系 ----------------------------------------------------------------
+// ---- History --------------------------------------------------------------------
 
-/// 操作履歴を取得 (ybasey query_log_tail 経由)
+/// Operation history, read from the database log.
 pub fn query_history(
     db: &Database,
     table: Option<&str>,
@@ -1335,19 +1305,19 @@ pub fn query_history(
     db.query_log_tail(table, limit).map_err(Into::into)
 }
 
-// ---- Report 系 -----------------------------------------------------------------
+// ---- Reports --------------------------------------------------------------------
 
-/// normalize_sort_order の公開 wrapper (history.rs から利用)
+/// Public wrapper of normalize_sort_order for history.rs.
 pub fn normalize_sort_order_pub(db: &mut Database, date: &str) -> Result<()> {
     normalize_sort_order(db, date)
 }
 
-/// normalize_backlog_sort_order の公開 wrapper (history.rs から利用)
+/// Public wrapper of normalize_backlog_sort_order for history.rs.
 pub fn normalize_backlog_sort_order_pub(db: &mut Database) -> Result<()> {
     normalize_backlog_sort_order(db)
 }
 
-/// 指定日のカテゴリ別集計
+/// Totals per category for a date.
 pub fn report_by_category(
     db: &Database,
     date: &str,
@@ -1393,7 +1363,7 @@ pub fn report_by_category(
     Ok(result)
 }
 
-/// 指定日のタイトル別集計
+/// Totals per title for a date.
 pub fn report_by_title(db: &Database, date: &str) -> Result<Vec<crate::model::TitleReport>> {
     use std::collections::HashMap;
 

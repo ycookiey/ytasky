@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// ybasey data dir を解決する。
-/// $YTASKY_DATA_DIR > OS default (~/.local/share/ytasky-ybasey 等)。
-/// 既存 rusqlite DB は ~/.local/share/ytasky/ytasky.db のため、
-/// ytasky-ybasey を別ディレクトリに配置して衝突を回避する。
+/// Resolves the data dir: `$YTASKY_DATA_DIR`, else a folder in the OS data dir.
+/// The folder name differs from the legacy SQLite data folder (`ytasky/`) so both can coexist.
 fn resolve_data_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("YTASKY_DATA_DIR") {
         return Ok(PathBuf::from(dir));
@@ -13,13 +11,12 @@ fn resolve_data_dir() -> Result<PathBuf> {
     Ok(base.join("ytasky-ybasey"))
 }
 
-/// `ytasky init` エントリポイント。
-/// force=true のとき既存 data_dir を削除して再作成。
-/// yes=true のとき確認プロンプトを skip。
+/// Entry point of `ytasky init`.
+/// `force` deletes and recreates an existing data dir; `yes` skips the confirmation prompt.
 pub fn run_init(force: bool, yes: bool) -> Result<()> {
     let data_dir = resolve_data_dir()?;
 
-    // 既存 schema 検出
+    // Detect an existing schema
     let ybasey_dir = data_dir.join(".ybasey");
     if ybasey_dir.exists() && !force {
         anyhow::bail!(
@@ -28,7 +25,7 @@ pub fn run_init(force: bool, yes: bool) -> Result<()> {
         );
     }
 
-    // 確認プロンプト
+    // Confirmation prompt
     if !yes {
         eprint!(
             "Initialize ybasey schema at {}? [y/N] ",
@@ -42,36 +39,36 @@ pub fn run_init(force: bool, yes: bool) -> Result<()> {
         }
     }
 
-    // --force: 既存 dir を削除して再作成
+    // --force: delete the existing dir and recreate it
     if force && data_dir.exists() {
         std::fs::remove_dir_all(&data_dir)?;
     }
     std::fs::create_dir_all(&data_dir)?;
 
-    // 1. _meta を先に書く (Database::open が読む)
+    // 1. Write _meta first: Database::open reads it
     write_meta(&data_dir)?;
 
     // 2. Database::open
     let mut db = ybasey::Database::open(&data_dir, Some("ytasky-init"))?;
 
-    // 3. schema 投入
+    // 3. Apply the schema
     apply_schema(&mut db)?;
 
     eprintln!("ytasky: initialized at {}", data_dir.display());
     Ok(())
 }
 
-/// `_meta` ファイルを data_dir 直下に書き出す。
-/// ybasey には _meta write API が無いため Database::open 前に直接ファイル書込する。
+/// Writes the `_meta` file into the data dir.
+/// ybasey has no API to write _meta, so the file is written directly before Database::open.
 fn write_meta(data_dir: &Path) -> Result<()> {
     let meta_path = data_dir.join("_meta");
     std::fs::write(&meta_path, "tz: Asia/Tokyo\nview_sync: async\n")?;
     Ok(())
 }
 
-/// ybasey Database に ytasky schema を投入する。
-/// テストから直接呼べるように pub。
-/// 投入順序: categories → recurrences → recurrence_exceptions → tasks (ref 先が先に存在する必要)
+/// Applies the ytasky schema to the database.
+/// Public so that tests can call it directly.
+/// Order: categories -> recurrences -> recurrence_exceptions -> tasks (a ref target must exist first)
 pub fn apply_schema(db: &mut ybasey::Database) -> Result<()> {
     // ---- categories ----
     db.create_table("categories")?;
@@ -79,7 +76,7 @@ pub fn apply_schema(db: &mut ybasey::Database) -> Result<()> {
     db.add_field("categories", "color", "str", false)?;
     db.add_field("categories", "icon", "str", false)?;
 
-    // seed 9 カテゴリ投入
+    // Seed the 9 categories
     seed_categories(db)?;
 
     // ---- recurrences ----
@@ -143,10 +140,10 @@ pub fn apply_schema(db: &mut ybasey::Database) -> Result<()> {
     Ok(())
 }
 
-/// 9 つの seed カテゴリを挿入する。
-/// insert 順序で id=1..=9 が割り当てられる。この順序は固定。
+/// Inserts the 9 seed categories.
+/// The insert order assigns ids 1..=9; keep the order fixed.
 fn seed_categories(db: &mut ybasey::Database) -> Result<()> {
-    // (name, icon, color) の順 — icon は db.rs の既存 seed と同一
+    // (name, icon, color)
     let categories: &[(&str, &str, &str)] = &[
         ("睡眠", "󰒲", "blue-grey"),
         ("食事", "󰩃", "yellow"),
@@ -170,24 +167,24 @@ fn seed_categories(db: &mut ybasey::Database) -> Result<()> {
     Ok(())
 }
 
-/// ytasky 用 view 定義を投入する。
+/// Adds the ytasky view definitions.
 fn apply_views(db: &mut ybasey::Database) -> Result<()> {
-    // report_by_category: カテゴリ別の計画時間合計とタスク数
-    // count の alias 変更は DSL 非サポートのため count のまま
+    // report_by_category: planned minutes and task count per category
+    // The DSL cannot alias count, so the column stays "count"
     db.add_view(
         "tasks",
         "report_by_category",
         "group by category_id | sum(duration_min) as planned, count",
     )?;
 
-    // report_by_date: 日付別の計画時間合計とタスク数 (日付昇順)
+    // report_by_date: planned minutes and task count per date (date ascending)
     db.add_view(
         "tasks",
         "report_by_date",
         "group by date | sum(duration_min) as total_min, count sort by date asc",
     )?;
 
-    // upcoming_tasks: 未着手タスクを日付・sort_order 昇順で一覧
+    // upcoming_tasks: todo tasks by date and sort_order ascending
     db.add_view(
         "tasks",
         "upcoming_tasks",
@@ -197,8 +194,8 @@ fn apply_views(db: &mut ybasey::Database) -> Result<()> {
     Ok(())
 }
 
-/// 既存 DB に対して差分スキーマを適用する。
-/// 新規 init では `apply_schema` が全部入れるため、ここは「既存ユーザー向けの追加分」を冪等に処理する。
+/// Applies schema additions to an existing database.
+/// A fresh init gets everything from `apply_schema`; this adds, idempotently, what older databases lack.
 pub fn migrate_schema(db: &mut ybasey::Database) -> Result<()> {
     add_field_if_absent(db, "tasks", "external_id", "str", true)?;
     add_field_if_absent(db, "recurrences", "external_id", "str", true)?;
@@ -219,9 +216,9 @@ fn add_field_if_absent(
     Ok(())
 }
 
-/// ybasey schema が存在するか check する。
-/// 存在しなければ stderr に案内を出して exit(1)。
-/// 本 phase では未使用 (phase 3-4 で各起動パスに挿入)。
+/// Checks that the schema exists.
+/// If it does not, prints a hint to stderr and exits with 1.
+/// Currently unused.
 #[allow(dead_code)]
 pub fn ensure_schema_exists() -> Result<()> {
     let data_dir = resolve_data_dir()?;
@@ -230,7 +227,7 @@ pub fn ensure_schema_exists() -> Result<()> {
         eprintln!("ytasky: database not initialized. Run 'ytasky init' first.");
         std::process::exit(1);
     }
-    // table 存在確認
+    // Check that the tables exist
     let db = ybasey::Database::open(&data_dir, Some("ytasky-check"))?;
     let required = ["categories", "tasks", "recurrences", "recurrence_exceptions"];
     for table in &required {

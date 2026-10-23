@@ -1,11 +1,11 @@
-//! ビルド時に `gcal_client.json` があれば読み込み、Google OAuth の
-//! client_id / client_secret を `YTASKY_GCAL_CLIENT_ID` /
-//! `YTASKY_GCAL_CLIENT_SECRET` 環境変数としてコンパイルに埋め込む。
+//! Embeds a Google OAuth client into the binary when `gcal_client.json` exists at build
+//! time: client_id / client_secret become the `YTASKY_GCAL_CLIENT_ID` /
+//! `YTASKY_GCAL_CLIENT_SECRET` compile-time env vars.
 //!
-//! - `gcal_client.json` は Google Cloud Console の Desktop app credential
-//!   (`{"installed":{...}}` 形式) をそのまま置く。`.gitignore` 済み。
-//! - ファイルが無ければ何もしない (auth.rs 側の option_env! が None になり、
-//!   ~/.config/ytasky/gcal.json での上書きが必須となる)。
+//! - `gcal_client.json` is the Desktop app credential downloaded from Google Cloud
+//!   Console (`{"installed":{...}}`). It is git-ignored so the secret stays out of the repo.
+//! - Without the file nothing is embedded, and users must provide `gcal.json` in the
+//!   config dir.
 
 use std::path::Path;
 
@@ -31,7 +31,7 @@ fn main() {
             return;
         }
     };
-    // Google Cloud Console の JSON は {"installed":{...}} or {"web":{...}}
+    // Google Cloud Console wraps the credential in {"installed":{...}} or {"web":{...}}.
     let inner = value
         .get("installed")
         .or_else(|| value.get("web"))

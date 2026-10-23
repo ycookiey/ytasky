@@ -15,7 +15,6 @@ use crate::model::{Recurrence, Task, format_deadline, format_duration, format_ti
 
 const DAY_MINUTES: i32 = 24 * 60;
 
-/// カテゴリIDからカラーを返す
 fn category_color(cat_id: &str) -> Color {
     match cat_id {
         "sleep" => Color::Rgb(100, 120, 140),
@@ -33,9 +32,9 @@ fn category_color(cat_id: &str) -> Color {
 
 pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::vertical([
-        Constraint::Length(1), // タイトルバー
-        Constraint::Min(0),    // メインエリア
-        Constraint::Length(1), // キーバインドバー
+        Constraint::Length(1), // title bar
+        Constraint::Min(0),    // main area
+        Constraint::Length(1), // key binding bar
     ])
     .split(f.area());
 
@@ -93,9 +92,9 @@ fn draw_title_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(bar, area);
 }
 
-/// view 別テーブル → 共通テーブルの順で、表示対象 (hint=Some) のキー一覧を集める。
-/// keymap の単一テーブルから生成するため、ハンドラに追加したキーが自動で
-/// 下部バーにも現れる (表示漏れが起きない)。
+/// Collects the keys to show (hint=Some) from the view's table, then the common table.
+/// The handlers dispatch from the same tables, so every bound key also appears in
+/// the bar.
 fn collect_hints(
     view: &[crate::app::Binding],
     common: &[crate::app::Binding],
@@ -405,9 +404,9 @@ fn draw_backlog_panel(f: &mut Frame, area: Rect, app: &App) {
             let manual_count = app.backlog_manual_count();
             let github_count = app.backlog_github_count();
             let has_gh = github_count > 0;
-            // BacklogSelect モード中は展開して全 task を選択候補にする
+            // In BacklogSelect mode, expand so every task can be picked.
             let expanded_for_render = app.backlog_github_expanded || select_cursor.is_some();
-            // BacklogSelect モードでは header にフォーカスを乗せない
+            // In BacklogSelect mode the header cannot take focus.
             let header_focused = app.backlog_header_focused && select_cursor.is_none();
             let sel_bg = Style::default().bg(Color::Rgb(50, 50, 80)).fg(Color::White);
 
@@ -420,7 +419,7 @@ fn draw_backlog_panel(f: &mut Frame, area: Rect, app: &App) {
                     .style(Style::default().fg(Color::DarkGray)),
                 );
             } else {
-                // Manual セクション
+                // Manual section
                 for (idx, task) in app.backlog_tasks.iter().take(manual_count).enumerate() {
                     let (deadline_text, deadline_color) =
                         backlog_deadline_style(task.deadline.as_deref(), &today);
@@ -438,7 +437,7 @@ fn draw_backlog_panel(f: &mut Frame, area: Rect, app: &App) {
                     );
                 }
 
-                // GitHub セクション: ヘッダ + 展開時のみタスク一覧
+                // GitHub section: the header, plus its tasks when expanded
                 if has_gh {
                     let arrow = if expanded_for_render { "▼" } else { "▶" };
                     let header_text = format!("[GitHub ({github_count}) {arrow}]");
@@ -628,7 +627,7 @@ fn draw_timeline_column(
             " ".repeat(label_width as usize)
         };
 
-        // バッファ区間
+        // Free time between tasks
         if let Some((buffer_start, buffer_end)) = buffers
             .iter()
             .find(|(start, end)| *start < slot_end && *end > slot_start)
@@ -653,7 +652,7 @@ fn draw_timeline_column(
             continue;
         }
 
-        // 通常スケジュール
+        // Scheduled task
         if let Some((idx, (task_start, _, task))) = schedule
             .iter()
             .enumerate()
@@ -704,7 +703,7 @@ fn draw_timeline_column(
                 Span::styled(padded, style),
             ]));
         } else {
-            // 空きスロット
+            // Empty slot
             lines.push(Line::from(vec![
                 Span::styled(label, Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -1319,7 +1318,7 @@ fn draw_recurrence_form_modal(f: &mut Frame, app: &App, form: &RecurrenceFormSta
             Span::styled(*label, label_style),
         ];
 
-        // weekly行: 曜日ボタン（weeklyパターン時のみ選択表示）
+        // weekly row: weekday buttons, selectable only for the weekly pattern
         if idx == 1 {
             spans.push(Span::raw("    "));
             let show_selection = form.pattern == "weekly";
@@ -1342,7 +1341,7 @@ fn draw_recurrence_form_modal(f: &mut Frame, app: &App, form: &RecurrenceFormSta
             }
         }
 
-        // monthly行: setpos=None は日付、setpos=Some は "第N <曜日>"
+        // monthly row: setpos=None shows days of the month, setpos=Some shows "Nth <weekday>"
         if idx == 2 {
             spans.push(Span::raw("    "));
             if form.pattern != "monthly" {
@@ -1372,7 +1371,7 @@ fn draw_recurrence_form_modal(f: &mut Frame, app: &App, form: &RecurrenceFormSta
         lines.push(Line::from(spans));
     }
 
-    // INTERVAL 行
+    // INTERVAL row
     lines.push(Line::from(""));
     let interval_display = if form.interval_input.is_empty() {
         "1".to_string()
@@ -1396,7 +1395,7 @@ fn draw_recurrence_form_modal(f: &mut Frame, app: &App, form: &RecurrenceFormSta
         Span::styled(format!(" {interval_unit}"), normal),
     ]));
 
-    // SETPOS 行 (monthly のみ意味があるが、常時表示で OFF 状態を見せる)
+    // SETPOS row: only meaningful for monthly, but always shown so the OFF state is visible
     let setpos_display = match form.setpos {
         None => "なし (BYMONTHDAY)".to_string(),
         Some(-1) => "最終".to_string(),
@@ -1424,7 +1423,7 @@ fn draw_recurrence_form_modal(f: &mut Frame, app: &App, form: &RecurrenceFormSta
         Span::styled(weekday_hint, normal),
     ]));
 
-    // 終了日
+    // End date row
     lines.push(Line::from(""));
     let end_display = if !form.end_date_input.is_empty() {
         form.end_date_input.clone()
@@ -1441,7 +1440,7 @@ fn draw_recurrence_form_modal(f: &mut Frame, app: &App, form: &RecurrenceFormSta
         Span::styled(format!("[{end_display:<14}]"), end_style),
     ]));
 
-    // ヘルプ
+    // Help
     lines.push(Line::from(""));
     let help = match form.field {
         RecurrenceFormField::Pattern => match form.pattern.as_str() {

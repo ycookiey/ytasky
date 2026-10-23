@@ -1,6 +1,6 @@
-//! db.rs 統合テスト — ybasey Database API 経由の全 pub 関数を検証する
+//! Integration tests for the `db` module.
 //!
-//! 各テストは tempdir に独立した ybasey DB を作り、相互干渉なし。
+//! Each test opens its own database in a temporary directory.
 
 use std::path::Path;
 
@@ -25,7 +25,7 @@ fn test_load_categories_returns_9() {
     let db = setup_db(tmp.path());
     let cats = ytasky::db::load_categories(&db).unwrap();
     assert_eq!(cats.len(), 9);
-    // id は "1".."9" の文字列
+    // Category ids are the strings "1".."9".
     assert!(cats.iter().any(|c| c.id == "1"));
     assert!(cats.iter().any(|c| c.id == "9"));
 }
@@ -61,7 +61,6 @@ fn test_load_tasks_filter_is_backlog() {
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
-    // backlog task は load_tasks で出てこない
     ytasky::db::insert_backlog_task(&mut db, "backlog task", "1", 30, None).unwrap();
     ytasky::db::insert_task(&mut db, "2026-04-19", "schedule task", "1", 30, None).unwrap();
 
@@ -173,12 +172,11 @@ fn test_swap_sort_order_different_dates_noop() {
     let id1 = ytasky::db::insert_task(&mut db, "2026-04-19", "T1", "1", 30, None).unwrap();
     let id2 = ytasky::db::insert_task(&mut db, "2026-04-20", "T2", "1", 30, None).unwrap();
 
-    // 異日 swap は no-op
+    // Swapping tasks on different dates is a no-op.
     ytasky::db::swap_sort_order(&mut db, id1, id2).unwrap();
 
     let t1 = ytasky::db::load_task_by_id(&db, id1).unwrap().unwrap();
     let t2 = ytasky::db::load_task_by_id(&db, id2).unwrap().unwrap();
-    // sort_order 変わらず (各日で 0)
     assert_eq!(t1.sort_order, 0);
     assert_eq!(t2.sort_order, 0);
 }
@@ -195,7 +193,7 @@ fn test_load_backlog_tasks() {
 
     let tasks = ytasky::db::load_backlog_tasks(&db).unwrap();
     assert_eq!(tasks.len(), 2);
-    // deadline あり (B2) が先に来る
+    // Tasks with a deadline come before tasks without one.
     assert_eq!(tasks[0].title, "B2");
     assert_eq!(tasks[1].title, "B1");
 }
@@ -224,7 +222,6 @@ fn test_insert_backlog_task_at_head() {
         ytasky::db::insert_task(&mut db, "2026-04-19", "既存", "1", 30, None).unwrap();
     let bl_id = ytasky::db::insert_backlog_task(&mut db, "挿入", "1", 30, None).unwrap();
 
-    // 先頭 (index=0) に挿入
     ytasky::db::insert_backlog_task_at(&mut db, bl_id, "2026-04-19", 0).unwrap();
 
     let tasks = ytasky::db::load_tasks(&mut db, "2026-04-19").unwrap();
@@ -257,9 +254,7 @@ fn test_restore_task_to_schedule() {
     let mut db = setup_db(tmp.path());
 
     let id = ytasky::db::insert_task(&mut db, "2026-04-19", "元タスク", "1", 30, None).unwrap();
-    // バックログに移動
     ytasky::db::set_backlog_flag(&mut db, id, true).unwrap();
-    // スケジュールに戻す
     ytasky::db::restore_task_to_schedule(&mut db, id, "2026-04-19", 0).unwrap();
 
     let tasks = ytasky::db::load_tasks(&mut db, "2026-04-19").unwrap();
@@ -276,10 +271,8 @@ fn test_restore_task_to_backlog() {
         ytasky::db::insert_task(&mut db, "2026-04-19", "スケジュール", "1", 30, None).unwrap();
     let bl_id = ytasky::db::insert_backlog_task(&mut db, "バックログ", "1", 30, None).unwrap();
 
-    // スケジュールからバックログへ移動
     ytasky::db::set_backlog_flag(&mut db, sched_id, true).unwrap();
 
-    // バックログに戻す (sort_order=0)
     ytasky::db::restore_task_to_backlog(&mut db, bl_id, 0).unwrap();
 
     let bl = ytasky::db::load_backlog_tasks(&db).unwrap();
@@ -298,10 +291,8 @@ fn test_report_by_category() {
     ytasky::db::insert_task(&mut db, "2026-04-19", "T3", "2", 45, None).unwrap();
 
     let report = ytasky::db::report_by_category(&db, "2026-04-19").unwrap();
-    // category_id=1 の planned_min = 90
     let r1 = report.iter().find(|r| r.category_id == "1").unwrap();
     assert_eq!(r1.planned_min, 90);
-    // category_id=2 の planned_min = 45
     let r2 = report.iter().find(|r| r.category_id == "2").unwrap();
     assert_eq!(r2.planned_min, 45);
 }
@@ -316,13 +307,13 @@ fn test_report_by_title() {
     ytasky::db::insert_task(&mut db, "2026-04-19", "別タイトル", "2", 45, None).unwrap();
 
     let report = ytasky::db::report_by_title(&db, "2026-04-19").unwrap();
-    // 同タイトルは集約 planned_min=90
+    // Tasks with the same title are summed into one row.
     let r = report
         .iter()
         .find(|r| r.title == "同タイトル")
         .unwrap();
     assert_eq!(r.planned_min, 90);
-    // 最大値が先頭
+    // Rows are sorted by planned minutes, largest first.
     assert_eq!(report[0].title, "同タイトル");
 }
 
@@ -370,19 +361,16 @@ fn test_delete_recurrence_cascades() {
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
-    // recurrence 作成
     let rec_id = ytasky::db::insert_recurrence(
         &mut db, "週次", "1", 30, None,
         "weekly", Some(r#"{"days":[1]}"#), "2026-01-01", None,
     ).unwrap();
 
-    // recurrence_exception 追加
     ytasky::db::add_recurrence_exception(&mut db, rec_id, "2026-04-21").unwrap();
 
-    // recurrence に紐づくタスクを作成
     let task_id =
         ytasky::db::insert_task(&mut db, "2026-04-21", "週次インスタンス", "1", 30, None).unwrap();
-    // recurrence_id を手動設定 (generate_recurring_tasks を使わずにテスト)
+    // Link the task by hand so the test does not depend on generate_recurring_tasks.
     ybasey::Database::update(
         &mut db,
         "tasks",
@@ -390,14 +378,13 @@ fn test_delete_recurrence_cascades() {
         vec![("recurrence_id".into(), rec_id.to_string())],
     ).unwrap();
 
-    // cascade delete
     ytasky::db::delete_recurrence(&mut db, rec_id).unwrap();
 
-    // exception も削除されている
+    // Exceptions are removed by the cascade.
     let recs = ytasky::db::load_recurrences(&db).unwrap();
     assert!(recs.is_empty());
 
-    // task.recurrence_id は null (set-null)
+    // The task stays, with recurrence_id cleared (on-delete=set-null).
     let task = ytasky::db::load_task_by_id(&db, task_id).unwrap().unwrap();
     assert!(task.recurrence_id.is_none());
 }
@@ -429,7 +416,6 @@ fn test_generate_recurring_task_with_exception() {
         "daily", None, "2026-04-01", None,
     ).unwrap();
 
-    // 2026-04-19 を例外に登録
     ytasky::db::add_recurrence_exception(&mut db, rec_id, "2026-04-19").unwrap();
 
     let tasks = ytasky::db::load_tasks(&mut db, "2026-04-19").unwrap();
@@ -446,9 +432,8 @@ fn test_generate_recurring_task_existing_skips() {
         "daily", None, "2026-04-01", None,
     ).unwrap();
 
-    // 1回目の load_tasks で生成
     ytasky::db::load_tasks(&mut db, "2026-04-19").unwrap();
-    // 2回目の load_tasks で重複生成しない
+    // A second load must not generate the task again.
     let tasks = ytasky::db::load_tasks(&mut db, "2026-04-19").unwrap();
     assert_eq!(tasks.len(), 1, "should not duplicate");
 }
@@ -458,17 +443,15 @@ fn test_generate_weekly_recurring_task() {
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
-    // 2026-04-19 は日曜 = weekday 7 (chrono: 月曜=1)
+    // 2026-04-19 is a Sunday, weekday 7 (Monday = 1).
     ytasky::db::insert_recurrence(
         &mut db, "日曜タスク", "1", 30, None,
         "weekly", Some(r#"{"days":[7]}"#), "2026-04-01", None,
     ).unwrap();
 
-    // 日曜日
     let tasks = ytasky::db::load_tasks(&mut db, "2026-04-19").unwrap();
     assert_eq!(tasks.len(), 1);
 
-    // 月曜日 (2026-04-20) は生成されない
     let tasks_mon = ytasky::db::load_tasks(&mut db, "2026-04-20").unwrap();
     assert!(tasks_mon.is_empty());
 }
@@ -516,29 +499,27 @@ fn test_query_history_table_filter() {
     let mut db = setup_db(tmp.path());
 
     ytasky::db::insert_task(&mut db, "2026-04-19", "タスク", "1", 30, None).unwrap();
-    // categories はスキーマ適用時に insert 済みなので history に含まれる
+    // The seeded categories are written during schema setup, so they are in the history.
 
     let all = ytasky::db::query_history(&db, None, 100).unwrap();
     let tasks_only = ytasky::db::query_history(&db, Some("tasks"), 100).unwrap();
 
-    // tasks filter は tasks テーブルの entries のみ返す
     assert!(tasks_only.len() < all.len() || !all.is_empty());
     for entry in &tasks_only {
         assert!(entry.contains("tasks"), "entry should mention tasks: {entry}");
     }
 }
 
-// ---- 固定タスク再配置: insert / edit / load 自動修正 -----------------------------
+// ---- reordering of fixed-time tasks on insert / edit / load -------------------
 
 #[test]
 fn test_insert_fixed_tasks_sorted_by_time_regardless_of_order() {
-    // 仕様: 固定タスクは登録順に関係なく fixed_start の時刻順に並ぶ
+    // Fixed-time tasks are ordered by fixed_start regardless of insertion order.
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
-    // 21:00(1260) を先に登録
     ytasky::db::insert_task(&mut db, "2026-05-06", "会議", "9", 60, Some(1260)).unwrap();
-    // 後から 18:30(1110) を登録 → 会議より前に来るべき
+    // Inserted later but earlier in the day, so it must come first.
     ytasky::db::insert_task(&mut db, "2026-05-06", "運動", "5", 60, Some(1110)).unwrap();
 
     let tasks = ytasky::db::load_tasks(&mut db, "2026-05-06").unwrap();
@@ -549,7 +530,7 @@ fn test_insert_fixed_tasks_sorted_by_time_regardless_of_order() {
 
 #[test]
 fn test_unscheduled_task_appended_to_end() {
-    // 仕様: 未定タスクは末尾に追加される (3-d)
+    // Tasks without a fixed start are appended at the end.
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
@@ -565,8 +546,8 @@ fn test_unscheduled_task_appended_to_end() {
 
 #[test]
 fn test_fixed_task_inserted_between_existing_by_proximity() {
-    // 既存固定 9:00(540) と 18:00(1080) がある状態で 12:00(720) を追加
-    // dist_prev = 720 - (540+60) = 120, dist_next = 1080 - 720 = 360 → prev 寄り
+    // With fixed tasks at 9:00 (540) and 18:00 (1080), add one at 12:00 (720):
+    // gap to prev = 720 - (540+60) = 120, gap to next = 1080 - 720 = 360, so it goes after prev.
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
@@ -582,11 +563,11 @@ fn test_fixed_task_inserted_between_existing_by_proximity() {
 
 #[test]
 fn test_load_tasks_auto_normalizes_existing_misordered_fixed_tasks() {
-    // 既存データが時刻順で並んでいない場合、load_tasks 経由で自動修正される
+    // Data stored out of time order is fixed when loaded through load_tasks.
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
-    // ybasey API で sort_order を直接書いて wrong order を作る
+    // Write sort_order directly through the database API to create a wrong order.
     use ybasey::NewRecord;
     let _ = db
         .insert(
@@ -626,7 +607,7 @@ fn test_load_tasks_auto_normalizes_existing_misordered_fixed_tasks() {
 
 #[test]
 fn test_edit_fixed_start_relocates_task() {
-    // 4-a/5-a: edit で fixed_start を変更したら再配置
+    // Changing fixed_start on edit moves the task to its new time slot.
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
@@ -634,7 +615,7 @@ fn test_edit_fixed_start_relocates_task() {
     let b = ytasky::db::insert_task(&mut db, "2026-05-06", "B", "1", 60, Some(720)).unwrap(); // 12:00
     let _c = ytasky::db::insert_task(&mut db, "2026-05-06", "C", "1", 60, Some(1080)).unwrap(); // 18:00
 
-    // B を 19:00 (1140) に変更 → C(18:00) の後ろに来るべき
+    // Move B to 19:00 (1140); it must end up after C (18:00).
     ytasky::db::update_task(&mut db, b, "B", "1", 60, Some(1140)).unwrap();
 
     let tasks = ytasky::db::load_tasks(&mut db, "2026-05-06").unwrap();
@@ -645,7 +626,7 @@ fn test_edit_fixed_start_relocates_task() {
 
 #[test]
 fn test_edit_fixed_to_unscheduled_moves_to_end() {
-    // edit で固定 → 未定 にしたら末尾へ移動
+    // Clearing the fixed start on edit moves the task to the end.
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
@@ -663,7 +644,7 @@ fn test_edit_fixed_to_unscheduled_moves_to_end() {
 
 #[test]
 fn test_edit_fixed_same_rank_keeps_sort_order() {
-    // 8-a: time-rank が変わらないなら sort_order は変えない
+    // If the time rank does not change, sort_order must not change.
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
@@ -673,7 +654,7 @@ fn test_edit_fixed_same_rank_keeps_sort_order() {
 
     let before = ytasky::db::load_task_by_id(&db, b).unwrap().unwrap();
 
-    // B を 13:00 (780) に変更 → A(9) < B < C(18) なので rank 不変
+    // Move B to 13:00 (780); A (9:00) < B < C (18:00), so the rank stays.
     ytasky::db::update_task(&mut db, b, "B", "1", 60, Some(780)).unwrap();
 
     let after = ytasky::db::load_task_by_id(&db, b).unwrap().unwrap();
@@ -700,7 +681,6 @@ fn test_create_recurrence_from_task() {
     ).unwrap();
     assert!(rec_id > 0);
 
-    // task に recurrence_id が設定されている
     let task = ytasky::db::load_task_by_id(&db, task_id).unwrap().unwrap();
     assert_eq!(task.recurrence_id, Some(rec_id));
 }

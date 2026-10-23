@@ -1,9 +1,9 @@
-//! 認証: `gh` CLI のトークンを流用する。ytasky 自身はトークンを保管しない。
+//! Authentication: reuses the token of the `gh` CLI. ytasky does not store the token.
 
 use anyhow::{Context, Result, bail};
 use std::process::Command;
 
-/// `gh` のアクセストークン。`Debug` を手動実装し、ログ・エラーに平文が漏れないようマスクする。
+/// Access token from `gh`. `Debug` is implemented by hand to keep the token out of logs and errors.
 #[derive(Clone)]
 pub struct GithubToken(String);
 
@@ -19,10 +19,10 @@ impl std::fmt::Debug for GithubToken {
     }
 }
 
-/// `gh auth token` を実行してトークンを取得する。
+/// Gets the token by running `gh auth token`.
 ///
-/// トークン管理（保管・更新・スコープ）は `gh` に委譲する。
-/// エラーメッセージにはトークンを含めない（stdout 側にあるトークンは捨てる）。
+/// Storing, refreshing and scoping the token are left to `gh`.
+/// Error messages never include the token, which is on stdout.
 pub fn get_token() -> Result<GithubToken> {
     let output = Command::new("gh")
         .args(["auth", "token"])
@@ -30,7 +30,7 @@ pub fn get_token() -> Result<GithubToken> {
         .context("`gh` の実行に失敗しました。GitHub CLI をインストールして `gh auth login` してください")?;
 
     if !output.status.success() {
-        // stderr にトークンは含まれない。未ログイン等の理由を案内に乗せる。
+        // stderr holds no token; pass its reason (such as not logged in) on to the message.
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "`gh auth token` が失敗しました（未ログインの可能性）。`gh auth login` でログインしてください: {}",

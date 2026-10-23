@@ -1,12 +1,7 @@
-//! GitHub issue 連携モジュール。
+//! GitHub issue import.
 //!
-//! GitHub の検索クエリに一致する open issue を backlog タスクへ取り込む。
-//! 認証は `gh` CLI のトークンを流用する（OAuth なし）。設計は `docs/github-import.md`。
-//!
-//! 公開 API（順次追加）:
-//! - [`load_config`]: `~/.config/ytasky/config.json` から GitHub 設定を読む
-//! - [`external_id`]: `github:{owner}/{repo}#{number}` 形式の external_id を生成
-//! - `types`: Search API レスポンスの serde 型
+//! Imports open issues matching GitHub search queries as backlog tasks.
+//! Authentication reuses the token of the `gh` CLI, so ytasky needs no OAuth flow.
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -16,9 +11,8 @@ pub mod auth;
 pub mod import;
 pub mod types;
 
-/// 長大なレスポンス本文をエラーメッセージに乗せる際の安全な truncate。
-// TODO(共通化): gcal にも同名の関数がある。M3 の sanitize_text 共通化とあわせて
-//   src/text.rs 等へ統合する。
+/// Truncates a long response body before it goes into an error message.
+// TODO: identical to gcal::truncate_for_log; merge both into src/text.rs.
 pub(crate) fn truncate_for_log(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -27,15 +21,15 @@ pub(crate) fn truncate_for_log(s: &str, max: usize) -> String {
     format!("{head}... ({} 文字省略)", s.chars().count() - max)
 }
 
-/// `~/.config/ytasky/config.json` の GitHub 関連設定。
-/// GCal 設定（`GcalConfig`）と同じファイルを別構造体で部分デシリアライズする。
-/// 注: `#[serde(deny_unknown_fields)]` を付けないこと（GCal のフィールドで失敗する）。
+/// GitHub settings in `config.json` in the config dir.
+/// The same file also holds `GcalConfig`; each struct deserializes only its own fields.
+/// Do not add `#[serde(deny_unknown_fields)]`: the GCal fields would make parsing fail.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GithubConfig {
-    /// import 対象を表す GitHub 検索構文の配列（例: `"is:open assignee:@me"`）。
+    /// GitHub search queries to import (e.g. `"is:open assignee:@me"`).
     #[serde(default)]
     pub github_import_queries: Vec<String>,
-    /// TUI 起動時にバックグラウンドで import するか（default: true）。
+    /// Whether the TUI imports in the background at startup.
     #[serde(default = "default_true")]
     pub github_auto_sync: bool,
 }
@@ -53,9 +47,9 @@ impl Default for GithubConfig {
     }
 }
 
-/// `~/.config/ytasky/config.json` から GitHub 設定を読む。無ければデフォルト。
-/// JSON パース失敗は `Err` を返す（unwrap_or_default で握り潰すと typo が
-/// 「queries が空」に degrade してデバッグ不能になるため）。
+/// Reads the GitHub settings from `config.json`; defaults when the file is missing.
+/// A JSON parse error is returned instead of falling back to the defaults, which would
+/// turn a typo into "no queries" and hide the cause.
 pub fn load_config() -> Result<GithubConfig> {
     use anyhow::Context;
     let path = crate::recurrence::config_dir()?.join("config.json");
@@ -69,8 +63,8 @@ pub fn load_config() -> Result<GithubConfig> {
     Ok(cfg)
 }
 
-/// `github:{owner}/{repo}#{number}` 形式の external_id を生成する。
-/// GCal の `gcal:` prefix と名前空間が分かれるため衝突しない。
+/// Builds the external_id `github:{owner}/{repo}#{number}`.
+/// The `github:` prefix keeps these ids apart from the `gcal:` ones.
 pub fn external_id(owner: &str, repo: &str, number: u64) -> String {
     format!("github:{owner}/{repo}#{number}")
 }
@@ -112,7 +106,7 @@ mod tests {
 
     #[test]
     fn coexists_with_gcal_fields() {
-        // GCal のフィールドが同居しても GitHub 設定の読み取りは成功する
+        // GCal fields in the same file do not break reading the GitHub settings
         let json = r#"{
             "gcal_auto_sync": false,
             "gcal_auto_sync_days": 14,

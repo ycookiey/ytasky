@@ -1,6 +1,4 @@
-//! history.rs — undo/redo Command pattern
-//!
-//! Sub-task 11: rusqlite::Connection → ybasey::Database に全面置換済み。
+//! Undo/redo with the command pattern.
 
 use anyhow::{Context, Result};
 use ybasey::Database;
@@ -349,16 +347,16 @@ impl Command for ToggleActualCommand {
     }
 }
 
-// ---- history.rs 内部 helper (restore_task) ------------------------------------
+// ---- Internal helper (restore_task) ---------------------------------------------
 
-/// 削除済みタスクを復元する (Undo 用)
+/// Restores a deleted task (for undo).
 fn restore_task(db: &mut Database, task: &Task) -> Result<()> {
-    // 既存なら何もしない
+    // Do nothing when the task still exists
     if crate::db::load_task_by_id(db, task.id)?.is_some() {
         return Ok(());
     }
 
-    // sort_order 以降を shift
+    // Shift sort_order at and after its position
     if task.is_backlog {
         let to_shift: Vec<(u64, i32)> = {
             let table = db.table("tasks")?;
@@ -431,7 +429,7 @@ fn restore_task(db: &mut Database, task: &Task) -> Result<()> {
         }
     }
 
-    // InsertWithId で元の id で復元
+    // Restore with the original id through InsertWithId
     let mut fields = vec![
         ("date".into(), task.date.clone()),
         ("title".into(), task.title.clone()),
@@ -465,7 +463,6 @@ fn restore_task(db: &mut Database, task: &Task) -> Result<()> {
         }],
     )?;
 
-    // normalize
     if task.is_backlog {
         crate::db::normalize_backlog_sort_order_pub(db)?;
     } else {

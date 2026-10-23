@@ -1,16 +1,16 @@
-//! `ytasky update`: Scoop でインストールした ytasky の自己更新。
+//! `ytasky update`: self-update of a Scoop-installed ytasky.
 //!
-//! ytasky.exe を実行したまま `scoop update` を呼ぶと、Windows のファイルロックと
-//! Scoop の running-process チェックの双方に阻まれる (自己ロック)。これを避けるため:
-//!   1. 背景に溜まった `ytasky mcp` プロセスを kill する
-//!   2. 自分 (この update プロセス) の消滅を待ってから `scoop update ytasky` を
-//!      実行する detached な PowerShell helper を別コンソールに起動する
-//!   3. 自分は即終了する
-//! helper が `scoop update` を呼ぶ時点で ytasky.exe は1つも生きていないため、
-//! ロックも running 判定も発生しない。
+//! Running `scoop update` while ytasky.exe runs is blocked both by the Windows file
+//! lock and by Scoop's running-process check. To avoid this, update:
+//!   1. Kills the background `ytasky mcp` processes
+//!   2. Starts a detached PowerShell helper in a new console that waits for this
+//!      process to exit and then runs `scoop update ytasky`
+//!   3. Exits immediately
+//! When the helper calls `scoop update`, no ytasky.exe is running, so neither the
+//! lock nor the running-process check applies.
 //!
-//! 注: 別ターミナルで TUI を開いたままだと、その ytasky.exe が Scoop の
-//! running チェックに引っかかる。update は背景の mcp のみを kill 対象とする。
+//! A TUI left open in another terminal still trips Scoop's running-process check:
+//! update kills only the background mcp processes.
 
 use anyhow::Result;
 
@@ -33,7 +33,7 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// 自分以外の `ytasky mcp` プロセスを列挙して kill する。kill 成功数を返す。
+/// Kills every `ytasky mcp` process except this one; returns how many were killed.
 #[cfg(target_os = "windows")]
 fn kill_mcp_processes() -> usize {
     use sysinfo::{ProcessesToUpdate, System, get_current_pid};
@@ -51,7 +51,7 @@ fn kill_mcp_processes() -> usize {
         if name != "ytasky.exe" && name != "ytasky" {
             continue;
         }
-        // コマンドライン引数に `mcp` を含むものだけを対象 (TUI/CLI は除外)。
+        // Only processes with an `mcp` argument (TUI/CLI processes are left alone).
         let is_mcp = proc_
             .cmd()
             .iter()
@@ -63,8 +63,8 @@ fn kill_mcp_processes() -> usize {
     count
 }
 
-/// 自分の PID が消えるのを待ってから `scoop update ytasky` を実行する
-/// 独立コンソールの PowerShell プロセスを起動する。
+/// Starts a PowerShell process in its own console that waits for this PID to exit
+/// and then runs `scoop update ytasky`.
 #[cfg(target_os = "windows")]
 fn spawn_detached_updater() -> Result<()> {
     use anyhow::Context;
@@ -72,7 +72,7 @@ fn spawn_detached_updater() -> Result<()> {
     use std::process::Command;
     use sysinfo::get_current_pid;
 
-    // 新しいコンソールで起動し、scoop の進捗をユーザーが見られるようにする。
+    // A new console lets the user follow scoop's progress.
     const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
@@ -80,7 +80,7 @@ fn spawn_detached_updater() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("自 PID 取得失敗: {e}"))?
         .as_u32();
 
-    // 自分 (update プロセス) の消滅を待ってから update を走らせる。
+    // Wait for this update process to exit before updating.
     let script = format!(
         "while (Get-Process -Id {my_pid} -ErrorAction SilentlyContinue) {{ Start-Sleep -Milliseconds 100 }}; scoop update ytasky"
     );

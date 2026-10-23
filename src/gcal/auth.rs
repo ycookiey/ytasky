@@ -1,9 +1,9 @@
-//! OAuth 2.0 Loopback Redirect + PKCE による Google Calendar への認証。
+//! Google Calendar sign-in with OAuth 2.0 loopback redirect and PKCE (RFC 8252, RFC 7636).
 //!
-//! - credential: 同梱の client_id/client_secret (ビルド時環境変数で埋め込み) を
-//!   デフォルトとし、`~/.config/ytasky/gcal.json` があればそちらで上書きする
-//! - token: `~/.config/ytasky/gcal_token.json` に保存する
-//! - 同時ログインは `~/.config/ytasky/gcal_login.lock` で排他
+//! - credential: the client embedded at build time, overridden by `gcal.json` in the
+//!   config dir when that file exists
+//! - token: `gcal_token.json` in the config dir
+//! - `gcal_login.lock` in the config dir keeps two sign-ins from running at once
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
@@ -18,8 +18,8 @@ const TOKEN_URI_DEFAULT: &str = "https://oauth2.googleapis.com/token";
 const SCOPE: &str = "https://www.googleapis.com/auth/calendar.readonly";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// ビルド時に `YTASKY_GCAL_CLIENT_ID` / `YTASKY_GCAL_CLIENT_SECRET` を指定すると埋め込まれる。
-/// 未指定なら `~/.config/ytasky/gcal.json` が必須。
+/// Set at build time from `YTASKY_GCAL_CLIENT_ID` / `YTASKY_GCAL_CLIENT_SECRET`.
+/// Without them, `gcal.json` in the config dir is required.
 const BUNDLED_CLIENT_ID: Option<&str> = option_env!("YTASKY_GCAL_CLIENT_ID");
 const BUNDLED_CLIENT_SECRET: Option<&str> = option_env!("YTASKY_GCAL_CLIENT_SECRET");
 
@@ -77,7 +77,7 @@ impl Token {
     }
 }
 
-// ---- パス解決 -----------------------------------------------------------------
+// ---- paths --------------------------------------------------------------------
 
 fn config_dir() -> Result<PathBuf> {
     crate::recurrence::config_dir()
@@ -95,9 +95,9 @@ fn lock_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("gcal_login.lock"))
 }
 
-// ---- 公開 API -----------------------------------------------------------------
+// ---- public API ---------------------------------------------------------------
 
-/// OAuth フローを実行して token を取得・保存する。
+/// Runs the OAuth flow and saves the token.
 pub fn login() -> Result<()> {
     let _lock = acquire_login_lock()?;
     let credential = load_credential()?;
@@ -114,9 +114,8 @@ pub fn login() -> Result<()> {
     let redirect_uri = format!("http://127.0.0.1:{port}/cb");
 
     let url = build_authorize_url(&credential, &redirect_uri, &challenge, &state);
-    // state を含む URL は同マシン上のローカルプロセスから観測されると
-    // 偽コールバック攻撃の素材になる。eprintln は state を伏字化し、
-    // 完全 URL はブラウザにのみ渡す。
+    // A local process that sees the URL with `state` could forge the callback, so stderr
+    // gets the URL with `state` redacted and only the browser gets the full URL.
     eprintln!(
         "ブラウザで認可してください: {}",
         redact_state_in_url(&url)
@@ -137,7 +136,6 @@ pub fn login() -> Result<()> {
     Ok(())
 }
 
-/// 保存済み token を削除する。
 pub fn logout() -> Result<()> {
     let path = token_path()?;
     if path.exists() {
@@ -149,7 +147,7 @@ pub fn logout() -> Result<()> {
     Ok(())
 }
 
-/// 有効な access token を返す。期限切れなら refresh、無ければエラー。
+/// Returns a valid access token, refreshing it when expired. Errors when not signed in.
 pub fn get_valid_token() -> Result<String> {
     let mut token = load_token()?.context("未認証。`ytasky gcal-login` を先に実行してください")?;
     let now = chrono::Utc::now().timestamp();
@@ -160,7 +158,7 @@ pub fn get_valid_token() -> Result<String> {
             .as_deref()
             .context("refresh_token が無い。再ログインが必要")?;
         let refreshed = refresh_access_token(&credential, refresh)?;
-        // refresh レスポンスは refresh_token を含まないことがある → 既存値を維持
+        // A refresh response may omit refresh_token; keep the stored one.
         let merged = Token {
             refresh_token: refreshed.refresh_token.clone().or(token.refresh_token.clone()),
             ..refreshed
@@ -180,7 +178,7 @@ fn load_credential() -> Result<Credential> {
             .with_context(|| format!("credential 読込失敗: {}", path.display()))?;
         let value: serde_json::Value = serde_json::from_str(&raw)
             .with_context(|| format!("credential JSON が不正: {}", path.display()))?;
-        // Google Cloud Console の JSON は {"installed": {...}} or {"web": {...}} 形式
+        // Google Cloud Console wraps the credential in {"installed": {...}} or {"web": {...}}.
         let inner = value
             .get("installed")
             .or_else(|| value.get("web"))
@@ -210,9 +208,9 @@ fn load_credential() -> Result<Credential> {
     )
 }
 
-/// 悪意ある gcal.json で `auth_uri` / `token_uri` を攻撃者管理 URL に
-/// 差し替えられると `code` / `code_verifier` / `client_secret` が漏洩する。
-/// Google 公式エンドポイントの prefix にマッチすることを必須にする。
+/// A malicious gcal.json that points `auth_uri` / `token_uri` at an attacker's server
+/// would leak `code`, `code_verifier` and `client_secret`, so both must start with
+/// an official Google endpoint prefix.
 fn validate_oauth_endpoints(cred: &Credential) -> Result<()> {
     const ALLOWED_AUTH_PREFIXES: &[&str] = &[
         "https://accounts.google.com/",
@@ -242,12 +240,11 @@ fn validate_oauth_endpoints(cred: &Credential) -> Result<()> {
     Ok(())
 }
 
-/// token を `~/.config/ytasky/gcal_token.json` に保存する。
+/// Saves the token as `gcal_token.json` in the config dir.
 ///
-/// セキュリティ:
-/// - **Unix**: `chmod 600` で所有者のみアクセス可
-/// - **Windows**: ユーザープロファイル配下の ACL に依存。共有環境では別ユーザーが
-///   読み取れるリスクが残る。詳細は README の Google Calendar 連携節を参照。
+/// - Unix: mode 600, readable only by the owner.
+/// - Windows: no extra protection beyond the user profile's ACL, so other users with
+///   access to the profile can read the token.
 fn save_token(token: &Token) -> Result<()> {
     let path = token_path()?;
     if let Some(parent) = path.parent() {
@@ -283,7 +280,7 @@ fn load_token() -> Result<Option<Token>> {
 
 // ---- PKCE / state / URL -------------------------------------------------------
 
-/// (code_verifier, code_challenge) を生成する。
+/// Returns (code_verifier, code_challenge).
 fn generate_pkce() -> (String, String) {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -321,7 +318,7 @@ fn build_authorize_url(
     url.to_string()
 }
 
-// ---- Loopback サーバー --------------------------------------------------------
+// ---- loopback server ---------------------------------------------------------
 
 fn run_loopback_callback(
     server: &tiny_http::Server,
@@ -347,8 +344,8 @@ fn run_loopback_callback(
         }
     }
 
-    // ユーザー誤認を防ぐため、レスポンス送信より先に state を検証する
-    // (CSRF / 偽コールバックの場合に「認証完了」を表示しない)
+    // Check `state` before responding so a forged callback (CSRF) never shows
+    // the success page.
     if let Some(err) = error {
         respond_plain(request, "認証失敗。ターミナルを確認してください。");
         bail!("OAuth エラー: {err}");
@@ -386,7 +383,7 @@ fn respond_plain(request: tiny_http::Request, body: &str) {
     let _ = request.respond(response);
 }
 
-// ---- token 交換 / refresh -----------------------------------------------------
+// ---- token exchange / refresh ------------------------------------------------
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -444,16 +441,15 @@ fn post_token(token_uri: &str, params: &[(&str, &str)]) -> Result<Token> {
     let status = resp.status();
     let body = resp.text()?;
     if !status.is_success() {
-        // エラーレスポンス body は Google のエラー JSON で token は含まれないが
-        // 念のため先頭 200 文字に truncate して長大な漏洩を防ぐ
+        // Google's error body holds no token, but truncate it anyway to keep long bodies
+        // out of the logs.
         bail!(
             "token endpoint エラー {status}: {}",
             crate::gcal::truncate_for_log(&body, 200)
         );
     }
-    // 200 OK の body には access_token / refresh_token が平文で含まれる。
-    // パース失敗時に body を anyhow にそのまま乗せると token が伝搬するため
-    // status のみを残す。
+    // A 200 OK body carries access_token / refresh_token in plain text. Attaching it to
+    // the error on a parse failure would spread the token, so keep only the status.
     let parsed: TokenResponse = serde_json::from_str(&body)
         .with_context(|| format!("token JSON 解析失敗 (status={status})"))?;
     let expires_at = chrono::Utc::now().timestamp() + parsed.expires_in;
@@ -465,7 +461,7 @@ fn post_token(token_uri: &str, params: &[(&str, &str)]) -> Result<Token> {
     })
 }
 
-/// 認可 URL の `state=...` を `state=REDACTED` に置換する (表示用)。
+/// Replaces `state=...` in the authorization URL with `state=REDACTED` for display.
 fn redact_state_in_url(url: &str) -> String {
     let mut out = String::with_capacity(url.len());
     let mut rest = url;
@@ -488,8 +484,8 @@ fn redact_state_in_url(url: &str) -> String {
     }
 }
 
-/// state パラメータの定数時間比較。文字列の長さも長さ自体で先漏れ
-/// しないよう、長さが異なれば直ちに不一致を返す。
+/// Constant-time comparison of `state`. A length mismatch returns early; the length
+/// alone does not reveal the secret.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
@@ -503,7 +499,7 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-// ---- ロック -------------------------------------------------------------------
+// ---- lock ---------------------------------------------------------------------
 
 fn acquire_login_lock() -> Result<LoginLock> {
     use fs2::FileExt as _;
@@ -534,7 +530,7 @@ impl Drop for LoginLock {
     }
 }
 
-// ---- テスト -------------------------------------------------------------------
+// ---- tests -------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -609,10 +605,10 @@ mod tests {
             expires_at: 1000,
             scope: "".into(),
         };
-        // 30 秒のスキューで余裕を持って expired
+        // Within the 30-second skew, the token counts as expired
         assert!(t.is_expired(970));
         assert!(t.is_expired(1000));
-        // 31 秒以上前ならまだ有効
+        // 31 seconds or more before expiry, still valid
         assert!(!t.is_expired(969));
     }
 
@@ -708,7 +704,7 @@ mod tests {
 
     #[test]
     fn credential_parses_installed_wrapper() {
-        // Google Cloud Console の JSON 形式を直接書ける検証用 unit (ファイル経由ではない)
+        // Parses the Google Cloud Console JSON shape directly, without a file
         let raw = r#"{"installed":{"client_id":"X","client_secret":"Y","auth_uri":"https://a","token_uri":"https://t"}}"#;
         let value: serde_json::Value = serde_json::from_str(raw).unwrap();
         let inner = value.get("installed").cloned().unwrap();
