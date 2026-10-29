@@ -22,5 +22,5 @@ _merge_tmp/
 # Claude
 .claude/
 
-# Google Calendar OAuth client (ビルド埋め込み用。secret を含むのでコミット禁止)
+# Google OAuth client that build.rs embeds; it holds the client secret
 /gcal_client.json

@@ -19,20 +19,17 @@ fn setup_db(data_dir: &Path) -> Database {
     db
 }
 
-/// handle A で insert → handle B で refresh → 見える
 #[test]
 fn test_cli_insert_visible_to_another_handle() {
     let tmp = TempDir::new().unwrap();
     let mut db_a = setup_db(tmp.path());
 
-    // handle B を同じ dir で開く
     let mut db_b = Database::open(tmp.path(), Some("handle-b")).unwrap();
 
-    // A でタスクを insert
     let id = ytasky::db::insert_task(&mut db_a, "2026-04-19", "共有テスト", "1", 30, None).unwrap();
     assert!(id > 0);
 
-    // B では未 refresh なので見えないが、refresh 後は見える
+    // Handle B sees the insert only after refresh.
     db_b.refresh().unwrap();
 
     let tasks = ytasky::db::load_tasks(&mut db_b, "2026-04-19").unwrap();
@@ -40,7 +37,6 @@ fn test_cli_insert_visible_to_another_handle() {
     assert_eq!(tasks[0].title, "共有テスト");
 }
 
-/// 2 handle × 50 insert → id 重複なし
 #[test]
 fn test_concurrent_handles_no_duplicate_id() {
     let tmp = TempDir::new().unwrap();
@@ -76,7 +72,6 @@ fn test_concurrent_handles_no_duplicate_id() {
         ids.push(id);
     }
 
-    // id 重複なし
     let mut sorted = ids.clone();
     sorted.sort();
     sorted.dedup();
@@ -87,7 +82,6 @@ fn test_concurrent_handles_no_duplicate_id() {
         ids
     );
 
-    // 合計 100 件が handle A から見える
     db_a.refresh().unwrap();
     let tasks = ytasky::db::load_tasks(&mut db_a, "2026-04-19").unwrap();
     assert_eq!(tasks.len(), 100);

@@ -1,4 +1,4 @@
-//! recurrence.rs 統合テスト — Material 方式の展開ロジックを検証する
+//! Integration tests for recurrence expansion into concrete tasks.
 
 use std::path::Path;
 
@@ -15,19 +15,18 @@ fn setup_db(data_dir: &Path) -> ybasey::Database {
     db
 }
 
-/// horizon file を tempdir 内に作成するための環境変数設定ヘルパー。
-/// テスト後に削除されるよう (TempDir, TempDir) を返す。
-/// 並列実行時の競合を避けるため set_var は unsafe。テスト内で個別の config dir を渡すこと。
+/// Points `YTASKY_CONFIG_DIR` at a temp dir so the horizon file stays out of the
+/// user's config. Keep the returned dir alive for the whole test.
+/// The variable is process-wide, so parallel tests can overwrite each other's value.
 fn setup_horizon_env() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: テスト専用。並列テストとの競合に注意 (単一スレッドで実行)。
+    // SAFETY: test-only. Racy under parallel tests; run with one thread to avoid it.
     unsafe {
         std::env::set_var("YTASKY_CONFIG_DIR", tmp.path().to_str().unwrap());
     }
     tmp
 }
 
-/// recurrence を DB に挿入して id を返す
 fn insert_recurrence(
     db: &mut ybasey::Database,
     title: &str,
@@ -42,7 +41,7 @@ fn insert_recurrence(
     .unwrap()
 }
 
-// ---- Sub-task 2: generate_dates_for_recurrence / build_task_records ----------
+// ---- generate_dates_for_recurrence / build_task_records ----------------------
 
 #[test]
 fn test_generate_dates_daily_7days() {
@@ -67,7 +66,7 @@ fn test_generate_dates_daily_7days() {
 
 #[test]
 fn test_generate_dates_weekly_14days() {
-    // 月曜(1)・水曜(3) のみ
+    // Mondays (1) and Wednesdays (3) only.
     let rec = ytasky::model::Recurrence {
         id: 1,
         title: "weekly".into(),
@@ -81,7 +80,7 @@ fn test_generate_dates_weekly_14days() {
         external_id: None,
     };
     use chrono::NaiveDate;
-    // 2026-04-01 は水曜。14日間 → 月曜2回 + 水曜2回 = 4件
+    // 2026-04-01 is a Wednesday. 14 days hold 2 Mondays and 2 Wednesdays.
     let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
     let to = NaiveDate::from_ymd_opt(2026, 4, 14).unwrap();
     let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
@@ -90,7 +89,7 @@ fn test_generate_dates_weekly_14days() {
 
 #[test]
 fn test_generate_dates_monthly_60days() {
-    // 毎月15日
+    // The 15th of every month.
     let rec = ytasky::model::Recurrence {
         id: 1,
         title: "monthly".into(),
@@ -104,14 +103,14 @@ fn test_generate_dates_monthly_60days() {
         external_id: None,
     };
     use chrono::NaiveDate;
-    // 2026-04-01 から 60日: 4/15, 5/15 → 2件
+    // 60 days from 2026-04-01 hold 4/15 and 5/15.
     let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
     let to = NaiveDate::from_ymd_opt(2026, 5, 30).unwrap();
     let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
     assert_eq!(dates.len(), 2);
 }
 
-// ---- M2: interval / setpos の境界テスト --------------------------------------
+// ---- interval / setpos edge cases ---------------------------------------------
 
 fn make_rec(pattern: &str, pattern_data: Option<&str>, start: &str) -> ytasky::model::Recurrence {
     ytasky::model::Recurrence {
@@ -135,7 +134,7 @@ fn test_daily_interval_2() {
     let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
     let to = NaiveDate::from_ymd_opt(2026, 4, 10).unwrap();
     let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
-    // 4/1, 4/3, 4/5, 4/7, 4/9 = 5件
+    // 4/1, 4/3, 4/5, 4/7, 4/9
     assert_eq!(dates.len(), 5);
     assert_eq!(dates[0], NaiveDate::from_ymd_opt(2026, 4, 1).unwrap());
     assert_eq!(dates[4], NaiveDate::from_ymd_opt(2026, 4, 9).unwrap());
@@ -144,9 +143,9 @@ fn test_daily_interval_2() {
 #[test]
 fn test_weekly_interval_2_tuesday() {
     use chrono::NaiveDate;
-    // 2026-04-01 = 水曜。火曜 (day=2) で interval=2
-    // 4/7 (火) → 開始週は 3/30〜4/5、 4/7 は次週(4/6〜4/12) なので delta_weeks=1 (interval=2 で false)
-    // 4/14 (火) → delta_weeks=2 (true), 4/28 (火) → delta_weeks=4 (true)
+    // 2026-04-01 is a Wednesday; the rule is Tuesdays with interval=2.
+    // 4/7 falls in the week after the start week (3/30-4/5), so delta_weeks=1: no match.
+    // 4/14 has delta_weeks=2 and 4/28 has delta_weeks=4: both match.
     let rec = make_rec("weekly", Some(r#"{"days":[2],"interval":2}"#), "2026-04-01");
     let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
     let to = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
@@ -160,24 +159,24 @@ fn test_weekly_interval_2_tuesday() {
 #[test]
 fn test_monthly_interval_2_bymonthday() {
     use chrono::NaiveDate;
-    // 毎隔月15日。start=2026-04-15
+    // The 15th of every other month, starting 2026-04-15.
     let rec = make_rec("monthly", Some(r#"{"days":[15],"interval":2}"#), "2026-04-15");
     let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
     let to = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
     let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
-    // 4/15, 6/15, 8/15, 10/15, 12/15 = 5件
+    // 4/15, 6/15, 8/15, 10/15, 12/15
     assert_eq!(dates.len(), 5);
 }
 
 #[test]
 fn test_monthly_setpos_2nd_tuesday() {
     use chrono::NaiveDate;
-    // 第2火曜 (days=[2] setpos=2)
+    // Second Tuesday (days=[2], setpos=2).
     let rec = make_rec("monthly", Some(r#"{"days":[2],"setpos":2}"#), "2026-04-01");
     let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
     let to = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
     let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
-    // 4月: 4/14, 5月: 5/12, 6月: 6/9, 7月: 7/14
+    // 4/14, 5/12, 6/9, 7/14
     assert_eq!(dates, vec![
         NaiveDate::from_ymd_opt(2026, 4, 14).unwrap(),
         NaiveDate::from_ymd_opt(2026, 5, 12).unwrap(),
@@ -189,12 +188,12 @@ fn test_monthly_setpos_2nd_tuesday() {
 #[test]
 fn test_monthly_setpos_last_friday() {
     use chrono::NaiveDate;
-    // 最終金曜 (days=[5] setpos=-1)
+    // Last Friday (days=[5], setpos=-1).
     let rec = make_rec("monthly", Some(r#"{"days":[5],"setpos":-1}"#), "2026-04-01");
     let from = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
     let to = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
     let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
-    // 4月最終金: 4/24, 5月: 5/29, 6月: 6/26, 7月: 7/31
+    // 4/24, 5/29, 6/26, 7/31
     assert_eq!(dates, vec![
         NaiveDate::from_ymd_opt(2026, 4, 24).unwrap(),
         NaiveDate::from_ymd_opt(2026, 5, 29).unwrap(),
@@ -206,12 +205,12 @@ fn test_monthly_setpos_last_friday() {
 #[test]
 fn test_monthly_setpos_last_day_boundary() {
     use chrono::NaiveDate;
-    // 月末日数が異なる月で最終水曜が正しく取れる: 2/2026 (28日, 平年) と 1/2026 (31日)
+    // The last Wednesday must be right across months of different lengths: Jan 2026 (31 days), Feb 2026 (28 days).
     let rec = make_rec("monthly", Some(r#"{"days":[3],"setpos":-1}"#), "2026-01-01");
     let from = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
     let to = NaiveDate::from_ymd_opt(2026, 3, 31).unwrap();
     let dates = ytasky::recurrence::generate_dates_for_recurrence(&rec, from, to).unwrap();
-    // 1月最終水: 1/28, 2月: 2/25, 3月: 3/25
+    // 1/28, 2/25, 3/25
     assert_eq!(dates, vec![
         NaiveDate::from_ymd_opt(2026, 1, 28).unwrap(),
         NaiveDate::from_ymd_opt(2026, 2, 25).unwrap(),
@@ -229,7 +228,7 @@ fn test_target_before_start_date_returns_false() {
     assert!(dates.is_empty(), "expected no dates before start_date, got {dates:?}");
 }
 
-// ---- Sub-task 3: expand_recurrences_to_horizon --------------------------------
+// ---- expand_recurrences_to_horizon ---------------------------------------------
 
 #[test]
 fn test_expand_to_horizon_daily() {
@@ -237,13 +236,12 @@ fn test_expand_to_horizon_daily() {
     let tmp = tempfile::tempdir().unwrap();
     let mut db = setup_db(tmp.path());
 
-    // start_date = 今日
     let today = chrono::Local::now().date_naive();
     let start_str = today.format("%Y-%m-%d").to_string();
     insert_recurrence(&mut db, "daily task", "daily", None, &start_str, None);
 
     let result = ytasky::recurrence::expand_recurrences_to_horizon(&mut db).unwrap();
-    // 2年 = ~730日、今日分を含む
+    // The horizon is about 2 years ahead (~730 days), today included.
     assert!(result.total_inserted >= 700, "inserted: {}", result.total_inserted);
     assert!(result.total_inserted <= 740);
 }
@@ -256,11 +254,11 @@ fn test_expand_to_horizon_weekly() {
 
     let today = chrono::Local::now().date_naive();
     let start_str = today.format("%Y-%m-%d").to_string();
-    // 月曜(1)・水曜(3)
+    // Mondays (1) and Wednesdays (3).
     insert_recurrence(&mut db, "weekly task", "weekly", Some(r#"{"days":[1,3]}"#), &start_str, None);
 
     let result = ytasky::recurrence::expand_recurrences_to_horizon(&mut db).unwrap();
-    // 2年 = ~104週、各週2回 = ~208件
+    // About 104 weeks with 2 days each: ~208 tasks.
     assert!(result.total_inserted >= 200, "inserted: {}", result.total_inserted);
     assert!(result.total_inserted <= 216);
 }
@@ -278,7 +276,7 @@ fn test_expand_to_horizon_incremental() {
     let result1 = ytasky::recurrence::expand_recurrences_to_horizon(&mut db).unwrap();
     assert!(result1.total_inserted > 0);
 
-    // 2回目: horizon 更新済みなので追加 0 件
+    // The horizon has moved forward, so the second run inserts nothing.
     let result2 = ytasky::recurrence::expand_recurrences_to_horizon(&mut db).unwrap();
     assert_eq!(result2.total_inserted, 0);
 }
@@ -291,13 +289,13 @@ fn test_expand_to_horizon_with_end_date() {
 
     let today = chrono::Local::now().date_naive();
     let start_str = today.format("%Y-%m-%d").to_string();
-    // end_date = 今日から 3ヶ月
+    // end_date is 3 months from today.
     let end = today + chrono::Months::new(3);
     let end_str = end.format("%Y-%m-%d").to_string();
     insert_recurrence(&mut db, "daily task", "daily", None, &start_str, Some(&end_str));
 
     let result = ytasky::recurrence::expand_recurrences_to_horizon(&mut db).unwrap();
-    // 約 90 日分 (±1)
+    // About 90 days (±1).
     assert!(result.total_inserted >= 88, "inserted: {}", result.total_inserted);
     assert!(result.total_inserted <= 93);
 }
@@ -312,18 +310,18 @@ fn test_expand_to_horizon_with_exceptions() {
     let start_str = today.format("%Y-%m-%d").to_string();
     let rec_id = insert_recurrence(&mut db, "daily task", "daily", None, &start_str, None);
 
-    // 今日と明日を exception に追加
+    // Make today and tomorrow exceptions.
     let tomorrow = today + chrono::Duration::days(1);
     ytasky::db::add_recurrence_exception(&mut db, rec_id, &today.format("%Y-%m-%d").to_string()).unwrap();
     ytasky::db::add_recurrence_exception(&mut db, rec_id, &tomorrow.format("%Y-%m-%d").to_string()).unwrap();
 
     let result = ytasky::recurrence::expand_recurrences_to_horizon(&mut db).unwrap();
-    // 2年分 - 2日 = ~728件
+    // 2 years minus 2 days: ~728 tasks.
     assert!(result.total_inserted >= 698, "inserted: {}", result.total_inserted);
     assert!(result.total_inserted <= 738);
 }
 
-// ---- Sub-task 4: replace_future_tasks ----------------------------------------
+// ---- replace_future_tasks ------------------------------------------------------
 
 #[test]
 fn test_replace_future_tasks() {
@@ -333,11 +331,10 @@ fn test_replace_future_tasks() {
 
     let today = chrono::Local::now().date_naive();
     let start_str = today.format("%Y-%m-%d").to_string();
-    // daily で展開
     let rec_id = insert_recurrence(&mut db, "daily task", "daily", None, &start_str, None);
     ytasky::recurrence::expand_recurrences_to_horizon(&mut db).unwrap();
 
-    // pattern を weekly(月曜のみ) に変更
+    // Change the pattern to weekly, Mondays only.
     let rec = ytasky::db::load_recurrences(&db)
         .unwrap()
         .into_iter()
@@ -358,9 +355,9 @@ fn test_replace_future_tasks() {
     .unwrap();
 
     let result = ytasky::recurrence::replace_future_tasks(&mut db, rec_id).unwrap();
-    // 削除: 未来の daily 分 (多数)
+    // Removed: the future daily tasks.
     assert!(result.deleted > 100, "deleted: {}", result.deleted);
-    // 再生成: 週1回 × 2年 = ~104件
+    // Regenerated: once a week for 2 years, ~104 tasks.
     assert!(result.inserted >= 100, "inserted: {}", result.inserted);
     assert!(result.inserted <= 108);
 }
@@ -377,7 +374,7 @@ fn test_replace_future_tasks_preserves_completed() {
     let rec_id = insert_recurrence(&mut db, "daily task", "daily", None, &start_str, None);
     ytasky::recurrence::expand_recurrences_to_horizon(&mut db).unwrap();
 
-    // 昨日のタスクに actual_start をセット (完了扱い)
+    // Give yesterday's task an actual_start so it counts as done.
     let yesterday_str = yesterday.format("%Y-%m-%d").to_string();
     let tasks = ytasky::db::load_tasks(&mut db, &yesterday_str).unwrap();
     let completed = tasks
@@ -388,17 +385,16 @@ fn test_replace_future_tasks_preserves_completed() {
     }
 
     let result = ytasky::recurrence::replace_future_tasks(&mut db, rec_id).unwrap();
-    // 昨日の完了済みタスクは削除されていない (過去 + actual_start あり)
+    // Past tasks with an actual_start are kept.
     let tasks_yesterday = ytasky::db::load_tasks(&mut db, &yesterday_str).unwrap();
     let still_exists = tasks_yesterday
         .iter()
         .any(|t| t.recurrence_id == Some(rec_id) && t.actual_start.is_some());
     assert!(still_exists, "completed task should be preserved");
-    // 未来タスクは再生成
     assert!(result.inserted > 0 || result.deleted > 0);
 }
 
-// ---- Sub-task 6: UndoManager max_size ----------------------------------------
+// ---- UndoManager max_size ------------------------------------------------------
 
 #[test]
 fn test_undo_manager_max_size() {
@@ -406,7 +402,7 @@ fn test_undo_manager_max_size() {
     let mut db = setup_db(tmp.path());
     let mut manager = ytasky::history::UndoManager::with_max_size(100);
 
-    // 101回 execute → stack は 100 件 (最古 1 件破棄)
+    // After 101 executes the stack holds 100 entries; the oldest is dropped.
     for i in 0..101 {
         let date = format!("2026-04-{:02}", (i % 28) + 1);
         let cmd = Box::new(ytasky::history::AddTaskCommand::new(

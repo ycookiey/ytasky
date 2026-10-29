@@ -1,26 +1,25 @@
-//! GCal `recurrence` 配列 (`["RRULE:...", "EXDATE:...", "RDATE:..."]`) を
-//! ytasky の (pattern, PatternData, end_date, exceptions, additions) に変換する。
+//! Converts a Google Calendar `recurrence` array (`["RRULE:...", "EXDATE:...", "RDATE:..."]`)
+//! into ytasky's (pattern, PatternData, end_date, exceptions, additions).
 //!
-//! サポート範囲は設計書 §4.1 のマトリクスのみ。範囲外の RRULE が来たら
-//! [`RruleError::Unsupported`] を返し、呼び出し側で個別 instance 展開に
-//! フォールバックする。
+//! An RRULE outside the supported subset returns [`RruleError::Unsupported`], and the
+//! caller falls back to expanding individual instances.
 
 use chrono::{Duration, NaiveDate};
 
 use crate::model::PatternData;
 
-/// EXDATE / RDATE のリスト長上限。これを超える RRULE は敵対カレンダー
-/// 起因の DoS とみなして Invalid を返す。
+/// Maximum length of an EXDATE / RDATE list. Longer lists are treated as a DoS from a
+/// hostile calendar and rejected as Invalid.
 const MAX_EXDATE_RDATE_ITEMS: usize = 1000;
-/// COUNT の上限。RFC 5545 上は無制限だが、ytasky の現実的な範囲では
-/// 10000 を超える繰り返しは想定外として弾く。
+/// Maximum COUNT. RFC 5545 sets no limit, but more than 10000 repetitions is outside
+/// any realistic schedule.
 const MAX_COUNT: u32 = 10_000;
 
 #[derive(Debug)]
 pub enum RruleError {
-    /// ytasky の recurrence で表現不能。呼び出し側は個別 instance 展開へ。
+    /// Not expressible as a ytasky recurrence; the caller expands instances instead.
     Unsupported(String),
-    /// RRULE 文字列の構文・値が不正。
+    /// Malformed RRULE syntax or value.
     Invalid(String),
 }
 
@@ -35,22 +34,21 @@ impl std::fmt::Display for RruleError {
 
 impl std::error::Error for RruleError {}
 
-/// 解析結果。
 #[derive(Debug, Clone, Default)]
 pub struct ParsedRecurrence {
     pub pattern: String,
     pub pattern_data: PatternData,
-    /// UNTIL / COUNT から導出した end_date (含む)
+    /// end_date derived from UNTIL / COUNT, inclusive
     pub end_date: Option<NaiveDate>,
-    /// EXDATE 行から抽出した除外日
+    /// dates excluded by EXDATE lines
     pub exdates: Vec<NaiveDate>,
-    /// RDATE 行から抽出した追加日 (recurrence と独立に task 化する)
+    /// dates added by RDATE lines, turned into tasks separately from the recurrence
     pub rdates: Vec<NaiveDate>,
 }
 
-/// GCal の `recurrence` 配列を解釈する。
+/// Parses a Google Calendar `recurrence` array.
 ///
-/// `start_date` は COUNT を end_date に換算する際の起点。
+/// `start_date` is the origin for converting COUNT into end_date.
 pub fn parse_recurrence_rules(
     rules: &[String],
     start_date: NaiveDate,
@@ -100,20 +98,19 @@ pub fn parse_recurrence_rules(
         .get("FREQ")
         .ok_or_else(|| RruleError::Invalid("FREQ が無い".into()))?
         .as_str();
-    // INTERVAL は RFC 5545 上 INTEGER (1..) で、ytasky では pattern_data に
-    // Option<u8> で保存する。u32 でパースして RFC 範囲を許容しつつ、
-    // ytasky 内部表現に収まらない値は Unsupported として弾く。
+    // RFC 5545 allows any positive INTERVAL, but pattern_data stores it as Option<u8>.
+    // Parse as u32 to accept the RFC range, and return Unsupported for values that do
+    // not fit.
     let interval_raw: Option<u32> = parts
         .get("INTERVAL")
         .map(|v| v.parse::<u32>())
         .transpose()
         .map_err(|_| RruleError::Invalid("INTERVAL は数値".into()))?;
-    // INTERVAL=0 は RFC 5545 違反。サイレントに 1 と解釈せず明示的に弾く
+    // INTERVAL=0 violates RFC 5545. Reject it instead of reading it as 1.
     if interval_raw == Some(0) {
         return Err(RruleError::Invalid("INTERVAL=0 は不正".into()));
     }
-    // pattern_data 上では interval=1 を None として持つ (DB に書かない)。
-    // 内部表現 (u8) に収まらないものは Unsupported を返してフォールバックさせる。
+    // interval=1 is stored as None, which keeps it out of the database.
     let interval: Option<u8> = match interval_raw {
         None | Some(1) => None,
         Some(n) if n <= u8::MAX as u32 => Some(n as u8),
@@ -147,8 +144,8 @@ pub fn parse_recurrence_rules(
         return Err(RruleError::Unsupported(format!("FREQ={freq} BYWEEKNO/BYYEARDAY")));
     }
 
-    // compute_end_from_count 用の数値 (COUNT 計算で interval=1 を 0 にしないため
-    // unwrap_or(1) を適用)。重複パースを避けて interval_raw を再利用する。
+    // COUNT needs the numeric interval with a default of 1, so that interval=1 stored as
+    // None does not become 0. Reuse interval_raw instead of parsing again.
     let interval_step: u32 = interval_raw.unwrap_or(1);
 
     match freq {
@@ -168,7 +165,7 @@ pub fn parse_recurrence_rules(
             }
             parsed.pattern = "weekly".into();
             parsed.pattern_data.interval = interval;
-            // BYDAY が無ければ start_date の曜日を採用
+            // Without BYDAY, use the weekday of start_date.
             if let Some(byday) = parts.get("BYDAY") {
                 let (days, _) = parse_byday_plain(byday)?;
                 if days.is_empty() {
@@ -196,7 +193,7 @@ pub fn parse_recurrence_rules(
                 ));
             }
             if let Some(byday) = parts.get("BYDAY") {
-                // 形式: "2TU" / "-1FR" / "TU" / "MO,WE" (複数は未対応)
+                // Forms: "2TU" / "-1FR" / "TU"; several days ("MO,WE") are unsupported
                 let (days, prefix_setpos) = parse_byday_with_prefix(byday)?;
                 if days.len() != 1 {
                     return Err(RruleError::Unsupported("MONTHLY BYDAY 複数曜日".into()));
@@ -225,7 +222,7 @@ pub fn parse_recurrence_rules(
                 }
                 parsed.pattern_data.days = Some(day_nums);
             } else {
-                // BYDAY/BYMONTHDAY 無し → start_date の日付を採用
+                // Without BYDAY / BYMONTHDAY, use the day of month of start_date.
                 use chrono::Datelike;
                 parsed.pattern_data.days = Some(vec![start_date.day() as u8]);
             }
@@ -235,7 +232,7 @@ pub fn parse_recurrence_rules(
         }
     }
 
-    // end_date の決定: UNTIL > COUNT
+    // UNTIL takes precedence over COUNT.
     parsed.end_date = if let Some(d) = until_date {
         Some(d)
     } else if let Some(n) = count {
@@ -265,15 +262,15 @@ fn split_rule_parts(body: &str) -> Result<std::collections::HashMap<String, Stri
 }
 
 fn parse_until_value(v: &str) -> Result<NaiveDate, RruleError> {
-    // 8 桁 (YYYYMMDD) or 15/16 桁 (YYYYMMDDTHHMMSSZ)
+    // 8 digits (YYYYMMDD) or 15/16 digits (YYYYMMDDTHHMMSSZ)
     let date_part = if v.len() >= 8 { &v[..8] } else { v };
     NaiveDate::parse_from_str(date_part, "%Y%m%d")
         .map_err(|_| RruleError::Invalid(format!("UNTIL 解析失敗: {v}")))
 }
 
-/// EXDATE / RDATE の `;TZID=...:`, `:` 区切り、`,` 区切りの値リストから NaiveDate を抜く。
+/// Extracts dates from an EXDATE / RDATE value list (`;TZID=...:`, `:` and `,` separated).
 fn parse_date_list_after_colon(body: &str) -> Result<Vec<NaiveDate>, RruleError> {
-    // body 例: ":20260516,20260517" / ";TZID=Asia/Tokyo:20260516T100000"
+    // e.g. ":20260516,20260517" / ";TZID=Asia/Tokyo:20260516T100000"
     let colon_idx = body
         .rfind(':')
         .ok_or_else(|| RruleError::Invalid(format!("EXDATE/RDATE に ':' が無い: {body}")))?;
@@ -292,8 +289,8 @@ fn parse_date_list_after_colon(body: &str) -> Result<Vec<NaiveDate>, RruleError>
     Ok(out)
 }
 
-/// "MO,WE,FR" のような複数曜日。各曜日に N プレフィックス (例: "1MO") が
-/// 付いていれば一律 setpos を返すが、ここでは prefix なし前提とする。
+/// Several weekdays such as "MO,WE,FR". An ordinal prefix ("1MO") is a monthly
+/// form and is rejected as Unsupported.
 fn parse_byday_plain(byday: &str) -> Result<(Vec<u8>, Option<i8>), RruleError> {
     let mut days = Vec::new();
     let mut common_prefix: Option<i8> = None;
@@ -304,7 +301,6 @@ fn parse_byday_plain(byday: &str) -> Result<(Vec<u8>, Option<i8>), RruleError> {
         }
         let (prefix, day) = split_byday_token(token)?;
         if prefix.is_some() {
-            // weekly では prefix 付きは未対応 (monthly 用)
             return Err(RruleError::Unsupported(format!(
                 "WEEKLY で N プレフィックス: {token}"
             )));
@@ -317,7 +313,7 @@ fn parse_byday_plain(byday: &str) -> Result<(Vec<u8>, Option<i8>), RruleError> {
     Ok((days, common_prefix))
 }
 
-/// "2TU" / "TU" / "-1FR" のような単一トークン (monthly 用)。
+/// One token such as "2TU" / "TU" / "-1FR" (monthly).
 fn parse_byday_with_prefix(byday: &str) -> Result<(Vec<u8>, Option<i8>), RruleError> {
     let mut days = Vec::new();
     let mut last_prefix: Option<i8> = None;
@@ -345,7 +341,7 @@ fn parse_byday_with_prefix(byday: &str) -> Result<(Vec<u8>, Option<i8>), RruleEr
 }
 
 fn split_byday_token(token: &str) -> Result<(Option<i8>, u8), RruleError> {
-    // 数値プレフィックス ( -? digits ) + 2 文字曜日コード
+    // optional signed ordinal followed by a two-letter weekday code
     let bytes = token.as_bytes();
     if bytes.len() < 2 {
         return Err(RruleError::Invalid(format!("BYDAY token: {token}")));
@@ -379,9 +375,9 @@ fn weekday_code_to_number(code: &str) -> Result<u8, RruleError> {
     })
 }
 
-/// COUNT を end_date に換算する近似計算。
-/// 簡易: daily=interval 日, weekly=interval 週×当該曜日数, monthly=interval 月。
-/// 真の値より遠めに見積もり、生成側で UNTIL 込みで切る前提。
+/// Approximates COUNT as an end_date: daily = interval days, weekly = interval weeks
+/// per number of weekdays, monthly = interval months. The estimate errs late and
+/// relies on the generator to stop at UNTIL.
 fn compute_end_from_count(
     pattern: &str,
     pd: &PatternData,
@@ -399,7 +395,6 @@ fn compute_end_from_count(
             Some(start + Duration::weeks(weeks * step))
         }
         "monthly" => {
-            // chrono::Months で n ヶ月加算
             let months = (n * step) as u32;
             start.checked_add_months(chrono::Months::new(months))
         }
@@ -407,7 +402,7 @@ fn compute_end_from_count(
     }
 }
 
-// ---- テスト -------------------------------------------------------------------
+// ---- tests -------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -458,7 +453,7 @@ mod tests {
 
     #[test]
     fn weekly_default_byday_uses_start_weekday() {
-        // 2026-05-16 = 土曜 (6)
+        // 2026-05-16 is a Saturday (6)
         let r = parse(&["RRULE:FREQ=WEEKLY"], d(2026, 5, 16)).unwrap();
         assert_eq!(r.pattern_data.days, Some(vec![6]));
     }
@@ -514,20 +509,20 @@ mod tests {
 
     #[test]
     fn count_extracts_end_date_daily() {
-        // COUNT=10, FREQ=DAILY → start から 9 日後
+        // COUNT=10, FREQ=DAILY -> 9 days after start
         let r = parse(&["RRULE:FREQ=DAILY;COUNT=10"], d(2026, 5, 16)).unwrap();
         assert_eq!(r.end_date, Some(d(2026, 5, 25)));
     }
 
     #[test]
     fn count_extracts_end_date_weekly() {
-        // COUNT=10, FREQ=WEEKLY;BYDAY=MO,WE → 5 週分
+        // COUNT=10, FREQ=WEEKLY;BYDAY=MO,WE -> 5 weeks
         let r = parse(
             &["RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10"],
             d(2026, 5, 16),
         )
         .unwrap();
-        // 5 週後の同曜日 = 2026-05-16 + 5*7 = 2026-06-20
+        // same weekday 5 weeks later = 2026-05-16 + 5*7 = 2026-06-20
         assert_eq!(r.end_date, Some(d(2026, 6, 20)));
     }
 
@@ -623,7 +618,7 @@ mod tests {
 
     #[test]
     fn invalid_exdate_over_limit() {
-        // 1001 個の EXDATE をカンマ区切りで作る
+        // 1001 comma-separated EXDATEs
         let dates: Vec<String> = (1..=1001)
             .map(|i| format!("2026{:02}{:02}", (i / 28) + 1, (i % 28) + 1))
             .collect();
@@ -644,7 +639,7 @@ mod tests {
 
     #[test]
     fn interval_above_u8_max_is_unsupported() {
-        // RFC 5545 上は 256 も有効値だが ytasky の u8 表現に収まらないので Unsupported
+        // RFC 5545 allows 256, but it does not fit ytasky's u8, so Unsupported
         let err = parse(
             &["RRULE:FREQ=DAILY;INTERVAL=256"],
             d(2026, 5, 16),
@@ -658,7 +653,7 @@ mod tests {
 
     #[test]
     fn interval_u8_boundary_is_supported() {
-        // u8::MAX = 255 はちょうど収まる
+        // u8::MAX = 255 fits exactly
         let r = parse(&["RRULE:FREQ=DAILY;INTERVAL=255"], d(2026, 5, 16)).unwrap();
         assert_eq!(r.pattern_data.interval, Some(255));
     }

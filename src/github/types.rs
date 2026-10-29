@@ -1,45 +1,44 @@
-//! GitHub Search API (`GET /search/issues`) レスポンスの serde 型。
+//! serde types for the GitHub Search API (`GET /search/issues`) response.
 //!
-//! 必要なフィールドのみ定義する。未知フィールドは無視される。
+//! Only the needed fields are defined; unknown fields are ignored.
 
 use serde::Deserialize;
 
-/// `GET /search/issues` のレスポンス本体。
+/// Body of the `GET /search/issues` response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchResult {
-    /// マッチ総数（最大 1000 までしか items は返らない）。
+    /// Total number of matches (items stop at 1000).
     #[serde(default)]
     pub total_count: u64,
-    /// rate limit 等で結果が不完全な場合 true。
+    /// True when the results are incomplete, e.g. because of a rate limit.
     #[serde(default)]
     pub incomplete_results: bool,
     #[serde(default)]
     pub items: Vec<Issue>,
 }
 
-/// issue（または PR）1件。search/issues は PR も返すため `pull_request` の有無で区別する。
+/// One issue or PR. search/issues also returns PRs, told apart by `pull_request`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Issue {
     pub number: u64,
     pub title: String,
-    /// `https://api.github.com/repos/{owner}/{repo}` 形式。owner/repo 抽出に使う。
+    /// In the form `https://api.github.com/repos/{owner}/{repo}`; owner/repo come from it.
     pub repository_url: String,
-    /// 期限。設定されていなければ `None`。
+    /// Source of the due date; `None` when not set.
     #[serde(default)]
     pub milestone: Option<Milestone>,
-    /// 存在すれば対象は issue ではなく PR。import 時に skip する（有無のみ判定し中身は使わない）。
+    /// Present only for PRs, which the import skips. Only its presence is checked.
     #[serde(default)]
     pub pull_request: Option<PullRequestRef>,
 }
 
 impl Issue {
-    /// PR か否か。
     pub fn is_pull_request(&self) -> bool {
         self.pull_request.is_some()
     }
 
-    /// `repository_url` から `(owner, repo)` を取り出す。
-    /// 例: `https://api.github.com/repos/ycookiey/ytasky` → `("ycookiey", "ytasky")`。
+    /// Extracts `(owner, repo)` from `repository_url`.
+    /// Example: `https://api.github.com/repos/owner/repo` -> `("owner", "repo")`.
     pub fn owner_repo(&self) -> Option<(&str, &str)> {
         let rest = self.repository_url.split("/repos/").nth(1)?;
         let mut parts = rest.split('/');
@@ -52,15 +51,15 @@ impl Issue {
     }
 }
 
-/// milestone（期限の取得元）。
+/// Milestone, the source of the due date.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Milestone {
-    /// ISO 8601（例 `2026-06-15T07:00:00Z`）。未設定なら `None`。
+    /// ISO 8601 (e.g. `2026-06-15T07:00:00Z`); `None` when not set.
     #[serde(default)]
     pub due_on: Option<String>,
 }
 
-/// PR 判定用のマーカー。`pull_request` フィールドの有無のみ意味を持ち、中身は参照しない。
+/// Marker for PR detection: only the presence of the `pull_request` field matters, not its content.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PullRequestRef {}
 

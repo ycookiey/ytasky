@@ -1,4 +1,4 @@
-//! recurrence.rs — Material 方式の繰り返し展開 (horizon 永続化 + incremental 展開)
+//! Recurrence expansion: rules are materialized as task rows up to a persisted horizon date, and later runs expand only the range past it.
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
@@ -18,7 +18,7 @@ pub struct HorizonConfig {
 impl Default for HorizonConfig {
     fn default() -> Self {
         Self {
-            // ファイル不存在時: まだ何も展開していない扱いにする
+            // No file yet: treat it as nothing expanded
             horizon_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
             years_ahead: 2,
         }
@@ -82,7 +82,7 @@ pub fn write_horizon(config: &HorizonConfig) -> Result<()> {
     Ok(())
 }
 
-// ---- pattern matching (db.rs から移動) ----------------------------------------
+// ---- pattern matching -------------------------------------------------------
 
 pub fn matches_recurrence_pattern(rec: &Recurrence, target_date: NaiveDate) -> Result<bool> {
     use chrono::Datelike;
@@ -107,7 +107,7 @@ pub fn matches_recurrence_pattern(rec: &Recurrence, target_date: NaiveDate) -> R
             if delta_days < 0 {
                 return Ok(false);
             }
-            // 開始日と同週始まり (月曜) からの経過週で interval を判定
+            // Count weeks from the Monday of the start date's week to apply interval
             let start_monday =
                 start_date - chrono::Duration::days(start_date.weekday().num_days_from_monday() as i64);
             let target_monday = target_date
@@ -127,12 +127,12 @@ pub fn matches_recurrence_pattern(rec: &Recurrence, target_date: NaiveDate) -> R
             }
             match pd.setpos {
                 None => {
-                    // BYMONTHDAY: days を日番号として比較
+                    // BYMONTHDAY: days are day-of-month numbers
                     let day = target_date.day() as u8;
                     Ok(days.contains(&day))
                 }
                 Some(n) => {
-                    // BYDAY=NTU 等: days を曜日番号 1..=7、setpos は何番目か
+                    // BYDAY=NTU etc.: days are weekday numbers 1..=7; setpos picks the occurrence
                     let target_weekday = target_date.weekday().number_from_monday() as u8;
                     if !days.contains(&target_weekday) {
                         return Ok(false);
@@ -159,7 +159,7 @@ fn parse_pattern_data(pattern_data: Option<&str>) -> Result<crate::model::Patter
         .with_context(|| format!("pattern_data の JSON が不正です: {raw}"))
 }
 
-/// 指定月の最終日 (1-31)
+/// Last day (1-31) of the given month
 fn last_day_of_month(d: NaiveDate) -> u32 {
     use chrono::Datelike;
     let (y, m) = if d.month() == 12 {
@@ -173,9 +173,9 @@ fn last_day_of_month(d: NaiveDate) -> u32 {
         .unwrap_or(28)
 }
 
-// ---- Sub-task 2: 展開ロジック --------------------------------------------------
+// ---- expansion --------------------------------------------------------------
 
-/// from..=to の範囲で recurrence pattern に合致する日付列を返す
+/// Returns the dates in from..=to that match the recurrence pattern
 pub fn generate_dates_for_recurrence(
     rec: &Recurrence,
     from: NaiveDate,
@@ -234,7 +234,7 @@ fn build_existing_map(db: &Database) -> Result<HashMap<i64, HashSet<String>>> {
     Ok(map)
 }
 
-/// 日付別の次の sort_order を一括取得
+/// Next sort_order for each date, fetched in one pass
 fn build_date_sort_map(db: &Database) -> Result<HashMap<String, i32>> {
     let table = db.table("tasks")?;
     let mut map: HashMap<String, i32> = HashMap::new();
@@ -259,14 +259,13 @@ fn build_date_sort_map(db: &Database) -> Result<HashMap<String, i32>> {
             *entry = sort;
         }
     }
-    // max → next (max + 1)
     for v in map.values_mut() {
         *v += 1;
     }
     Ok(map)
 }
 
-// ---- Sub-task 3: expand_recurrences_to_horizon --------------------------------
+// ---- expand_recurrences_to_horizon -------------------------------------------
 
 pub struct ExpandResult {
     pub total_inserted: usize,
@@ -352,7 +351,6 @@ pub fn expand_recurrences_to_horizon(db: &mut Database) -> Result<ExpandResult> 
                 fields.push(("fixed_start".into(), fs.to_string()));
             }
             all_records.push(NewRecord::from(fields));
-            // 同日の次の sort_order をインクリメント
             *date_sort_map.get_mut(&ds).unwrap() += 1;
         }
     }
@@ -374,7 +372,7 @@ pub fn expand_recurrences_to_horizon(db: &mut Database) -> Result<ExpandResult> 
     })
 }
 
-// ---- Sub-task 4: replace_future_tasks ----------------------------------------
+// ---- replace_future_tasks -----------------------------------------------------
 
 pub struct ReplaceResult {
     pub deleted: usize,
@@ -452,7 +450,7 @@ pub fn replace_future_tasks(db: &mut Database, recurrence_id: i64) -> Result<Rep
         })
         .collect();
 
-    // sort_order 衝突を避けるため delete 対象を除外した日付別 max sort_order を計算
+    // Per-date max sort_order excluding the tasks being deleted, to avoid sort_order collisions
     let to_delete_set: std::collections::HashSet<u64> = to_delete.iter().copied().collect();
     let mut date_sort_map = {
         let table = db.table("tasks")?;

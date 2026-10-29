@@ -42,13 +42,13 @@ pub struct Recurrence {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PatternData {
-    /// weekly: 曜日番号 1..=7 (MO=1..SU=7) / monthly: setpos なしなら BYMONTHDAY、ありなら曜日番号
+    /// weekly: weekday numbers 1..=7 (MO=1..SU=7). monthly: BYMONTHDAY without setpos, weekday numbers with setpos.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub days: Option<Vec<u8>>,
-    /// INTERVAL=N (未指定=1)。daily/weekly/monthly に共通
+    /// INTERVAL=N (None means 1). Shared by daily, weekly and monthly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval: Option<u8>,
-    /// BYSETPOS。monthly で「第N曜日」「最終曜日(-1)」を表す
+    /// BYSETPOS. In monthly, the Nth weekday, or -1 for the last weekday.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setpos: Option<i8>,
 }
@@ -85,7 +85,7 @@ pub struct TitleReport {
     pub actual_min: i32,
 }
 
-/// 分を "HH:MM" に変換（24:00以降も対応）
+/// Minutes to "HH:MM", wrapping values past 24:00 around the clock.
 pub fn format_time(minutes: i32) -> String {
     let wrapped = minutes.rem_euclid(24 * 60);
     let h = wrapped / 60;
@@ -93,7 +93,7 @@ pub fn format_time(minutes: i32) -> String {
     format!("{h:02}:{m:02}")
 }
 
-/// 分を "XhYY" / "Xm" に変換（負値対応）
+/// Minutes to "XhYY" or "Xm". Negative values keep the sign.
 pub fn format_duration(minutes: i32) -> String {
     let sign = if minutes < 0 { "-" } else { "" };
     let abs = minutes.saturating_abs();
@@ -106,11 +106,8 @@ pub fn format_duration(minutes: i32) -> String {
     }
 }
 
-/// 期限を短い表示に整形
-/// - 過去: !Nd
-/// - 当日: 今日
-/// - 7日以内: Nd
-/// - それ以外: M/D または M/D HH:MM
+/// Short label for a deadline: `!Nd` when past, a today label on the day,
+/// `Nd` within 7 days, otherwise `M/D` or `M/D HH:MM`.
 pub fn format_deadline(deadline: &str, today: &str) -> String {
     let today_date = NaiveDate::parse_from_str(today, "%Y-%m-%d").ok();
     let (date_part, time_part) = split_deadline(deadline);

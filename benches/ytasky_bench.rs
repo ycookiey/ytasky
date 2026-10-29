@@ -92,14 +92,13 @@ fn bench_batch_insert_500(c: &mut Criterion) {
     });
 }
 
-// ---- Windows/NTFS 特有 bench -------------------------------------------
+// ---- Windows/NTFS-specific benches ------------------------------------------
 
 #[cfg(target_os = "windows")]
 fn bench_dir_listing_22000(c: &mut Criterion) {
     use std::io::Write as _;
 
     let dir = TempDir::new().unwrap();
-    // 22000 ファイルを作成
     let n = 22_000usize;
     for i in 0..n {
         let p = dir.path().join(format!("{i:05}.txt"));
@@ -125,7 +124,7 @@ fn bench_dir_mtime_detection(c: &mut Criterion) {
     c.bench_function("dir_mtime_detection", |b| {
         b.iter_with_setup(
             || {
-                // ファイル作成してから mtime 取得
+                // Create the file, then read its mtime
                 let p = dir.path().join("probe.txt");
                 std::fs::write(&p, b"probe").unwrap();
                 p

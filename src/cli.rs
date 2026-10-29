@@ -266,7 +266,7 @@ fn current_minutes() -> i32 {
         + now.format("%M").to_string().parse::<i32>().unwrap()
 }
 
-/// HH:MM → 分に変換
+/// Converts HH:MM to minutes.
 fn parse_time(s: &str) -> Result<i32> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 {
@@ -281,7 +281,7 @@ fn print_json(value: &impl serde::Serialize) {
     println!("{}", serde_json::to_string_pretty(value).unwrap());
 }
 
-/// AddRecurrence 用: --pattern-data 指定があれば優先、無ければ --interval/--setpos から JSON 生成
+/// For AddRecurrence: --pattern-data wins; otherwise builds the JSON from --interval/--setpos
 fn build_pattern_data_for_add(
     pattern_data: Option<&str>,
     interval: Option<u8>,
@@ -301,7 +301,7 @@ fn build_pattern_data_for_add(
     Ok(Some(serde_json::to_string(&pd)?))
 }
 
-/// EditRecurrence 用: --pattern-data で完全置換、無ければ --interval/--setpos を current にマージ
+/// For EditRecurrence: --pattern-data replaces the whole value; otherwise merges --interval/--setpos into the current value
 fn build_pattern_data_for_edit(
     pattern_data_arg: Option<&str>,
     interval_arg: Option<&str>,
@@ -365,7 +365,7 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
             duration,
             fixed_start,
         } => {
-            // 現在の値を取得して、指定されたフィールドだけ更新
+            // Load the current values and update only the given fields
             let task = db::load_task_by_id(db, id)?
                 .context("タスクが見つからない")?;
 
@@ -396,7 +396,7 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
         }
         Commands::Done { id } => {
             let mins = current_minutes();
-            // actual_start が未設定なら同時に設定
+            // Also set actual_start when it is not set yet
             let current_start: Option<i32> = db::load_task_by_id(db, id)?
                 .context("タスクが見つからない")?
                 .actual_start;
@@ -586,15 +586,15 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
             }
         }
         Commands::Mcp => {
-            // MCP は main.rs から直接呼ぶ
+            // main.rs handles MCP directly
             unreachable!();
         }
         Commands::Update => {
-            // update は DB 不要のため main.rs から直接呼ぶ
+            // main.rs handles update directly: it needs no DB
             unreachable!();
         }
         Commands::Init { .. } => {
-            // Init は main.rs から直接呼ぶ (rusqlite Connection 不要)
+            // main.rs handles Init directly
             unreachable!();
         }
         #[cfg(feature = "gcal")]
@@ -652,7 +652,7 @@ pub fn run(cmd: Commands, db: &mut ybasey::Database) -> Result<()> {
         }
         #[cfg(feature = "gcal")]
         Commands::GcalLogin | Commands::GcalLogout => {
-            // DB 不要のため main.rs で db::open() を経由せず処理する
+            // main.rs handles these without db::open(): they need no DB
             unreachable!();
         }
     }

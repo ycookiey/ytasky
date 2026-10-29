@@ -2,6 +2,12 @@
 name = "ytasky"
 version = "0.4.0"
 edition = "2024"
+description = "A time-blocking scheduler for the terminal, with a TUI, a CLI and an MCP server"
+repository = "https://github.com/ycookiey/ytasky"
+license = "MIT"
+readme = "README.md"
+keywords = ["scheduler", "time-blocking", "tui", "mcp", "planner"]
+categories = ["command-line-utilities"]
 
 [lib]
 name = "ytasky"
@@ -14,8 +20,8 @@ path = "src/main.rs"
 [features]
 default = ["gcal", "github"]
 mcp = ["dep:rmcp", "dep:tokio", "dep:schemars"]
-# GitHub issue import。reqwest を gcal と共有する（認証は gh CLI 流用のため OAuth 系 dep は不要）。
-# chrono-tz は milestone due_on を local date へ変換するために必要 (gcal と共有)。
+# No OAuth dependencies: GitHub import borrows the token of the gh CLI.
+# chrono-tz converts milestone due dates to the local date.
 github = ["dep:reqwest", "dep:chrono-tz"]
 gcal = [
     "dep:reqwest",
@@ -40,7 +46,7 @@ clap = { version = "4", features = ["derive"] }
 rmcp = { version = "0.16", features = ["server", "transport-io"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 schemars = { version = "0.8", optional = true }
-# `ytasky update` (自己更新) と MCP watchdog の両方でプロセス監視に使うため必須依存。
+# Not optional: both `ytasky update` and the MCP parent-process watchdog inspect processes.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"], optional = true }
 tiny_http = { version = "0.12", optional = true }

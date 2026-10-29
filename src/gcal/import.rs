@@ -1,13 +1,13 @@
-//! GCal events → ytasky tasks/recurrences の import オーケストレータ。
+//! Imports Google Calendar events into ytasky tasks and recurrences.
 //!
-//! - `import_range`: 期間内の events を取得し振り分け
-//! - 単発 → `tasks` upsert
-//! - 繰り返し (RRULE サポート内) → `recurrences` upsert
-//! - 繰り返し (RRULE サポート外) → `events.instances` で展開し各 instance を `tasks` upsert
-//! - cancelled / all-day / 親無し instance はスキップ
+//! - single event -> `tasks` upsert
+//! - recurring event with a supported RRULE -> `recurrences` upsert
+//! - recurring event with an unsupported RRULE -> expanded with `events.instances`,
+//!   each instance upserted into `tasks`
+//! - cancelled events, all-day events and instances of a recurring event are skipped
 //!
-//! EXDATE / RDATE の完全反映は将来拡張 (設計書 §12)。本フェーズでは
-//! summary の `skipped_exdates` / `skipped_rdates` でカウントのみ。
+//! EXDATE / RDATE are not applied yet; the summary only counts them in
+//! `skipped_exdates` / `skipped_rdates`.
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
@@ -30,7 +30,7 @@ impl Default for ImportOptions {
     fn default() -> Self {
         Self {
             calendar_id: "primary".into(),
-            category_id: "6".into(), // 6 = 身支度・自由時間 (≒ personal)
+            category_id: "6".into(), // 6 is the seeded personal-time category
         }
     }
 }
@@ -45,7 +45,6 @@ pub struct ImportSummary {
     pub errors: Vec<String>,
 }
 
-/// 指定期間の events を import する。
 pub fn import_range(
     db: &mut Database,
     from: NaiveDate,
@@ -98,7 +97,7 @@ fn handle_event(
         summary.skipped += 1;
         return Ok(());
     }
-    // 個別 instance (親イベントから展開済み) は親側で処理されるためスキップ
+    // An instance expanded from a parent event is covered by the parent.
     if event.recurring_event_id.is_some() {
         summary.skipped += 1;
         return Ok(());
@@ -131,7 +130,7 @@ fn handle_event(
                 }
             }
             Err(RruleError::Unsupported(_)) => {
-                // 個別 instance 展開フォールバック
+                // Fall back to expanding the individual instances.
                 let instances = api::list_event_instances(
                     access_token,
                     &opts.calendar_id,
@@ -173,11 +172,10 @@ fn summary_count_recurrence(summary: &mut ImportSummary, parsed: &ParsedRecurren
 
 // ---- upsert helpers -----------------------------------------------------------
 
-/// `gcal:{calendar_id}:{event_id}` の形式で external_id を生成する。
+/// Builds the external_id `gcal:{calendar_id}:{event_id}`.
 ///
-/// calendar_id 中の `:` は Google Calendar API の仕様上通常含まれないが、
-/// 将来の逆分解が必要になった場合は `splitn(3, ':')` で先頭 2 要素を
-/// 取って残りを event_id として扱える設計にしてある。
+/// Calendar IDs do not normally contain `:`, and if one did, `splitn(3, ':')` would still
+/// recover the event ID as the remainder.
 fn external_id(calendar_id: &str, event_id: &str) -> String {
     format!("gcal:{calendar_id}:{event_id}")
 }
@@ -230,8 +228,8 @@ fn upsert_single_task(
     Ok(())
 }
 
-/// recurrences を upsert する。inserted/updated を `bool` で返し、
-/// 呼び出し側で summary の created/updated を区別できるようにする。
+/// Upserts a recurrence and returns whether it was inserted, so the summary can count
+/// created and updated separately.
 fn upsert_recurrence(
     db: &mut Database,
     event: &Event,
@@ -261,9 +259,9 @@ fn upsert_recurrence(
         ("start_date".into(), gtz::date_to_string(start_date)),
         ("external_id".into(), ext.clone()),
     ];
-    // end_date は Some/None の両方を明示的に渡し、GCal 側で UNTIL が
-    // 削除された場合に ytasky 側もクリアされるようにする。
-    // ybasey の Null sentinel は "_" 文字列。
+    // Always pass end_date, as a value or as null, so that removing UNTIL in
+    // Google Calendar clears it here too.
+    // The database's null sentinel is the string "_".
     let end_value = parsed
         .end_date
         .map(gtz::date_to_string)
@@ -281,10 +279,10 @@ fn task_exists_by_external_id(db: &Database, ext: &str) -> Result<bool> {
     Ok(!table.find_by_field("external_id", ext).is_empty())
 }
 
-// ---- テスト -------------------------------------------------------------------
+// ---- tests -------------------------------------------------------------------
 //
-// 注: import_range は HTTP に依存するため統合テストにはモックが要る。
-// ここでは振り分けロジックの一部を純粋関数として検証する。
+// import_range calls the HTTP API, so testing it needs a mock. These tests cover the
+// parts of the routing that are pure functions.
 
 #[cfg(test)]
 mod tests {
@@ -357,7 +355,7 @@ mod tests {
         assert_eq!(summary.created, 1);
         assert_eq!(summary.updated, 0);
 
-        // 2 回目: title を変えて update
+        // second run: change the title -> update
         let ev_v2 = make_event(
             "evt1",
             "Meeting (renamed)",
@@ -368,7 +366,7 @@ mod tests {
         assert_eq!(summary.created, 1);
         assert_eq!(summary.updated, 1);
 
-        // tasks は 1 件のみ
+        // still one task
         let count = db.query("tasks", "| count").unwrap();
         assert!(count.contains("count=1"), "got {count}");
     }
@@ -443,17 +441,17 @@ mod tests {
     #[test]
     fn sanitize_text_strips_control_characters() {
         assert_eq!(sanitize_text("hello"), "hello");
-        // ANSI escape は \x1b (ESC) で始まる制御シーケンス → 全部除去
+        // ANSI escape sequences start with \x1b (ESC) and are removed entirely
         assert_eq!(sanitize_text("foo\x1b[31mbar\x1b[0m"), "foo[31mbar[0m");
-        // NUL バイトの除去
+        // NUL bytes are removed
         assert_eq!(sanitize_text("a\0b"), "ab");
-        // タブは残す
+        // tabs stay
         assert_eq!(sanitize_text("a\tb"), "a\tb");
     }
 
     #[test]
     fn sanitize_text_strips_unicode_bidi_and_format() {
-        // RTL override (U+202E) は表示偽装に使われる
+        // RTL override (U+202E) can disguise displayed text
         assert_eq!(sanitize_text("safe\u{202E}evil.exe"), "safeevil.exe");
         // LTR mark (U+200E)
         assert_eq!(sanitize_text("a\u{200E}b"), "ab");
@@ -461,7 +459,7 @@ mod tests {
         assert_eq!(sanitize_text("a\u{200B}b\u{200D}c"), "abc");
         // Line/Paragraph Separator
         assert_eq!(sanitize_text("a\u{2028}b\u{2029}c"), "abc");
-        // 通常の日本語・記号は残る
+        // ordinary Japanese text and symbols stay
         assert_eq!(sanitize_text("会議 → A 室 (10:00)"), "会議 → A 室 (10:00)");
     }
 

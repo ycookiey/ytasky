@@ -1,8 +1,7 @@
-//! Google Calendar API v3 の薄いクライアント。
+//! Minimal client for Google Calendar API v3.
 //!
-//! - events.list: 期間内の全イベントを取得 (pageToken でページネーション完走)
-//! - events.instances: 単一の繰り返しイベントの instance を取得 (フォールバック用)
-//! - calendarList.list: ユーザーのカレンダー一覧
+//! - events.list: all events in a range, following pageToken to the last page
+//! - events.instances: instances of one recurring event, used when its RRULE is unsupported
 
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::{Client, RequestBuilder, Response};
@@ -13,12 +12,11 @@ use crate::gcal::types::{Event, EventList};
 const API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESULTS: u32 = 2500;
-/// ページネーション暴走防止。1ページ最大 2500 件 × 200 ページ = 50万件で十分。
+/// Guard against runaway pagination. 2500 events per page x 200 pages is far above real use.
 const MAX_PAGES: u32 = 200;
-/// 429 Retry-After を尊重して 1 回だけリトライする上限秒数。
+/// Upper bound for honoring Retry-After on the single 429 retry.
 const MAX_RETRY_AFTER_SECS: u64 = 30;
 
-/// 認可ヘッダ付き reqwest クライアントを返す。
 fn make_client() -> Result<Client> {
     Client::builder()
         .timeout(HTTP_TIMEOUT)
@@ -26,14 +24,14 @@ fn make_client() -> Result<Client> {
         .context("HTTP クライアント構築失敗")
 }
 
-/// 429 (Too Many Requests) の場合 Retry-After を尊重して 1 度だけ retry する。
-/// 5xx と 401 はそのまま返す (401 は呼び出し側で refresh を判断)。
+/// Retries once on 429, honoring Retry-After. 5xx and 401 are returned as is;
+/// the caller decides whether to refresh on 401.
 fn send_with_retry(make_req: impl Fn() -> RequestBuilder) -> Result<Response> {
     let resp = make_req().send().context("HTTP 送信失敗")?;
     if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Ok(resp);
     }
-    // Retry-After は秒数または HTTP-date。秒数のみハンドリングし、暴走を避けるため上限を設ける
+    // Retry-After is seconds or an HTTP-date. Only seconds are parsed, and the wait is capped.
     let wait_secs = resp
         .headers()
         .get(reqwest::header::RETRY_AFTER)
@@ -45,9 +43,9 @@ fn send_with_retry(make_req: impl Fn() -> RequestBuilder) -> Result<Response> {
     make_req().send().context("HTTP 送信失敗 (retry)")
 }
 
-/// `calendars/{id}/events` を timeMin..timeMax で取得し pageToken でページネーション完走する。
+/// Fetches `calendars/{id}/events` for timeMin..timeMax, following pageToken to the last page.
 ///
-/// `single_events=true` を渡すと RRULE をサーバ側で個別 instance に展開して返す。
+/// With `single_events=true` the server expands RRULEs into individual instances.
 pub fn list_events(
     access_token: &str,
     calendar_id: &str,
@@ -96,7 +94,7 @@ pub fn list_events(
         all.extend(parsed.items);
         match parsed.next_page_token {
             Some(t) if !t.is_empty() => {
-                // 同一 token を返し続ける異常ループを防ぐ
+                // Stop if the server keeps returning the same token.
                 if page_token.as_deref() == Some(t.as_str()) {
                     break;
                 }
@@ -113,7 +111,7 @@ pub fn list_events(
     Ok(all)
 }
 
-/// 単一の繰り返しイベントの instance を取得 (未対応 RRULE のフォールバック用)。
+/// Instances of one recurring event, for RRULEs the import cannot convert.
 pub fn list_event_instances(
     access_token: &str,
     calendar_id: &str,
@@ -181,15 +179,13 @@ pub fn list_event_instances(
     Ok(all)
 }
 
-/// path segment 用の percent encoding。
-/// `form_urlencoded::byte_serialize` は application/x-www-form-urlencoded 用で
-/// スペースを `+` にエンコードしてしまい、URL path には不適切。
-/// `NON_ALPHANUMERIC` で `@`, `/`, space, `%` などすべてを `%XX` 化する。
+/// Percent-encoding for a path segment. `form_urlencoded::byte_serialize` targets
+/// application/x-www-form-urlencoded and turns spaces into `+`, which is wrong in a path.
 fn urlencoding(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-// ---- テスト -------------------------------------------------------------------
+// ---- tests -------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -202,13 +198,13 @@ mod tests {
 
     #[test]
     fn urlencoding_escapes_at() {
-        // NON_ALPHANUMERIC は '.' も escape する
+        // NON_ALPHANUMERIC also escapes '.'
         assert_eq!(urlencoding("work@example.com"), "work%40example%2Ecom");
     }
 
     #[test]
     fn urlencoding_escapes_space_as_percent_20_not_plus() {
-        // form_urlencoded は ' ' を '+' にしてしまうが、path には不適
+        // form_urlencoded would turn ' ' into '+', which is wrong in a path
         assert_eq!(urlencoding("a b"), "a%20b");
     }
 
